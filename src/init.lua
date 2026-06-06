@@ -1,525 +1,363 @@
 local ffi = require("ffi")
+local raw = require("lua-sys.raw")
 
-ffi.cdef [[
-  typedef struct lua_State lua_State;
-  typedef int (*lua_CFunction)(lua_State *L);
+local unpack = table.unpack or unpack
+local function pack(...) return { n = select("#", ...), ... } end
 
-  typedef struct lua_Debug {
-    int event;
-    const char *name;
-    const char *namewhat;
-    const char *what;
-    const char *source;
-    int currentline;
-    int nups;
-    int linedefined;
-    int lastlinedefined;
-    char short_src[60];
-    int i_ci;
-  } lua_Debug;
+-- Lua 5.1 / LuaJIT pseudo-indices and constants
+local LUA_REGISTRYINDEX = -10000
+local LUA_GLOBALSINDEX  = -10002
+local LUA_NOREF         = -2
+local LUA_MULTRET       = -1
+local LUA_OK            = 0
+local LUA_YIELD         = 1
 
-  typedef struct luaL_Buffer {
-    char *p;
-    int lvl;
-    lua_State *L;
-    char buffer[512];
-  } luaL_Buffer;
+local TYPE_NAMES        = {
+	[0] = "nil",
+	[1] = "boolean",
+	[2] = "lightuserdata",
+	[3] = "number",
+	[4] = "string",
+	[5] = "table",
+	[6] = "function",
+	[7] = "userdata",
+	[8] = "thread"
+}
 
-  typedef struct luaL_Reg {
-    const char *name;
-    lua_CFunction func;
-  } luaL_Reg;
+-- Forward declarations (mutually recursive)
+local fromLua, toLua
 
-  typedef const char *(*lua_Reader)(lua_State *L, void *data, size_t *size);
-  typedef int (*lua_Writer)(lua_State *L, const void *p, size_t sz, void *ud);
-  typedef void *(*lua_Alloc)(void *ud, void *ptr, size_t osize, size_t nsize);
-  typedef double lua_Number;
-  typedef ptrdiff_t lua_Integer;
+-- Check if a value is any lua.Value subtype (via sentinel in metatable)
+local function isValue(v)
+	if type(v) ~= "table" then return false end
+	local mt = getmetatable(v)
+	return mt ~= nil and rawget(mt, "_is_lua_value") == true
+end
 
-  typedef void (*lua_Hook)(lua_State *L, lua_Debug *ar);
+-- ─── Value ────────────────────────────────────────────────────────────────
 
-  void *lua_atpanic(lua_State *L, lua_CFunction panicf);
-  void lua_call(lua_State *L, int nargs, int nresults);
-  int lua_checkstack(lua_State *L, int extra);
-  void lua_close(lua_State *L);
-  void lua_concat(lua_State *L, int n);
-  void lua_copy(lua_State *L, int fromidx, int toidx);
-  int lua_cpcall(lua_State *L, lua_CFunction func, void *ud);
-  void lua_createtable(lua_State *L, int narr, int nrec);
-  int lua_dump(lua_State *L, lua_Writer writer, void *data);
-  int lua_equal(lua_State *L, int idx1, int idx2);
-  int lua_error(lua_State *L);
-  int lua_gc(lua_State *L, int what, int data);
-  lua_Alloc lua_getallocf(lua_State *L, void **ud);
-  int lua_getfenv(lua_State *L, int idx);
-  void lua_getfield(lua_State *L, int idx, const char *k);
-  lua_Hook lua_gethook(lua_State *L);
-  int lua_gethookcount(lua_State *L);
-  int lua_gethookmask(lua_State *L);
-  int lua_getinfo(lua_State *L, const char *what, lua_Debug *ar);
-  const char *lua_getlocal(lua_State *L, const lua_Debug *ar, int n);
-  int lua_getmetatable(lua_State *L, int objindex);
-  int lua_getstack(lua_State *L, int level, lua_Debug *ar);
-  void lua_gettable(lua_State *L, int idx);
-  int lua_gettop(lua_State *L);
-  const char *lua_getupvalue(lua_State *L, int funcindex, int n);
-  void lua_insert(lua_State *L, int idx);
-  int lua_iscfunction(lua_State *L, int idx);
-  int lua_isnumber(lua_State *L, int idx);
-  int lua_isstring(lua_State *L, int idx);
-  int lua_isuserdata(lua_State *L, int idx);
-  int lua_isyieldable(lua_State *L);
-  int luaJIT_setmode(lua_State *L, int idx, int mode);
-  void luaJIT_profile_start(lua_State *L, const char *mode, void (*cb)(lua_State *L, void *data), void *data);
-  void luaJIT_profile_stop(lua_State *L);
-  int luaJIT_profile_dumpstack(lua_State *L, char *buf, int depth, size_t len);
-  void luaL_addlstring(luaL_Buffer *B, const char *s, size_t l);
-  void luaL_addstring(luaL_Buffer *B, const char *s);
-  void luaL_addvalue(luaL_Buffer *B);
-  int luaL_argerror(lua_State *L, int narg, const char *extramsg);
-  void luaL_buffinit(lua_State *L, luaL_Buffer *B);
-  int luaL_callmeta(lua_State *L, int obj, const char *e);
-  void luaL_checkany(lua_State *L, int narg);
-  lua_Integer luaL_checkinteger(lua_State *L, int numArg);
-  const char *luaL_checklstring(lua_State *L, int numArg, size_t *l);
-  lua_Number luaL_checknumber(lua_State *L, int numArg);
-  int luaL_checkoption(lua_State *L, int narg, const char *def, const char *const *lst);
-  void luaL_checkstack(lua_State *L, int sz, const char *msg);
-  void luaL_checktype(lua_State *L, int narg, int t);
-  void *luaL_checkudata(lua_State *L, int ud, const char *tname);
-  int luaL_error(lua_State *L, const char *fmt, ...);
-  int luaL_execresult(lua_State *L, int stat);
-  int luaL_fileresult(lua_State *L, int stat, const char *fname);
-  int luaL_findtable(lua_State *L, int idx, const char *fname, int szhint);
-  int luaL_getmetafield(lua_State *L, int obj, const char *e);
-  const char *luaL_gsub(lua_State *L, const char *s, const char *p, const char *r);
-  int luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, const char *name);
-  int luaL_loadbufferx(lua_State *L, const char *buff, size_t sz, const char *name);
-  int luaL_loadfile(lua_State *L, const char *filename);
-  int luaL_loadfilex(lua_State *L, const char *filename, const char *mode);
-  int luaL_loadstring(lua_State *L, const char *s);
-  int luaL_newmetatable(lua_State *L, const char *tname);
-  lua_State *luaL_newstate(void);
-  int luaL_openlib(lua_State *L, const char *libname, const luaL_Reg *l, int nup);
-  void luaL_openlibs(lua_State *L);
-  lua_Integer luaL_optinteger(lua_State *L, int numArg, lua_Integer def);
-  const char *luaL_optlstring(lua_State *L, int numArg, const char *def, size_t *l);
-  lua_Number luaL_optnumber(lua_State *L, int numArg, lua_Number def);
-  char *luaL_prepbuffer(luaL_Buffer *B);
-  void luaL_pushmodule(lua_State *L, const char *modname, int sizehint);
-  void luaL_pushresult(luaL_Buffer *B);
-  int luaL_ref(lua_State *L, int t);
-  void luaL_register(lua_State *L, const char *libname, const luaL_Reg *l);
-  void luaL_setfuncs(lua_State *L, const luaL_Reg *l, int nup);
-  void luaL_setmetatable(lua_State *L, const char *tname);
-  int luaL_testudata(lua_State *L, int ud, const char *tname);
-  void luaL_traceback(lua_State *L1, lua_State *L2, const char *msg, int level);
-  int luaL_typerror(lua_State *L, int narg, const char *tname);
-  void luaL_unref(lua_State *L, int t, int ref);
-  void luaL_where(lua_State *L, int lvl);
-  int lua_load(lua_State *L, lua_Reader reader, void *data, const char *chunkname);
-  int lua_loadx(lua_State *L, lua_Reader reader, void *data, const char *chunkname, const char *mode);
-  lua_State *lua_newstate(lua_Alloc f, void *ud);
-  lua_State *lua_newthread(lua_State *L);
-  void *lua_newuserdata(lua_State *L, size_t sz);
-  int lua_next(lua_State *L, int idx);
-  size_t lua_objlen(lua_State *L, int idx);
-  int lua_pcall(lua_State *L, int nargs, int nresults, int errfunc);
-  void lua_pushboolean(lua_State *L, int b);
-  void lua_pushcclosure(lua_State *L, lua_CFunction fn, int n);
-  const char *lua_pushfstring(lua_State *L, const char *fmt, ...);
-  void lua_pushinteger(lua_State *L, lua_Integer n);
-  void lua_pushlightuserdata(lua_State *L, void *p);
-  void lua_pushlstring(lua_State *L, const char *s, size_t ls);
-  void lua_pushnil(lua_State *L);
-  void lua_pushnumber(lua_State *L, lua_Number n);
-  const char *lua_pushstring(lua_State *L, const char *s);
-  int lua_pushthread(lua_State *L);
-  void lua_pushvalue(lua_State *L, int idx);
-  const char *lua_pushvfstring(lua_State *L, const char *fmt, void *argp);
-  int lua_rawequal(lua_State *L, int idx1, int idx2);
-  void lua_rawget(lua_State *L, int idx);
-  void lua_rawgeti(lua_State *L, int idx, int n);
-  void lua_rawset(lua_State *L, int idx);
-  void lua_rawseti(lua_State *L, int idx, int n);
-  void lua_remove(lua_State *L, int idx);
-  void lua_replace(lua_State *L, int idx);
-  int lua_resume(lua_State *L, lua_State *from, int nargs);
-  void lua_setallocf(lua_State *L, lua_Alloc f, void *ud);
-  int lua_setfenv(lua_State *L, int idx);
-  void lua_setfield(lua_State *L, int idx, const char *k);
-  int lua_sethook(lua_State *L, lua_Hook func, int mask, int count);
-  const char *lua_setlocal(lua_State *L, const lua_Debug *ar, int n);
-  int lua_setmetatable(lua_State *L, int objindex);
-  void lua_settable(lua_State *L, int idx);
-  void lua_settop(lua_State *L, int idx);
-  const char *lua_setupvalue(lua_State *L, int funcindex, int n);
-  int lua_status(lua_State *L);
-  int lua_toboolean(lua_State *L, int idx);
-  lua_CFunction lua_tocfunction(lua_State *L, int idx);
-  lua_Integer lua_tointeger(lua_State *L, int idx);
-  lua_Integer lua_tointegerx(lua_State *L, int idx, int *isnum);
-  const char *lua_tolstring(lua_State *L, int idx, size_t *len);
-  lua_Number lua_tonumber(lua_State *L, int idx);
-  lua_Number lua_tonumberx(lua_State *L, int idx, int *isnum);
-  const void *lua_topointer(lua_State *L, int idx);
-  lua_State *lua_tothread(lua_State *L, int idx);
-  void *lua_touserdata(lua_State *L, int idx);
-  int lua_type(lua_State *L, int idx);
-  const char *lua_typename(lua_State *L, int tp);
-  void *lua_upvalueid(lua_State *L, int funcindex, int n);
-  void lua_upvaluejoin(lua_State *L, int funcindex1, int n1, int funcindex2, int n2);
-  lua_Number lua_version(lua_State *L);
-  void lua_xmove(lua_State *L1, lua_State *L2, int n);
-  int lua_yield(lua_State *L, int nresults);
+---@class lua.Value
+---@field _state lua.State
+---@field _ref   integer   -- LUA_NOREF for primitive values
+---@field _type  string
+---@field _value any       -- only set for primitive Values (boolean/number/string)
+local Value = { _is_lua_value = true }
+Value.__index = Value
 
-  int lua_lessthan(lua_State *L, int idx1, int idx2);
+---@param state   lua.State
+---@param ref     integer
+---@param typename string
+---@return lua.Value
+function Value._ref_new(state, ref, typename)
+	return setmetatable({ _state = state, _ref = ref, _type = typename }, Value)
+end
 
-  int luaopen_base(lua_State *L);
-  int luaopen_bit(lua_State *L);
-  int luaopen_debug(lua_State *L);
-  int luaopen_ffi(lua_State *L);
-  int luaopen_io(lua_State *L);
-  int luaopen_jit(lua_State *L);
-  int luaopen_math(lua_State *L);
-  int luaopen_os(lua_State *L);
-  int luaopen_package(lua_State *L);
-  int luaopen_string(lua_State *L);
-  int luaopen_string_buffer(lua_State *L);
-  int luaopen_table(lua_State *L);
-]]
+---@param state   lua.State
+---@param value   any
+---@param typename string
+---@return lua.Value
+function Value._prim_new(state, value, typename)
+	return setmetatable({ _state = state, _ref = LUA_NOREF, _type = typename, _value = value }, Value)
+end
 
----@class lua.raw.State: ffi.cdata*
+---@return "nil" | "boolean" | "number" | "string" | "table" | "function" | "userdata" | "thread"
+function Value:type()
+	return self._type
+end
 
--- Get symbols from lde itself
----@class lua.raw.Fns
----@field lua_atpanic fun(L: lua.raw.State, panicf: fun(L: lua.raw.State): integer): ffi.cdata*
----@field lua_call fun(L: lua.raw.State, nargs: integer, nresults: integer)
----@field lua_checkstack fun(L: lua.raw.State, extra: integer): integer
----@field lua_close fun(L: lua.raw.State)
----@field lua_concat fun(L: lua.raw.State, n: integer)
----@field lua_copy fun(L: lua.raw.State, fromidx: integer, toidx: integer)
----@field lua_cpcall fun(L: lua.raw.State, func: fun(L: lua.raw.State): integer, ud: ffi.cdata*): integer
----@field lua_createtable fun(L: lua.raw.State, narr: integer, nrec: integer)
----@field lua_dump fun(L: lua.raw.State, writer: fun(L: lua.raw.State, p: ffi.cdata*, sz: integer, ud: ffi.cdata*): integer, data: ffi.cdata*): integer
----@field lua_equal fun(L: lua.raw.State, idx1: integer, idx2: integer): integer
----@field lua_error fun(L: lua.raw.State): integer
----@field lua_gc fun(L: lua.raw.State, what: integer, data: integer): integer
----@field lua_getallocf fun(L: lua.raw.State, ud: ffi.cdata*): ffi.cdata*
----@field lua_getfenv fun(L: lua.raw.State, idx: integer): integer
----@field lua_getfield fun(L: lua.raw.State, idx: integer, k: string)
----@field lua_gethook fun(L: lua.raw.State): ffi.cdata*
----@field lua_gethookcount fun(L: lua.raw.State): integer
----@field lua_gethookmask fun(L: lua.raw.State): integer
----@field lua_getinfo fun(L: lua.raw.State, what: string, ar: ffi.cdata*): integer
----@field lua_getlocal fun(L: lua.raw.State, ar: ffi.cdata*, n: integer): string
----@field lua_getmetatable fun(L: lua.raw.State, objindex: integer): integer
----@field lua_getstack fun(L: lua.raw.State, level: integer, ar: ffi.cdata*): integer
----@field lua_gettable fun(L: lua.raw.State, idx: integer)
----@field lua_gettop fun(L: lua.raw.State): integer
----@field lua_getupvalue fun(L: lua.raw.State, funcindex: integer, n: integer): string
----@field lua_insert fun(L: lua.raw.State, idx: integer)
----@field lua_iscfunction fun(L: lua.raw.State, idx: integer): integer
----@field lua_isnumber fun(L: lua.raw.State, idx: integer): integer
----@field lua_isstring fun(L: lua.raw.State, idx: integer): integer
----@field lua_isuserdata fun(L: lua.raw.State, idx: integer): integer
----@field lua_isyieldable fun(L: lua.raw.State): integer
----@field lua_lessthan fun(L: lua.raw.State, idx1: integer, idx2: integer): integer
----@field luaJIT_setmode fun(L: lua.raw.State, idx: integer, mode: integer): integer
----@field luaJIT_profile_start fun(L: lua.raw.State, mode: string, cb: fun(L: lua.raw.State, data: ffi.cdata*), data: ffi.cdata*)
----@field luaJIT_profile_stop fun(L: lua.raw.State)
----@field luaJIT_profile_dumpstack fun(L: lua.raw.State, buf: string, depth: integer, len: integer): integer
----@field luaL_addlstring fun(B: ffi.cdata*, s: string, l: integer)
----@field luaL_addstring fun(B: ffi.cdata*, s: string)
----@field luaL_addvalue fun(B: ffi.cdata*)
----@field luaL_argerror fun(L: lua.raw.State, narg: integer, extramsg: string): integer
----@field luaL_buffinit fun(L: lua.raw.State, B: ffi.cdata*)
----@field luaL_callmeta fun(L: lua.raw.State, obj: integer, e: string): integer
----@field luaL_checkany fun(L: lua.raw.State, narg: integer)
----@field luaL_checkinteger fun(L: lua.raw.State, numArg: integer): integer
----@field luaL_checklstring fun(L: lua.raw.State, numArg: integer, l: ffi.cdata*): string
----@field luaL_checknumber fun(L: lua.raw.State, numArg: integer): number
----@field luaL_checkoption fun(L: lua.raw.State, narg: integer, def: string, lst: ffi.cdata*): integer
----@field luaL_checkstack fun(L: lua.raw.State, sz: integer, msg: string)
----@field luaL_checktype fun(L: lua.raw.State, narg: integer, t: integer)
----@field luaL_checkudata fun(L: lua.raw.State, ud: integer, tname: string): ffi.cdata*
----@field luaL_error fun(L: lua.raw.State, fmt: string, ...): integer
----@field luaL_execresult fun(L: lua.raw.State, stat: integer): integer
----@field luaL_fileresult fun(L: lua.raw.State, stat: integer, fname: string): integer
----@field luaL_findtable fun(L: lua.raw.State, idx: integer, fname: string, szhint: integer): integer
----@field luaL_getmetafield fun(L: lua.raw.State, obj: integer, e: string): integer
----@field luaL_gsub fun(L: lua.raw.State, s: string, p: string, r: string): string
----@field luaL_loadbuffer fun(L: lua.raw.State, buff: string, sz: integer, name: string): integer
----@field luaL_loadbufferx fun(L: lua.raw.State, buff: string, sz: integer, name: string): integer
----@field luaL_loadfile fun(L: lua.raw.State, filename: string): integer
----@field luaL_loadfilex fun(L: lua.raw.State, filename: string, mode: string): integer
----@field luaL_loadstring fun(L: lua.raw.State, s: string): integer
----@field luaL_newmetatable fun(L: lua.raw.State, tname: string): integer
----@field luaL_newstate fun(): lua.raw.State
----@field luaL_openlib fun(L: lua.raw.State, libname: string, l: ffi.cdata*, nup: integer)
----@field luaL_openlibs fun(L: lua.raw.State)
----@field luaL_optinteger fun(L: lua.raw.State, numArg: integer, def: integer): integer
----@field luaL_optlstring fun(L: lua.raw.State, numArg: integer, def: string, l: ffi.cdata*): string
----@field luaL_optnumber fun(L: lua.raw.State, numArg: integer, def: number): number
----@field luaL_prepbuffer fun(B: ffi.cdata*): string
----@field luaL_pushmodule fun(L: lua.raw.State, modname: string, sizehint: integer)
----@field luaL_pushresult fun(B: ffi.cdata*)
----@field luaL_ref fun(L: lua.raw.State, t: integer): integer
----@field luaL_register fun(L: lua.raw.State, libname: string, l: ffi.cdata*)
----@field luaL_setfuncs fun(L: lua.raw.State, l: ffi.cdata*, nup: integer)
----@field luaL_setmetatable fun(L: lua.raw.State, tname: string)
----@field luaL_testudata fun(L: lua.raw.State, ud: integer, tname: string): integer
----@field luaL_traceback fun(L1: lua.raw.State, L2: lua.raw.State, msg: string, level: integer)
----@field luaL_typerror fun(L: lua.raw.State, narg: integer, tname: string): integer
----@field luaL_unref fun(L: lua.raw.State, t: integer, ref: integer)
----@field luaL_where fun(L: lua.raw.State, lvl: integer)
----@field lua_load fun(L: lua.raw.State, reader: fun(L: lua.raw.State, data: ffi.cdata*, sz: ffi.cdata*): string, data: ffi.cdata*, chunkname: string): integer
----@field lua_loadx fun(L: lua.raw.State, reader: fun(L: lua.raw.State, data: ffi.cdata*, sz: ffi.cdata*): string, data: ffi.cdata*, chunkname: string, mode: string): integer
----@field lua_newstate fun(alloc: fun(ud: ffi.cdata*, ptr: ffi.cdata*, osize: integer, nsize: integer): ffi.cdata*, ud: ffi.cdata*): lua.raw.State
----@field lua_newthread fun(L: lua.raw.State): lua.raw.State
----@field lua_newuserdata fun(L: lua.raw.State, sz: integer): ffi.cdata*
----@field lua_next fun(L: lua.raw.State, idx: integer): integer
----@field lua_objlen fun(L: lua.raw.State, idx: integer): integer
----@field lua_pcall fun(L: lua.raw.State, nargs: integer, nresults: integer, errfunc: integer): integer
----@field lua_pushboolean fun(L: lua.raw.State, b: boolean)
----@field lua_pushcclosure fun(L: lua.raw.State, fn: fun(L: lua.raw.State): integer, n: integer)
----@field lua_pushfstring fun(L: lua.raw.State, fmt: string, ...): string
----@field lua_pushinteger fun(L: lua.raw.State, n: integer)
----@field lua_pushlightuserdata fun(L: lua.raw.State, p: ffi.cdata*)
----@field lua_pushlstring fun(L: lua.raw.State, s: string, ls: integer)
----@field lua_pushnil fun(L: lua.raw.State)
----@field lua_pushnumber fun(L: lua.raw.State, n: number)
----@field lua_pushstring fun(L: lua.raw.State, s: string)
----@field lua_pushthread fun(L: lua.raw.State): integer
----@field lua_pushvalue fun(L: lua.raw.State, idx: integer)
----@field lua_pushvfstring fun(L: lua.raw.State, fmt: string, argp: ffi.cdata*): string
----@field lua_rawequal fun(L: lua.raw.State, idx1: integer, idx2: integer): integer
----@field lua_rawget fun(L: lua.raw.State, idx: integer)
----@field lua_rawgeti fun(L: lua.raw.State, idx: integer, n: integer)
----@field lua_rawset fun(L: lua.raw.State, idx: integer)
----@field lua_rawseti fun(L: lua.raw.State, idx: integer, n: integer)
----@field lua_remove fun(L: lua.raw.State, idx: integer)
----@field lua_replace fun(L: lua.raw.State, idx: integer)
----@field lua_resume fun(L: lua.raw.State, from: lua.raw.State, nargs: integer): integer
----@field lua_setallocf fun(L: lua.raw.State, alloc: fun(ud: ffi.cdata*, ptr: ffi.cdata*, osize: integer, nsize: integer): ffi.cdata*, ud: ffi.cdata*)
----@field lua_setfenv fun(L: lua.raw.State, idx: integer): integer
----@field lua_setfield fun(L: lua.raw.State, idx: integer, k: string)
----@field lua_sethook fun(L: lua.raw.State, func: fun(L: lua.raw.State, ar: ffi.cdata*), mask: integer, count: integer): integer
----@field lua_setlocal fun(L: lua.raw.State, ar: ffi.cdata*, n: integer): string
----@field lua_setmetatable fun(L: lua.raw.State, objindex: integer): integer
----@field lua_settable fun(L: lua.raw.State, idx: integer)
----@field lua_settop fun(L: lua.raw.State, idx: integer)
----@field lua_pop fun(L: lua.raw.State, n: integer)
----@field lua_setupvalue fun(L: lua.raw.State, funcindex: integer, n: integer): string
----@field lua_status fun(L: lua.raw.State): integer
----@field lua_toboolean fun(L: lua.raw.State, idx: integer): boolean
----@field lua_tocfunction fun(L: lua.raw.State, idx: integer): ffi.cdata*
----@field lua_tointeger fun(L: lua.raw.State, idx: integer): integer
----@field lua_tointegerx fun(L: lua.raw.State, idx: integer, isnum: ffi.cdata*): integer
----@field lua_tolstring fun(L: lua.raw.State, idx: integer, len: ffi.cdata*): string
----@field lua_tonumber fun(L: lua.raw.State, idx: integer): number
----@field lua_tonumberx fun(L: lua.raw.State, idx: integer, isnum: ffi.cdata*): number
----@field lua_topointer fun(L: lua.raw.State, idx: integer): ffi.cdata*
----@field lua_tothread fun(L: lua.raw.State, idx: integer): lua.raw.State
----@field lua_touserdata fun(L: lua.raw.State, idx: integer): ffi.cdata*
----@field lua_type fun(L: lua.raw.State, idx: integer): integer
----@field lua_typename fun(L: lua.raw.State, tp: integer): string
----@field lua_upvalueid fun(L: lua.raw.State, funcindex: integer, n: integer): ffi.cdata*
----@field lua_upvaluejoin fun(L: lua.raw.State, funcindex1: integer, n1: integer, funcindex2: integer, n2: integer)
----@field lua_version fun(L: lua.raw.State): number
----@field lua_xmove fun(L1: lua.raw.State, L2: lua.raw.State, n: integer)
----@field lua_yield fun(L: lua.raw.State, nresults: integer): integer
----@field luaopen_base fun(L: lua.raw.State): integer
----@field luaopen_bit fun(L: lua.raw.State): integer
----@field luaopen_debug fun(L: lua.raw.State): integer
----@field luaopen_ffi fun(L: lua.raw.State): integer
----@field luaopen_io fun(L: lua.raw.State): integer
----@field luaopen_jit fun(L: lua.raw.State): integer
----@field luaopen_math fun(L: lua.raw.State): integer
----@field luaopen_os fun(L: lua.raw.State): integer
----@field luaopen_package fun(L: lua.raw.State): integer
----@field luaopen_string fun(L: lua.raw.State): integer
----@field luaopen_string_buffer fun(L: lua.raw.State): integer
----@field luaopen_table fun(L: lua.raw.State): integer
-local C = ffi.C
+--- Returns the raw Lua primitive for boolean/number/string Values, or self for compound types.
+---@return boolean | number | string | lua.Value
+function Value:value()
+	if self._ref == LUA_NOREF then
+		return self._value
+	end
+	return self
+end
 
+--- Release the registry reference. Called automatically by __gc.
+function Value:free()
+	if self._ref ~= LUA_NOREF and self._state.L ~= nil then
+		raw.unref(self._state.L, LUA_REGISTRYINDEX, self._ref)
+	end
+	self._ref = LUA_NOREF
+end
+
+Value.__gc = Value.free
+
+function Value:__tostring()
+	if self._ref == LUA_NOREF then
+		return tostring(self._value)
+	end
+	return "lua." .. self._type
+end
+
+-- ─── Function ─────────────────────────────────────────────────────────────
+
+---@class lua.Function: lua.Value
+local Function = { _is_lua_value = true }
+
+-- Inherit from Value.
+for k, v in pairs(Value) do Function[k] = v end
+
+Function.__index = Function
+Function.__gc    = Value.free
+
+---@param state lua.State
+---@param ref   integer
+---@return lua.Function
+function Function._new(state, ref)
+	return setmetatable({ _state = state, _ref = ref, _type = "function" }, Function)
+end
+
+--- Call the function, raising on error. Results are returned as lua.Values.
+---@param ... string | number | boolean | lua.Value | function | nil
+---@return lua.Value ...
+function Function:call(...)
+	local L    = self._state.L
+	local base = raw.gettop(L)
+	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
+	local n = select("#", ...)
+	for i = 1, n do toLua(self._state, L, (select(i, ...))) end
+	raw.call(L, n, LUA_MULTRET)
+	local nresults = raw.gettop(L) - base
+	local results  = {}
+	for i = 1, nresults do results[i] = fromLua(self._state, L, base + i) end
+	raw.settop(L, base)
+	return unpack(results, 1, nresults)
+end
+
+--- Protected call. Returns false + error string on failure, true + results on success.
+---@param ... string | number | boolean | lua.Value | function | nil
+---@return boolean, ...
+function Function:pcall(...)
+	local L    = self._state.L
+	local base = raw.gettop(L)
+	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
+	local n = select("#", ...)
+	for i = 1, n do toLua(self._state, L, (select(i, ...))) end
+	local status = raw.pcall(L, n, LUA_MULTRET, 0)
+	if status ~= LUA_OK then
+		local err = raw.tolstring(L, -1)
+		raw.settop(L, base)
+		return false, err
+	end
+	local nresults = raw.gettop(L) - base
+	local results  = {}
+	for i = 1, nresults do results[i] = fromLua(self._state, L, base + i) end
+	raw.settop(L, base)
+	return true, unpack(results, 1, nresults)
+end
+
+-- ─── Table ────────────────────────────────────────────────────────────────
+
+---@class lua.Table: lua.Value
+local Table = { _is_lua_value = true }
+
+-- Inherit from Value.
+for k, v in pairs(Value) do Table[k] = v end
+
+Table.__index = Table
+Table.__gc    = Value.free
+
+---@param state lua.State
+---@param ref   integer
+---@return lua.Table
+function Table._new(state, ref)
+	return setmetatable({ _state = state, _ref = ref, _type = "table" }, Table)
+end
+
+---@param key string | number | boolean | lua.Value
+---@return lua.Value | nil
+function Table:get(key)
+	local L = self._state.L
+	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref) -- push table
+	toLua(self._state, L, key)                -- push key
+	raw.gettable(L, -2)                       -- pop key, push value
+	local result = fromLua(self._state, L, -1)
+	raw.pop(L, 2)                             -- pop value + table
+	return result
+end
+
+---@param key   string | number | boolean | lua.Value
+---@param value string | number | boolean | lua.Value | lua.Function | lua.Table | function | nil
+function Table:set(key, value)
+	local L = self._state.L
+	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref) -- push table
+	toLua(self._state, L, key)                -- push key
+	toLua(self._state, L, value)              -- push value
+	raw.settable(L, -3)                       -- pop key + value
+	raw.pop(L, 1)                             -- pop table
+end
+
+-- ─── fromLua / toLua ──────────────────────────────────────────────────────
+
+-- Reads the Lua value at `idx` on the stack and returns it as a lua.Value.
+-- Primitives (boolean/number/string) are stored by value; compound types
+-- (table/function/userdata/thread) are anchored in the registry.
+-- Returns nil (Lua nil) for a nil stack slot.
+---@param state lua.State
+---@param L     lua.raw.State
+---@param idx   integer
+---@return lua.Value | nil
+fromLua = function(state, L, idx)
+	local t = raw.type(L, idx)
+	if t == 0 then return nil end
+
+	local typename = TYPE_NAMES[t]
+
+	-- Primitives: copy directly, no registry ref needed
+	if typename == "boolean" then
+		return Value._prim_new(state, raw.toboolean(L, idx), "boolean")
+	elseif typename == "number" then
+		return Value._prim_new(state, raw.tonumber(L, idx), "number")
+	elseif typename == "string" then
+		return Value._prim_new(state, raw.tolstring(L, idx), "string")
+	end
+
+	-- Compound types: push a copy and create a registry ref (luaL_ref pops it)
+	raw.pushvalue(L, idx)
+	local ref = raw.ref(L, LUA_REGISTRYINDEX)
+
+	if typename == "function" then
+		return Function._new(state, ref)
+	elseif typename == "table" then
+		return Table._new(state, ref)
+	else
+		return Value._ref_new(state, ref, typename)
+	end
+end
+
+-- Pushes `value` onto the Lua stack.
+-- Accepts plain Lua primitives, lua.Value subtypes (pushed via their registry ref),
+-- or plain Lua functions (wrapped as lua_CFunctions via ffi.cast).
+---@param state lua.State
+---@param L     lua.raw.State
+---@param value string | number | boolean | lua.Value | function | nil
+toLua = function(state, L, value)
+	local t = type(value)
+
+	if t == "nil" then
+		raw.pushnil(L)
+	elseif t == "boolean" then
+		raw.pushboolean(L, value and 1 or 0)
+	elseif t == "number" then
+		raw.pushnumber(L, value)
+	elseif t == "string" then
+		raw.pushstring(L, value)
+	elseif t == "table" and isValue(value) then
+		-- lua.Value: push from registry ref for compound types, or push primitive directly
+		if value._ref ~= LUA_NOREF then
+			raw.rawgeti(L, LUA_REGISTRYINDEX, value._ref)
+		elseif value._type == "number" then
+			raw.pushnumber(L, value._value)
+		elseif value._type == "string" then
+			raw.pushstring(L, value._value)
+		elseif value._type == "boolean" then
+			raw.pushboolean(L, value._value and 1 or 0)
+		else
+			raw.pushnil(L)
+		end
+	elseif t == "function" then
+		-- Wrap the outer Lua function as a lua_CFunction in the inner state.
+		-- The callback runs in the outer (lde) Lua interpreter via the FFI callback
+		-- mechanism. JIT is disabled on Function:call/State:load so the outer
+		-- interpreter is in a re-entrant state when this fires.
+		local cb = ffi.cast("lua_CFunction", function(L_raw)
+			local n    = raw.gettop(L_raw)
+			local args = {}
+			for i = 1, n do args[i] = fromLua(state, L_raw, i) end
+			local rets = pack(value(state, unpack(args, 1, n)))
+			for i = 1, rets.n do toLua(state, L_raw, rets[i]) end
+			return rets.n
+		end)
+
+		table.insert(state._callbacks, cb)
+		raw.pushcclosure(L, cb, 0)
+	else
+		error("cannot coerce value of type '" .. t .. "' to a Lua value", 2)
+	end
+end
+
+-- ─── State ────────────────────────────────────────────────────────────────
+
+---@class lua.State
+---@field L               lua.raw.State
+---@field _callbacks      table  -- keeps ffi cdata callbacks alive
+---@field _lua_callbacks  table  -- outer-state Lua functions registered as callbacks
+local State = {}
+State.__index = State
+
+--- Compile and evaluate a Lua chunk, returning the first result as a lua.Value.
+--- As a convenience, a bare expression (e.g. `"function(a,b) end"`) is
+--- automatically wrapped with `return` so it evaluates to a value.
+---@param code string
+---@return lua.Function | lua.Table | lua.Value | nil
+function State:load(code)
+	local L = self.L
+	-- Try loading as an expression first; fall back to a plain chunk
+	local status = raw.loadstring(L, "return " .. code)
+	if status ~= LUA_OK then
+		raw.pop(L, 1)
+		status = raw.loadstring(L, code)
+	end
+	if status ~= LUA_OK then
+		local err = raw.tolstring(L, -1)
+		raw.pop(L, 1)
+		error(err, 2)
+	end
+	local base = raw.gettop(L) - 1
+	status = raw.pcall(L, 0, LUA_MULTRET, 0)
+	if status ~= LUA_OK then
+		local err = raw.tolstring(L, -1)
+		raw.pop(L, 1)
+		error(err, 2)
+	end
+	local nresults = raw.gettop(L) - base
+	if nresults == 0 then return nil end
+	local result = fromLua(self, L, base + 1)
+	raw.settop(L, base)
+	return result
+end
+
+--- Returns a lua.Table wrapping the global environment (_G).
+---@return lua.Table
+function State:globals()
+	local L = self.L
+	raw.pushvalue(L, LUA_GLOBALSINDEX)
+	local tbl = fromLua(self, L, -1)
+	raw.pop(L, 1)
+	return tbl
+end
+
+--- Close the underlying Lua state and release all resources.
+function State:close()
+	if self.L then
+		raw.close(self.L)
+		self.L              = nil
+		self._callbacks     = {}
+		self._lua_callbacks = {}
+	end
+end
+
+-- ─── Module ───────────────────────────────────────────────────────────────
+
+---@class lua
 local lua = {}
 
--- Core API
-lua.atpanic = C.lua_atpanic
-lua.call = C.lua_call
-function lua.checkstack(L, extra) return C.lua_checkstack(L, extra) ~= 0 end
+lua.raw = raw
 
-lua.close = C.lua_close
-lua.concat = C.lua_concat
-lua.copy = C.lua_copy
-lua.cpcall = C.lua_cpcall
-lua.createtable = C.lua_createtable
-lua.dump = C.lua_dump
-function lua.equal(L, idx1, idx2) return C.lua_equal(L, idx1, idx2) ~= 0 end
+--- Create a new Lua state with all standard libraries loaded.
+---@return lua.State
+function lua.new()
+	local L = raw.lnewstate()
+	raw.openlibs(L)
+	return setmetatable({ L = L, _callbacks = {}, _lua_callbacks = {} }, State)
+end
 
-lua.error = C.lua_error
-lua.gc = C.lua_gc
-lua.getallocf = C.lua_getallocf
-function lua.getfenv(L, idx) return C.lua_getfenv(L, idx) ~= 0 end
-
-lua.getfield = C.lua_getfield
-lua.gethook = C.lua_gethook
-lua.gethookcount = C.lua_gethookcount
-lua.gethookmask = C.lua_gethookmask
-lua.getinfo = C.lua_getinfo
-lua.getlocal = C.lua_getlocal
-function lua.getmetatable(L, idx) return C.lua_getmetatable(L, idx) ~= 0 end
-
-lua.getstack = C.lua_getstack
-lua.gettable = C.lua_gettable
-lua.gettop = C.lua_gettop
-lua.getupvalue = C.lua_getupvalue
-lua.insert = C.lua_insert
-function lua.iscfunction(L, idx) return C.lua_iscfunction(L, idx) ~= 0 end
-
-function lua.isnumber(L, idx) return C.lua_isnumber(L, idx) ~= 0 end
-
-function lua.isstring(L, idx) return C.lua_isstring(L, idx) ~= 0 end
-
-function lua.isuserdata(L, idx) return C.lua_isuserdata(L, idx) ~= 0 end
-
-function lua.isyieldable(L) return C.lua_isyieldable(L) ~= 0 end
-
-function lua.lessthan(L, idx1, idx2) return C.lua_lessthan(L, idx1, idx2) ~= 0 end
-
-lua.load = C.lua_load
-lua.loadx = C.lua_loadx
-lua.newstate = C.lua_newstate
-lua.newthread = C.lua_newthread
-lua.newuserdata = C.lua_newuserdata
-function lua.next(L, idx) return C.lua_next(L, idx) ~= 0 end
-
-lua.objlen = C.lua_objlen
-lua.pcall = C.lua_pcall
-lua.pushboolean = C.lua_pushboolean
-lua.pushcclosure = C.lua_pushcclosure
-lua.pushfstring = C.lua_pushfstring
-lua.pushinteger = C.lua_pushinteger
-lua.pushlightuserdata = C.lua_pushlightuserdata
-lua.pushlstring = C.lua_pushlstring
-lua.pushnil = C.lua_pushnil
-lua.pushnumber = C.lua_pushnumber
-lua.pushstring = C.lua_pushstring
-function lua.pushthread(L) return C.lua_pushthread(L) ~= 0 end
-
-lua.pushvalue = C.lua_pushvalue
-lua.pushvfstring = C.lua_pushvfstring
-function lua.rawequal(L, idx1, idx2) return C.lua_rawequal(L, idx1, idx2) ~= 0 end
-
-lua.rawget = C.lua_rawget
-lua.rawgeti = C.lua_rawgeti
-lua.rawset = C.lua_rawset
-lua.rawseti = C.lua_rawseti
-lua.remove = C.lua_remove
-lua.replace = C.lua_replace
-lua.resume = C.lua_resume
-lua.setallocf = C.lua_setallocf
-function lua.setfenv(L, idx) return C.lua_setfenv(L, idx) ~= 0 end
-
-lua.setfield = C.lua_setfield
-lua.sethook = C.lua_sethook
-lua.setlocal = C.lua_setlocal
-function lua.setmetatable(L, idx) return C.lua_setmetatable(L, idx) ~= 0 end
-
-lua.settable = C.lua_settable
-lua.settop = C.lua_settop
-function lua.pop(L, n) lua.settop(L, -(n) - 1) end
-
-lua.setupvalue = C.lua_setupvalue
-lua.status = C.lua_status
-function lua.toboolean(L, idx) return C.lua_toboolean(L, idx) ~= 0 end
-
-lua.tocfunction = C.lua_tocfunction
-lua.tointeger = C.lua_tointeger
-lua.tointegerx = C.lua_tointegerx
-function lua.tolstring(L, idx) return ffi.string(C.lua_tolstring(L, idx, nil)) end
-
-lua.tonumber = C.lua_tonumber
-lua.tonumberx = C.lua_tonumberx
-lua.topointer = C.lua_topointer
-lua.tothread = C.lua_tothread
-lua.touserdata = C.lua_touserdata
-lua.type = C.lua_type
-lua.typename = C.lua_typename
-lua.upvalueid = C.lua_upvalueid
-lua.upvaluejoin = C.lua_upvaluejoin
-lua.version = C.lua_version
-lua.xmove = C.lua_xmove
-lua.yield = C.lua_yield
-
--- Aux library (luaL_*)
-lua.addlstring = C.luaL_addlstring
-lua.addstring = C.luaL_addstring
-lua.addvalue = C.luaL_addvalue
-lua.argerror = C.luaL_argerror
-lua.buffinit = C.luaL_buffinit
-function lua.callmeta(L, obj, e) return C.luaL_callmeta(L, obj, e) ~= 0 end
-
-lua.checkany = C.luaL_checkany
-lua.checkinteger = C.luaL_checkinteger
-function lua.checklstring(L, idx) return ffi.string(C.luaL_checklstring(L, idx, nil)) end
-
-lua.checknumber = C.luaL_checknumber
-lua.checkoption = C.luaL_checkoption
-lua.lcheckstack = C.luaL_checkstack
-lua.checktype = C.luaL_checktype
-lua.checkudata = C.luaL_checkudata
-lua.lerror = C.luaL_error
-lua.execresult = C.luaL_execresult
-lua.fileresult = C.luaL_fileresult
-lua.findtable = C.luaL_findtable
-lua.getmetafield = C.luaL_getmetafield
-lua.gsub = C.luaL_gsub
-lua.loadbuffer = C.luaL_loadbuffer
-lua.loadbufferx = C.luaL_loadbufferx
-lua.loadfile = C.luaL_loadfile
-lua.loadfilex = C.luaL_loadfilex
-lua.loadstring = C.luaL_loadstring
-lua.newmetatable = C.luaL_newmetatable
-lua.lnewstate = C.luaL_newstate
-lua.openlib = C.luaL_openlib
-lua.openlibs = C.luaL_openlibs
-lua.optinteger = C.luaL_optinteger
-lua.optlstring = C.luaL_optlstring
-lua.optnumber = C.luaL_optnumber
-lua.prepbuffer = C.luaL_prepbuffer
-lua.pushmodule = C.luaL_pushmodule
-lua.pushresult = C.luaL_pushresult
-lua.ref = C.luaL_ref
-lua.register = C.luaL_register
-lua.setfuncs = C.luaL_setfuncs
-lua.lsetmetatable = C.luaL_setmetatable
-function lua.testudata(L, ud, tname) return C.luaL_testudata(L, ud, tname) ~= 0 end
-
-lua.traceback = C.luaL_traceback
-lua.typerror = C.luaL_typerror
-lua.unref = C.luaL_unref
-lua.where = C.luaL_where
-
--- Library openers (luaopen_*)
-lua.openBase = C.luaopen_base
-lua.openBit = C.luaopen_bit
-lua.openDebug = C.luaopen_debug
-lua.openFFI = C.luaopen_ffi
-lua.openIO = C.luaopen_io
-lua.openJIT = C.luaopen_jit
-lua.openMath = C.luaopen_math
-lua.openOS = C.luaopen_os
-lua.openPackage = C.luaopen_package
-lua.openString = C.luaopen_string
-lua.openStringBuffer = C.luaopen_string_buffer
-lua.openTable = C.luaopen_table
-
--- JIT extensions (luaJIT_*)
-lua.jit_setmode = C.luaJIT_setmode
-lua.jit_profile_start = C.luaJIT_profile_start
-lua.jit_profile_stop = C.luaJIT_profile_stop
-lua.jit_profile_dumpstack = C.luaJIT_profile_dumpstack
+-- Disable JIT on functions that call into the inner Lua state so that
+-- FFI callbacks can safely re-enter the outer (lde) interpreter.
+jit.off(Function.call, true)
+jit.off(Function.pcall, true)
+jit.off(State.load, true)
 
 return lua
