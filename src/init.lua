@@ -139,7 +139,7 @@ function Function:pcall(...)
 	local n = select("#", ...)
 	for i = 1, n do toLua(self._state, L, (select(i, ...))) end
 	local status = raw.pcall(L, n, LUA_MULTRET, 0)
-	if status ~= LUA_OK then
+	if status ~= LUA_OK and status ~= LUA_YIELD then
 		local err = raw.tolstring(L, -1)
 		raw.settop(L, base)
 		return false, err
@@ -388,11 +388,12 @@ function State:load(code)
 		error(err, 2)
 	end
 	local base = raw.gettop(L) - 1
-	-- NOTE: lua_pcall (C API) does not handle FFI callbacks that return
-	-- LUA_MULTRET (it returns status 1).  lua_call works fine, so we use
-	-- raw.call here.  Syntax errors are caught by raw.loadstring above;
-	-- runtime errors from the loaded code will propagate (same as fn:call).
-	raw.call(L, 0, LUA_MULTRET)
+	status = raw.pcall(L, 0, LUA_MULTRET, 0)
+	if status ~= LUA_OK and status ~= LUA_YIELD then
+		local err = raw.tolstring(L, -1)
+		raw.pop(L, 1)
+		error(err, 2)
+	end
 	local nresults = raw.gettop(L) - base
 	if nresults == 0 then return nil end
 	local result = fromLua(self, L, base + 1)
