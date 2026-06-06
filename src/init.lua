@@ -109,19 +109,131 @@ function Function._new(state, ref)
 	return setmetatable({ _state = state, _ref = ref, _type = "function" }, Function)
 end
 
+-- Run a coroutine, dispatching any Lua callbacks that fire via yields.
+-- Leaves results on co's stack on success.
+-- Returns true on success, or false + error_message on failure.
+---@param state lua.State
+---@param co    lua.raw.State   -- the coroutine thread
+---@param nargs integer         -- number of arguments on co's stack (after the function)
+---@return boolean, string|nil
+local function run_coroutine(state, co, nargs)
+	while true do
+		local status = raw.resume(co, nargs)
+		if status == LUA_YIELD then
+			-- The coroutine yielded — check for a pending Lua callback.
+			-- The proxy function stores callback info in _G.__lua_cb on the
+			-- coroutine's globals, then yields. We read it, dispatch, push
+			-- results onto the coroutine stack, and resume.
+
+			-- Read _G.__lua_cb from the coroutine's globals
+			raw.pushvalue(co, LUA_GLOBALSINDEX)
+			raw.getfield(co, -1, "__lua_cb")
+			local cb_nil = (raw.type(co, -1) == 0)
+			raw.pop(co, 2)
+
+			if cb_nil then
+				-- Spurious yield — pass nothing back
+				nargs = 0
+			else
+				-- Read the callback info table from globals via a fresh lookup
+				raw.pushvalue(co, LUA_GLOBALSINDEX)
+				raw.getfield(co, -1, "__lua_cb")
+				local cb_info = fromLua(state, co, -1)
+				raw.pop(co, 2)
+
+				local id_tbl = cb_info:get("id")
+				local args_val = cb_info:get("args")
+				local id = id_tbl and id_tbl:value()
+				local outer_fn = state._lua_callbacks[id]
+
+				if outer_fn then
+					-- Collect inner-state arguments
+					local inner_args = {}
+					if args_val and args_val._type == "table" then
+						for i = 1, math.huge do
+							local v = args_val:get(i)
+							if v == nil then break end
+							inner_args[i] = v
+						end
+					end
+
+					-- Call the outer function with state as first arg
+					local rets = pack(outer_fn(state, unpack(inner_args, 1, #inner_args)))
+
+					-- Push results onto the coroutine stack for the proxy to receive
+					for i = 1, rets.n do
+						toLua(state, co, rets[i])
+					end
+					nargs = rets.n
+				else
+					nargs = 0
+				end
+
+				-- Clear the callback info
+				raw.pushvalue(co, LUA_GLOBALSINDEX)
+				raw.pushnil(co)
+				raw.setfield(co, -2, "__lua_cb")
+				raw.pop(co, 1)
+			end
+		elseif status == LUA_OK then
+			-- Finished normally — results are on the coroutine stack
+			return true
+		else
+			-- Error in the coroutine
+			local err = raw.tolstring(co, -1)
+			raw.settop(co, 0)
+			return false, err
+		end
+	end
+end
+
 --- Call the function, raising on error. Results are returned as lua.Values.
 ---@param ... string | number | boolean | lua.Value | function | nil
 ---@return lua.Value ...
 function Function:call(...)
-	local L    = self._state.L
-	local base = raw.gettop(L)
+	local state = self._state
+	local L     = state.L
+
+	local base  = raw.gettop(L)
+
+	-- Create a coroutine thread (pushed onto L's stack)
+	local co    = raw.newthread(L)
+
+	-- Push the function onto the coroutine stack
 	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
+	raw.xmove(L, co, 1)
+
+	-- Push arguments onto the coroutine stack
 	local n = select("#", ...)
-	for i = 1, n do toLua(self._state, L, (select(i, ...))) end
-	raw.call(L, n, LUA_MULTRET)
-	local nresults = raw.gettop(L) - base
-	local results  = {}
-	for i = 1, nresults do results[i] = fromLua(self._state, L, base + i) end
+	for i = 1, n do
+		toLua(state, L, (select(i, ...)))
+	end
+	if n > 0 then
+		raw.xmove(L, co, n)
+	end
+
+	-- Run the coroutine with callback dispatch
+	local ok, err = run_coroutine(state, co, n)
+
+	-- Pop the coroutine thread from L's stack (it was the only thing above base)
+	-- L is back to where it was before newthread
+	raw.pop(L, 1)
+
+	if not ok then
+		raw.settop(L, base)
+		error(err, 2)
+	end
+
+	-- Move results from the coroutine stack to L
+	local nresults = raw.gettop(co)
+	if nresults > 0 then
+		raw.xmove(co, L, nresults)
+	end
+
+	local results = {}
+	for i = 1, nresults do
+		results[i] = fromLua(state, L, base + i)
+	end
 	raw.settop(L, base)
 	return unpack(results, 1, nresults)
 end
@@ -130,20 +242,48 @@ end
 ---@param ... string | number | boolean | lua.Value | function | nil
 ---@return boolean, ...
 function Function:pcall(...)
-	local L    = self._state.L
-	local base = raw.gettop(L)
+	local state = self._state
+	local L     = state.L
+
+	local base  = raw.gettop(L)
+
+	-- Create a coroutine thread (pushed onto L's stack)
+	local co    = raw.newthread(L)
+
+	-- Push the function onto the coroutine stack
 	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
+	raw.xmove(L, co, 1)
+
+	-- Push arguments onto the coroutine stack
 	local n = select("#", ...)
-	for i = 1, n do toLua(self._state, L, (select(i, ...))) end
-	local status = raw.pcall(L, n, LUA_MULTRET, 0)
-	if status ~= LUA_OK then
-		local err = raw.tolstring(L, -1)
+	for i = 1, n do
+		toLua(state, L, (select(i, ...)))
+	end
+	if n > 0 then
+		raw.xmove(L, co, n)
+	end
+
+	-- Run the coroutine with callback dispatch
+	local ok, err = run_coroutine(state, co, n)
+
+	-- Pop the coroutine thread from L's stack
+	raw.pop(L, 1)
+
+	if not ok then
 		raw.settop(L, base)
 		return false, err
 	end
-	local nresults = raw.gettop(L) - base
-	local results  = {}
-	for i = 1, nresults do results[i] = fromLua(self._state, L, base + i) end
+
+	-- Move results from the coroutine stack to L
+	local nresults = raw.gettop(co)
+	if nresults > 0 then
+		raw.xmove(co, L, nresults)
+	end
+
+	local results = {}
+	for i = 1, nresults do
+		results[i] = fromLua(state, L, base + i)
+	end
 	raw.settop(L, base)
 	return true, unpack(results, 1, nresults)
 end
@@ -229,7 +369,7 @@ end
 
 -- Pushes `value` onto the Lua stack.
 -- Accepts plain Lua primitives, lua.Value subtypes (pushed via their registry ref),
--- or plain Lua functions (wrapped as lua_CFunctions via ffi.cast).
+-- or plain Lua functions (registered as yield-based proxy in the inner state).
 ---@param state lua.State
 ---@param L     lua.raw.State
 ---@param value string | number | boolean | lua.Value | function | nil
@@ -258,21 +398,38 @@ toLua = function(state, L, value)
 			raw.pushnil(L)
 		end
 	elseif t == "function" then
-		-- Wrap the outer Lua function as a lua_CFunction in the inner state.
-		-- The callback runs in the outer (lde) Lua interpreter via the FFI callback
-		-- mechanism. JIT is disabled on Function:call/State:load so the outer
-		-- interpreter is in a re-entrant state when this fires.
-		local cb = ffi.cast("lua_CFunction", function(L_raw)
-			local n    = raw.gettop(L_raw)
-			local args = {}
-			for i = 1, n do args[i] = fromLua(state, L_raw, i) end
-			local rets = pack(value(state, unpack(args, 1, n)))
-			for i = 1, rets.n do toLua(state, L_raw, rets[i]) end
-			return rets.n
-		end)
+		-- Store the outer Lua function by ID and load a proxy into the inner state.
+		-- The proxy captures args, stores them in _G.__lua_cb, and yields.
+		-- The outer dispatch loop (in run_coroutine) reads __lua_cb, calls
+		-- the real function, pushes results onto the coroutine stack, and resumes.
+		local id = #state._lua_callbacks + 1
+		state._lua_callbacks[id] = value
 
-		table.insert(state._callbacks, cb)
-		raw.pushcclosure(L, cb, 0)
+		local proxy_code = ([[
+			return function(...)
+				_G.__lua_cb = { id = %d, args = {...} }
+				local results = { coroutine.yield() }
+				_G.__lua_cb = nil
+				if #results > 0 then
+					return unpack(results, 1, #results)
+				end
+				return
+			end
+		]]):format(id)
+
+		local ok = raw.loadstring(L, proxy_code) == 0
+		if not ok then
+			local err = raw.tolstring(L, -1)
+			raw.pop(L, 1)
+			error("failed to load callback proxy: " .. err, 2)
+		end
+		ok = raw.pcall(L, 0, 1, 0) == 0
+		if not ok then
+			local err = raw.tolstring(L, -1)
+			raw.pop(L, 1)
+			error("failed to init callback proxy: " .. err, 2)
+		end
+		-- The proxy function is now on the stack (returned by the loaded chunk)
 	else
 		error("cannot coerce value of type '" .. t .. "' to a Lua value", 2)
 	end
@@ -282,7 +439,7 @@ end
 
 ---@class lua.State
 ---@field L               lua.raw.State
----@field _callbacks      table  -- keeps ffi cdata callbacks alive
+---@field _callbacks      table  -- keeps ffi cdata callbacks alive (legacy)
 ---@field _lua_callbacks  table  -- outer-state Lua functions registered as callbacks
 local State = {}
 State.__index = State
@@ -305,14 +462,38 @@ function State:load(code)
 		raw.pop(L, 1)
 		error(err, 2)
 	end
-	local base = raw.gettop(L) - 1
-	status = raw.pcall(L, 0, LUA_MULTRET, 0)
-	if status ~= LUA_OK then
-		local err = raw.tolstring(L, -1)
-		raw.pop(L, 1)
+
+	-- Execute via coroutine so callbacks (yields) are handled.
+	-- The loaded function is at the top of L.
+	local base = raw.gettop(L) - 1 -- base of loaded function
+	local co   = raw.newthread(L) -- L: [..., func, co], top = base + 2
+
+	-- Move the loaded function from L to co
+	-- Function is at base + 1 on L, move it (and it alone) to co
+	raw.pushvalue(L, base + 1) -- duplicate func: L: [..., func, co, func]
+	raw.xmove(L, co, 1)     -- move duplicate to co: L: [..., func, co]. co: [func]
+
+	-- The coroutine is at base + 2 on L
+	-- Remove the original loaded function from L (it was at base + 1)
+	raw.remove(L, base + 1) -- L: [..., co] (func removed)
+
+	-- Run coroutine
+	local ok, err = run_coroutine(self, co, 0)
+
+	-- Pop the coroutine thread from L
+	raw.pop(L, 1) -- L: back to base
+
+	if not ok then
+		raw.settop(L, base)
 		error(err, 2)
 	end
-	local nresults = raw.gettop(L) - base
+
+	-- Move results from co to L
+	local nresults = raw.gettop(co)
+	if nresults > 0 then
+		raw.xmove(co, L, nresults)
+	end
+
 	if nresults == 0 then return nil end
 	local result = fromLua(self, L, base + 1)
 	raw.settop(L, base)
@@ -359,5 +540,6 @@ end
 jit.off(Function.call, true)
 jit.off(Function.pcall, true)
 jit.off(State.load, true)
+jit.off(run_coroutine, true)
 
 return lua
