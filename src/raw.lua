@@ -376,6 +376,11 @@ raw.getallocf = C.lua_getallocf
 function raw.getfenv(L, idx) return C.lua_getfenv(L, idx) ~= 0 end
 
 raw.getfield = C.lua_getfield
+
+---@param L lua.raw.State
+---@param name string
+function raw.getglobal(L, name) C.lua_getfield(L, -10002, name) end
+
 raw.gethook = C.lua_gethook
 raw.gethookcount = C.lua_gethookcount
 raw.gethookmask = C.lua_gethookmask
