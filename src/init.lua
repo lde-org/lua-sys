@@ -1,8 +1,7 @@
-local ffi = require("ffi")
-local raw = require("lua-sys.raw")
+local ffi               = require("ffi")
+local raw               = require("lua-sys.raw")
 
-local unpack = table.unpack or unpack
-local function pack(...) return { n = select("#", ...), ... } end
+local unpack            = table.unpack or unpack
 
 -- Lua 5.1 / LuaJIT pseudo-indices and constants
 local LUA_REGISTRYINDEX = -10000
@@ -23,6 +22,9 @@ local TYPE_NAMES        = {
 	[7] = "userdata",
 	[8] = "thread"
 }
+
+--- Function you can pass to lua
+---@alias lua.LFunction fun(state: lua.State, ...: lua.Value): ...lua.Value
 
 -- Forward declarations (mutually recursive)
 local fromLua, toLua
@@ -88,6 +90,7 @@ function Value:__tostring()
 	if self._ref == LUA_NOREF then
 		return tostring(self._value)
 	end
+
 	return "lua." .. self._type
 end
 
@@ -179,7 +182,7 @@ function Table:get(key)
 end
 
 ---@param key   string | number | boolean | lua.Value
----@param value string | number | boolean | lua.Value | lua.Function | lua.Table | function | nil
+---@param value string | number | boolean | lua.Value | lua.Function | lua.Table | lua.LFunction | nil
 function Table:set(key, value)
 	local L = self._state.L
 	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref) -- push table
@@ -258,18 +261,89 @@ toLua = function(state, L, value)
 			raw.pushnil(L)
 		end
 	elseif t == "function" then
-		-- Wrap the outer Lua function as a lua_CFunction in the inner state.
-		-- The callback runs in the outer (lde) Lua interpreter via the FFI callback
-		-- mechanism. JIT is disabled on Function:call/State:load so the outer
-		-- interpreter is in a re-entrant state when this fires.
-		local cb = ffi.cast("lua_CFunction", function(L_raw)
-			local n    = raw.gettop(L_raw)
-			local args = {}
-			for i = 1, n do args[i] = fromLua(state, L_raw, i) end
-			local rets = pack(value(state, unpack(args, 1, n)))
-			for i = 1, rets.n do toLua(state, L_raw, rets[i]) end
-			return rets.n
-		end)
+		local nparams = debug.getinfo(value, "u").nparams
+
+		-- Specialize on number of params known ahead of time.
+		local cb
+		if nparams == 0 then
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				raw.pop(L_raw, raw.gettop(L_raw))
+
+				local rets = { value(state) }
+				for i = 1, #rets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return -1
+			end)
+		elseif nparams == 1 then -- only lua state
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				raw.pop(L_raw, raw.gettop(L_raw))
+
+				local rets = { value(state) }
+				for i = 1, #rets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return -1
+			end)
+		elseif nparams == 2 then -- 1 argument
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				local arg1 = fromLua(state, L_raw, 1)
+				raw.pop(L_raw, raw.gettop(L_raw))
+				local rets = { value(state, arg1) }
+				for i = 1, #rets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return -1
+			end)
+		elseif nparams == 3 then -- 2 arguments
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				local arg1 = fromLua(state, L_raw, 1)
+				local arg2 = fromLua(state, L_raw, 2)
+				raw.pop(L_raw, raw.gettop(L_raw))
+				local rets = { value(state, arg1, arg2) }
+				for i = 1, #rets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return -1
+			end)
+		elseif nparams == 4 then
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				local arg1 = fromLua(state, L_raw, 1)
+				local arg2 = fromLua(state, L_raw, 2)
+				local arg3 = fromLua(state, L_raw, 3)
+				local arg4 = fromLua(state, L_raw, 4)
+				raw.pop(L_raw, raw.gettop(L_raw))
+				local rets = { value(state, arg1, arg2, arg3, arg4) }
+				for i = 1, #rets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return -1
+			end)
+		else
+			-- This needs to return -1 only for some reason.
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				local n = raw.gettop(L_raw)
+
+				local args = {}
+				for i = 1, n do
+					args[i] = fromLua(state, L_raw, i)
+				end
+
+				raw.pop(L_raw, n) -- crucial
+
+				local rets = { value(state, args) }
+				for i = 1, #rets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return -1 -- crucial
+			end)
+		end
 
 		table.insert(state._callbacks, cb)
 		raw.pushcclosure(L, cb, 0)
