@@ -343,7 +343,7 @@ toLua = function(state, L, value)
 
 				raw.pop(L_raw, n)
 
-				local rets = { value(state, args) }
+				local rets = { value(state, unpack(args, 1, n)) }
 				local nrets = #rets
 				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
