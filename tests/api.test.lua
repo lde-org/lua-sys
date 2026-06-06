@@ -339,3 +339,36 @@ test.it("checkstack returns boolean", function()
 	test.equal(true, lua.checkstack(st, 100))
 	lua.close(st)
 end)
+
+test.it("debug hook with LUA_MASKCOUNT aborts infinite loop", function()
+	local ffi = require("ffi")
+
+	local st = lua.lnewstate()
+	lua.openlibs(st)
+
+	local LUA_MASKCOUNT = 4
+
+	-- Keep the hook callback alive so it's not GC'd
+	local hook = ffi.cast("lua_Hook", function(L, ar)
+		lua.pushstring(L, "timeout: infinite loop detected")
+		lua.error(L)
+	end)
+
+	-- Fire the hook every 1000 "instructions" (bytecode steps)
+	lua.sethook(st, hook, LUA_MASKCOUNT, 1000)
+
+	-- Load the infinite loop
+	local ok = lua.loadstring(st, "while true do end")
+	test.equal(0, ok)
+
+	-- Run it -- the hook should fire, call lua_error, and pcall should catch it
+	local status = lua.pcall(st, 0, 0, 0)
+	test.notEqual(0, status) -- LUA_OK is 0, so any non-zero means error/yield
+
+	-- Verify the error message
+	local err = lua.tolstring(st, -1)
+	test.includes(err, "infinite loop")
+
+	lua.pop(st, 1)
+	lua.close(st)
+end)
