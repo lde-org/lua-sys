@@ -270,45 +270,51 @@ toLua = function(state, L, value)
 				raw.pop(L_raw, raw.gettop(L_raw))
 
 				local rets = { value(state) }
-				for i = 1, #rets do
+				local nrets = #rets
+				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
 				end
 
-				return -1
+				return nrets == 0 and 0 or -1
 			end)
 		elseif nparams == 1 then -- only lua state
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				raw.pop(L_raw, raw.gettop(L_raw))
 
 				local rets = { value(state) }
-				for i = 1, #rets do
+				local nrets = #rets
+				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
 				end
 
-				return -1
+				return nrets == 0 and 0 or -1
 			end)
 		elseif nparams == 2 then -- 1 argument
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				local arg1 = fromLua(state, L_raw, 1)
 				raw.pop(L_raw, raw.gettop(L_raw))
+
 				local rets = { value(state, arg1) }
-				for i = 1, #rets do
+				local nrets = #rets
+				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
 				end
 
-				return -1
+				return nrets == 0 and 0 or -1
 			end)
 		elseif nparams == 3 then -- 2 arguments
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				local arg1 = fromLua(state, L_raw, 1)
 				local arg2 = fromLua(state, L_raw, 2)
 				raw.pop(L_raw, raw.gettop(L_raw))
+
 				local rets = { value(state, arg1, arg2) }
-				for i = 1, #rets do
+				local nrets = #rets
+				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
 				end
 
-				return -1
+				return nrets == 0 and 0 or -1
 			end)
 		elseif nparams == 4 then
 			cb = ffi.cast("lua_CFunction", function(L_raw)
@@ -317,15 +323,16 @@ toLua = function(state, L, value)
 				local arg3 = fromLua(state, L_raw, 3)
 				local arg4 = fromLua(state, L_raw, 4)
 				raw.pop(L_raw, raw.gettop(L_raw))
+
 				local rets = { value(state, arg1, arg2, arg3, arg4) }
-				for i = 1, #rets do
+				local nrets = #rets
+				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
 				end
 
-				return -1
+				return nrets == 0 and 0 or -1
 			end)
 		else
-			-- This needs to return -1 only for some reason.
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				local n = raw.gettop(L_raw)
 
@@ -334,14 +341,15 @@ toLua = function(state, L, value)
 					args[i] = fromLua(state, L_raw, i)
 				end
 
-				raw.pop(L_raw, n) -- crucial
+				raw.pop(L_raw, n)
 
 				local rets = { value(state, args) }
-				for i = 1, #rets do
+				local nrets = #rets
+				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
 				end
 
-				return -1 -- crucial
+				return nrets == 0 and 0 or -1
 			end)
 		end
 
@@ -380,12 +388,11 @@ function State:load(code)
 		error(err, 2)
 	end
 	local base = raw.gettop(L) - 1
-	status = raw.pcall(L, 0, LUA_MULTRET, 0)
-	if status ~= LUA_OK then
-		local err = raw.tolstring(L, -1)
-		raw.pop(L, 1)
-		error(err, 2)
-	end
+	-- NOTE: lua_pcall (C API) does not handle FFI callbacks that return
+	-- LUA_MULTRET (it returns status 1).  lua_call works fine, so we use
+	-- raw.call here.  Syntax errors are caught by raw.loadstring above;
+	-- runtime errors from the loaded code will propagate (same as fn:call).
+	raw.call(L, 0, LUA_MULTRET)
 	local nresults = raw.gettop(L) - base
 	if nresults == 0 then return nil end
 	local result = fromLua(self, L, base + 1)

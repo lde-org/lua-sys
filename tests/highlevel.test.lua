@@ -194,49 +194,51 @@ end)
 
 -- ─── Lua function wrapping ────────────────────────────────────────────────
 
--- test.it("globals:set accepts a plain Lua function (wrapped as CFunction)", function()
--- 	local state = lua.new()
--- 	local g = state:globals()
+test.it("globals:set accepts a plain Lua function (wrapped as CFunction)", function()
+	local state = lua.new()
+	local g = state:globals()
 
--- 	g:set("add", function(st, a, b)
--- 		return a:value() + b:value()
--- 	end)
+	g:set("add", function(st, a, b)
+		return a:value() + b:value()
+	end)
 
--- 	local v = state:load("return add(3, 4)")
--- 	test.equal(7, v:value())
--- 	state:close()
--- end)
+	local v = state:load("return add(3, 4)")
+	test.equal(7, v:value())
+	state:close()
+end)
 
--- test.it("wrapped Lua function can return multiple values", function()
--- 	local state = lua.new()
--- 	local g = state:globals()
+test.it("wrapped Lua function can return multiple values", function()
+	local state = lua.new()
+	local g = state:globals()
 
--- 	g:set("swap", function(st, a, b)
--- 		return b, a
--- 	end)
+	g:set("swap", function(st, a, b)
+		return b, a
+	end)
 
--- 	-- load runs the chunk; swap returns two values but load captures only the first
--- 	local fn = state:load("function() return swap(1, 2) end")
--- 	local r1, r2 = fn:call()
--- 	test.equal(2, r1:value())
--- 	test.equal(1, r2:value())
--- 	state:close()
--- end)
+	-- load runs the chunk; swap returns two values but load captures only the first
+	local fn = state:load("function() return swap(1, 2) end")
+	local r1, r2 = fn:call()
+	test.equal(2, r1:value())
+	test.equal(1, r2:value())
+	state:close()
+end)
 
--- test.it("wrapped Lua function returning nil produces no results", function()
--- 	local state = lua.new()
--- 	local g = state:globals()
--- 	local called = false
+test.it("wrapped Lua function returning nil produces no results", function()
+	local state = lua.new()
+	local g = state:globals()
+	local called = false
 
--- 	g:set("noop", function(st)
--- 		called = true
--- 	end)
+	g:set("noop", function(st)
+		called = true
+	end)
 
--- 	local v = state:load("noop(); return 'done'")
--- 	test.equal(true, called)
--- 	test.equal("done", v:value())
--- 	state:close()
--- end)
+	-- load a function expression that calls noop then returns a value
+	local fn = state:load("function() noop(); return 'done' end")
+	local v = fn:call()
+	test.equal(true, called)
+	test.equal("done", v:value())
+	state:close()
+end)
 
 -- ─── Value helpers ────────────────────────────────────────────────────────
 
