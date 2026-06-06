@@ -144,7 +144,7 @@ ffi.cdef [[
   void lua_rawseti(lua_State *L, int idx, int n);
   void lua_remove(lua_State *L, int idx);
   void lua_replace(lua_State *L, int idx);
-  int lua_resume(lua_State *L, lua_State *from, int nargs);
+  int lua_resume(lua_State *L, int narg);
   void lua_setallocf(lua_State *L, lua_Alloc f, void *ud);
   int lua_setfenv(lua_State *L, int idx);
   void lua_setfield(lua_State *L, int idx, const char *k);
@@ -300,7 +300,7 @@ ffi.cdef [[
 ---@field lua_rawseti fun(L: lua.raw.State, idx: integer, n: integer)
 ---@field lua_remove fun(L: lua.raw.State, idx: integer)
 ---@field lua_replace fun(L: lua.raw.State, idx: integer)
----@field lua_resume fun(L: lua.raw.State, from: lua.raw.State, nargs: integer): integer
+---@field lua_resume fun(L: lua.raw.State, narg: integer): integer
 ---@field lua_setallocf fun(L: lua.raw.State, alloc: fun(ud: ffi.cdata*, ptr: ffi.cdata*, osize: integer, nsize: integer): ffi.cdata*, ud: ffi.cdata*)
 ---@field lua_setfenv fun(L: lua.raw.State, idx: integer): integer
 ---@field lua_setfield fun(L: lua.raw.State, idx: integer, k: string)
