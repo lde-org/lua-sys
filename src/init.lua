@@ -131,7 +131,8 @@ end
 
 --- Protected call. Returns false + error string on failure, true + results on success.
 ---@param ... string | number | boolean | lua.Value | function | nil
----@return boolean, ...
+---@return boolean
+---@return lua.Value ...
 function Function:pcall(...)
 	local L    = self._state.L
 	local base = raw.gettop(L)
