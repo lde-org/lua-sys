@@ -198,7 +198,7 @@ test.it("globals:set accepts a plain Lua function (wrapped as CFunction)", funct
 	local state = lua.new()
 	local g = state:globals()
 
-	g:set("add", function(st, a, b)
+	g:set("add", function(a, b)
 		return a:value() + b:value()
 	end)
 
@@ -211,7 +211,7 @@ test.it("wrapped Lua function can return multiple values", function()
 	local state = lua.new()
 	local g = state:globals()
 
-	g:set("swap", function(st, a, b)
+	g:set("swap", function(a, b)
 		return b, a
 	end)
 
@@ -228,7 +228,7 @@ test.it("wrapped Lua function returning nil produces no results", function()
 	local g = state:globals()
 	local called = false
 
-	g:set("noop", function(st)
+	g:set("noop", function()
 		called = true
 	end)
 
@@ -288,7 +288,7 @@ end)
 test.it("fn:pcall succeeds when function calls wrapped Lua function", function()
 	local state = lua.new()
 	local g = state:globals()
-	g:set("double", function(st, x)
+	g:set("double", function(x)
 		return x:value() * 2
 	end)
 	local fn = state:load("function(x) return double(x) end")
@@ -301,7 +301,7 @@ end)
 test.it("fn:pcall catches errors that occur after wrapped calls", function()
 	local state = lua.new()
 	local g = state:globals()
-	g:set("noop", function(st) end)
+	g:set("noop", function() end)
 	local fn = state:load("function() noop(); error('kaboom') end")
 	local ok, err = fn:pcall()
 	test.equal(false, ok)
@@ -313,7 +313,7 @@ end)
 test.it("fn:pcall returns results from wrapped function calls", function()
 	local state = lua.new()
 	local g = state:globals()
-	g:set("add", function(st, a, b)
+	g:set("add", function(a, b)
 		return a:value() + b:value()
 	end)
 	local fn = state:load("function(a, b) return add(a, b) end")

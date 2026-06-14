@@ -24,7 +24,7 @@ local TYPE_NAMES        = {
 }
 
 --- Function you can pass to lua
----@alias lua.LFunction fun(state: lua.State, ...: lua.Value): ...lua.Value
+---@alias lua.LFunction fun(...: lua.Value): ...lua.Value
 
 -- Forward declarations (mutually recursive)
 local fromLua, toLua
@@ -270,7 +270,7 @@ toLua = function(state, L, value)
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				raw.pop(L_raw, raw.gettop(L_raw))
 
-				local rets = { value(state) }
+				local rets = { value() }
 				local nrets = #rets
 				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
@@ -278,24 +278,12 @@ toLua = function(state, L, value)
 
 				return nrets == 0 and 0 or -1
 			end)
-		elseif nparams == 1 then -- only lua state
-			cb = ffi.cast("lua_CFunction", function(L_raw)
-				raw.pop(L_raw, raw.gettop(L_raw))
-
-				local rets = { value(state) }
-				local nrets = #rets
-				for i = 1, nrets do
-					toLua(state, L_raw, rets[i])
-				end
-
-				return nrets == 0 and 0 or -1
-			end)
-		elseif nparams == 2 then -- 1 argument
+		elseif nparams == 1 then
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				local arg1 = fromLua(state, L_raw, 1)
 				raw.pop(L_raw, raw.gettop(L_raw))
 
-				local rets = { value(state, arg1) }
+				local rets = { value(arg1) }
 				local nrets = #rets
 				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
@@ -303,13 +291,28 @@ toLua = function(state, L, value)
 
 				return nrets == 0 and 0 or -1
 			end)
-		elseif nparams == 3 then -- 2 arguments
+		elseif nparams == 2 then
 			cb = ffi.cast("lua_CFunction", function(L_raw)
 				local arg1 = fromLua(state, L_raw, 1)
 				local arg2 = fromLua(state, L_raw, 2)
 				raw.pop(L_raw, raw.gettop(L_raw))
 
-				local rets = { value(state, arg1, arg2) }
+				local rets = { value(arg1, arg2) }
+				local nrets = #rets
+				for i = 1, nrets do
+					toLua(state, L_raw, rets[i])
+				end
+
+				return nrets == 0 and 0 or -1
+			end)
+		elseif nparams == 3 then
+			cb = ffi.cast("lua_CFunction", function(L_raw)
+				local arg1 = fromLua(state, L_raw, 1)
+				local arg2 = fromLua(state, L_raw, 2)
+				local arg3 = fromLua(state, L_raw, 3)
+				raw.pop(L_raw, raw.gettop(L_raw))
+
+				local rets = { value(arg1, arg2, arg3) }
 				local nrets = #rets
 				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
@@ -325,7 +328,7 @@ toLua = function(state, L, value)
 				local arg4 = fromLua(state, L_raw, 4)
 				raw.pop(L_raw, raw.gettop(L_raw))
 
-				local rets = { value(state, arg1, arg2, arg3, arg4) }
+				local rets = { value(arg1, arg2, arg3, arg4) }
 				local nrets = #rets
 				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
@@ -344,7 +347,7 @@ toLua = function(state, L, value)
 
 				raw.pop(L_raw, n)
 
-				local rets = { value(state, unpack(args, 1, n)) }
+				local rets = { value(unpack(args, 1, n)) }
 				local nrets = #rets
 				for i = 1, nrets do
 					toLua(state, L_raw, rets[i])
