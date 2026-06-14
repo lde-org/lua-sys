@@ -322,3 +322,42 @@ test.it("fn:pcall returns results from wrapped function calls", function()
 	test.equal(30, result:value())
 	state:close()
 end)
+
+-- ─── Null byte handling ─────────────────────────────────────────────────────
+
+test.it("strings with embedded nulls survive fn:call roundtrip", function()
+	local state = lua.new()
+	-- Load a function that returns its argument unchanged (identity)
+	local id = state:load("function(s) return s end")
+	local original = "hello\0world"
+	test.equal(11, #original) -- verify the string actually has a null byte
+	local result = id:call(original)
+	test.equal("string", result:type())
+	test.equal(original, result:value())
+	state:close()
+end)
+
+test.it("strings with embedded nulls survive Table set/get roundtrip", function()
+	local state = lua.new()
+	local g = state:globals()
+	local original = "foo\0bar"
+	test.equal(7, #original)
+	g:set("nulkey", original)
+	local v = g:get("nulkey")
+	test.equal("string", v:type())
+	test.equal(original, v:value())
+	state:close()
+end)
+
+test.it("strings with embedded nulls survive table set/get in Lua evaluation", function()
+	local state = lua.new()
+	local original = "a\0b\0c"
+	test.equal(5, #original)
+	local getter = state:load("function() return tbl end")
+	local g = state:globals()
+	g:set("tbl", original)
+	local result = getter:call()
+	test.equal("string", result:type())
+	test.equal(original, result:value())
+	state:close()
+end)

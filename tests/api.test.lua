@@ -340,6 +340,17 @@ test.it("checkstack returns boolean", function()
 	lua.close(st)
 end)
 
+test.it("pushlstring / tolstring preserves embedded null bytes", function()
+	local st = lua.lnewstate()
+	local original = "ab\0cd\0ef"
+	test.equal(8, #original)
+	lua.pushlstring(st, original, #original)
+	test.equal(LUA_TSTRING, lua.type(st, 1))
+	test.equal(8, lua.objlen(st, 1))
+	test.equal(original, lua.tolstring(st, 1))
+	lua.close(st)
+end)
+
 test.it("debug hook with LUA_MASKCOUNT aborts infinite loop", function()
 	local ffi = require("ffi")
 

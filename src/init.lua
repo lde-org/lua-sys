@@ -247,7 +247,7 @@ toLua = function(state, L, value)
 	elseif t == "number" then
 		raw.pushnumber(L, value)
 	elseif t == "string" then
-		raw.pushstring(L, value)
+		raw.pushlstring(L, value, #value)
 	elseif t == "table" and isValue(value) then
 		-- lua.Value: push from registry ref for compound types, or push primitive directly
 		if value._ref ~= LUA_NOREF then
@@ -255,7 +255,7 @@ toLua = function(state, L, value)
 		elseif value._type == "number" then
 			raw.pushnumber(L, value._value)
 		elseif value._type == "string" then
-			raw.pushstring(L, value._value)
+			raw.pushlstring(L, value._value, #value._value)
 		elseif value._type == "boolean" then
 			raw.pushboolean(L, value._value and 1 or 0)
 		else

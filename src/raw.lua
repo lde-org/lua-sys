@@ -509,8 +509,8 @@ raw.tointegerx = C.lua_tointegerx
 ---@param idx integer
 ---@return string
 function raw.tolstring(L, idx)
-	local p = nil ---@type ffi.cdata*
-	return ffi.string(C.lua_tolstring(L, idx, p))
+	local len = ffi.new("size_t[1]")
+	return ffi.string(C.lua_tolstring(L, idx, len), len[0])
 end
 
 raw.tonumber = C.lua_tonumber
@@ -546,8 +546,8 @@ raw.checkinteger = C.luaL_checkinteger
 ---@param idx integer
 ---@return string
 function raw.checklstring(L, idx)
-	local p = nil ---@type ffi.cdata*
-	return ffi.string(C.luaL_checklstring(L, idx, p))
+	local len = ffi.new("size_t[1]")
+	return ffi.string(C.luaL_checklstring(L, idx, len), len[0])
 end
 
 raw.checknumber = C.luaL_checknumber
