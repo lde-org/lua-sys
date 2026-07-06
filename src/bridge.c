@@ -22,13 +22,13 @@ static int        callback_table_ref = LUA_NOREF;
 
 // ── Value copying ─────────────────────────────────────────────────────────
 
-static int is_primitive(lua_State *L, int idx) {
-    int t = lua_type(L, idx);
-    return t == LUA_TNIL || t == LUA_TBOOLEAN || t == LUA_TNUMBER || t == LUA_TSTRING;
-}
-
-static void push_primitive(lua_State *src, int idx, lua_State *dst) {
-    switch (lua_type(src, idx)) {
+// Pushes src[idx] onto dst if it is a primitive type, returns the lua_type.
+// Returns -1 for compound types (nothing pushed onto dst).
+// Single lua_type call covers both the check and the dispatch — eliminates
+// the double type-check of a separate is_primitive() + push_primitive().
+static int push_primitive_typed(lua_State *src, int idx, lua_State *dst) {
+    int t = lua_type(src, idx);
+    switch (t) {
     case LUA_TNIL:     lua_pushnil(dst); break;
     case LUA_TBOOLEAN: lua_pushboolean(dst, lua_toboolean(src, idx)); break;
     case LUA_TNUMBER:  lua_pushnumber(dst, lua_tonumber(src, idx)); break;
@@ -38,14 +38,13 @@ static void push_primitive(lua_State *src, int idx, lua_State *dst) {
         lua_pushlstring(dst, s, len);
         break;
     }
-    default: break;
+    default: return -1; /* compound — nothing pushed */
     }
+    return t;
 }
 
 static void push_primitive_or_error(lua_State *src, int idx, lua_State *dst) {
-    if (is_primitive(src, idx)) {
-        push_primitive(src, idx, dst);
-    } else {
+    if (push_primitive_typed(src, idx, dst) < 0) {
         lua_pushfstring(src, "bridge: cannot pass %s across independent states",
             lua_typename(src, lua_type(src, idx)));
         lua_error(src);
@@ -114,15 +113,14 @@ static int bound_call(lua_State *host) {
 
     int nresults = lua_gettop(guest) - guest_base;
     for (i = 0; i < nresults; i++) {
-        if (!is_primitive(guest, guest_base + 1 + i)) {
+        if (push_primitive_typed(guest, guest_base + 1 + i, host) < 0) {
+            /* compound result: undo the i values already copied to host */
+            lua_settop(host, lua_gettop(host) - i);
             lua_settop(guest, guest_base);
             lua_pushlightuserdata(host, (void *)&COMPOUND_TAG_ADDR);
             return 1;
         }
     }
-
-    for (i = 0; i < nresults; i++)
-        push_primitive(guest, guest_base + 1 + i, host);
     lua_settop(guest, guest_base);
     return nresults;
 }
