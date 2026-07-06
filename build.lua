@@ -14,43 +14,18 @@ local ext, flags, extra_link
 if jit.os == "Windows" then
     ext   = "dll"
     flags = "-shared"
-    -- Windows DLLs cannot resolve symbols from the host executable at
-    -- runtime. Generate an import library so gcc can link against lde's
-    -- embedded LuaJIT symbols.
-    --
-    -- Use GetModuleFileNameA to find the running executable, then nm to
-    -- extract every exported lua*/luaL*/luaJIT* symbol — avoids a manual
-    -- list that goes stale when lde adds new API surface.
+    -- sea.compile generates an import library (<exename>.a) alongside the exe
+    -- via --out-implib, exporting all lua* symbols. Link against it directly.
     local ffi = require("ffi")
     ffi.cdef("unsigned long GetModuleFileNameA(void*, char*, unsigned long);")
     local buf = ffi.new("char[512]")
     ffi.C.GetModuleFileNameA(nil, buf, 512)
     local exe_path = ffi.string(buf)
-    local exe_name = exe_path:match("[^\\/]+$") or "lde.exe"
-
-    local def_path = out .. "/lde.def"
-    local lib_path = out .. "/liblde.a"
-    local def = assert(io.open(def_path, "w"))
-    def:write("EXPORTS\n")
-    local nm   = io.popen('nm --defined-only "' .. exe_path .. '" 2>NUL')
-    local seen = {}
-    for line in nm:lines() do
-        -- nm output: <addr> <class> <symbol>
-        -- T/W = exported text symbol; match lua*, luaL*, luaJIT* names
-        local sym = line:match("%s+[TW]%s+(lua[a-zA-Z0-9_]+)$")
-        if sym and not seen[sym] then
-            seen[sym] = true
-            def:write("    " .. sym .. "\n")
-        end
-    end
-    nm:close()
-    def:close()
-    build:sh("dlltool --dllname " .. exe_name
-        .. " -d " .. def_path .. " -l " .. lib_path)
-    extra_link = " -L" .. out .. " -llde"
+    local imp_path = exe_path:gsub("%.exe$", "") .. ".a"
+    extra_link = " -L" .. out .. " " .. imp_path
 elseif jit.os == "OSX" then
     ext        = "dylib"
-    flags      = "-dynamiclib"
+    flags      = "-dynamiclib -undefined dynamic_lookup"
     extra_link = ""
 else
     ext        = "so"
