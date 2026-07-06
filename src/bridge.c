@@ -17,9 +17,7 @@
 
 #include <stdint.h>
 
-#define COMPOUND_RESULT_MSG "bridge: compound result"
-
-static lua_State *host_L       = NULL;
+static lua_State *host_L            = NULL;
 static int        callback_table_ref = LUA_NOREF;
 
 // ── Value copying ─────────────────────────────────────────────────────────
@@ -69,11 +67,7 @@ static lua_State *decode_guest_ptr(int stack_pos) {
 // ── Callback table ────────────────────────────────────────────────────────
 
 static void ensure_callback_table(void) {
-    if (callback_table_ref != LUA_NOREF) {
-        lua_rawgeti(host_L, LUA_REGISTRYINDEX, callback_table_ref);
-        if (!lua_isnil(host_L, -1)) { lua_pop(host_L, 1); return; }
-        lua_pop(host_L, 1);
-    }
+    if (callback_table_ref != LUA_NOREF) return;
     lua_newtable(host_L);
     callback_table_ref = luaL_ref(host_L, LUA_REGISTRYINDEX);
 }
@@ -91,19 +85,19 @@ static void ensure_callback_table(void) {
 //
 // Return protocol:
 //   All-primitive results: returns them directly (zero overhead on hot path).
-//   Compound results: returns (COMPOUND_TAG lightuserdata) as sole value.
+//   Compound results: returns COMPOUND_TAG_ADDR as a lightuserdata sentinel.
 //     The Lua wrapper detects the tag and calls callGuestSlow instead.
 //   Guest error: raises a Lua error normally.
 
-static char COMPOUND_TAG_ADDR; /* unique address used as lightuserdata tag */
+static char COMPOUND_TAG_ADDR;
 
 static int bound_call(lua_State *host) {
-    lua_State *guest    = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
-    int guest_fn_ref    = (int)lua_tointeger(host, lua_upvalueindex(2));
-    int nargs           = lua_gettop(host);
-    int guest_base      = lua_gettop(guest);
+    lua_State *guest = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
+    int fn_ref       = (int)lua_tointeger(host, lua_upvalueindex(2));
+    int nargs        = lua_gettop(host);
+    int guest_base   = lua_gettop(guest);
 
-    lua_rawgeti(guest, LUA_REGISTRYINDEX, guest_fn_ref);
+    lua_rawgeti(guest, LUA_REGISTRYINDEX, fn_ref);
 
     int i;
     for (i = 1; i <= nargs; i++)
@@ -142,8 +136,6 @@ static int bridge_make_callable(lua_State *L) {
     return 1;
 }
 
-// bridge.compound_tag() → lightuserdata
-// The sentinel value returned by bound_call when results include compound types.
 static int bridge_compound_tag(lua_State *L) {
     (void)L;
     lua_pushlightuserdata(host_L, (void *)&COMPOUND_TAG_ADDR);
@@ -168,16 +160,11 @@ static int dispatch_callback(lua_State *guest) {
     int callback_id = (int)lua_tointeger(guest, lua_upvalueindex(1));
     int saved_top   = lua_gettop(host_L);
 
-    // callback_table_ref: use rawgeti (O(1) int lookup) rather than
-    // getfield (string hash) — shaves ~13 ns off every callback invocation.
-    if (callback_table_ref == LUA_NOREF) {
-        lua_pushstring(guest, "bridge: callback table missing");
-        lua_error(guest);
-        return 0;
-    }
+    // Look up the callback function directly by integer key.
+    // callback_table_ref: rawgeti (O(1)) rather than getfield (string hash).
     lua_rawgeti(host_L, LUA_REGISTRYINDEX, callback_table_ref);
     lua_rawgeti(host_L, -1, callback_id);
-    lua_remove(host_L, -2);
+    lua_replace(host_L, -2); /* replace the table with the function */
 
     if (lua_isnil(host_L, -1)) {
         lua_settop(host_L, saved_top);
@@ -211,7 +198,6 @@ static int dispatch_callback(lua_State *guest) {
 
 // ── Exported functions ────────────────────────────────────────────────────
 
-// bridge.register(host_fn) → callback_id
 static int bridge_register(lua_State *L) {
     (void)L;
     luaL_checktype(host_L, 1, LUA_TFUNCTION);
@@ -225,7 +211,6 @@ static int bridge_register(lua_State *L) {
     return 1;
 }
 
-// bridge.push_callback(guest_L_ptr, callback_id)
 // Pushes a dispatch_callback closure onto the guest state.
 // Done in C so the closure is a real lua_CFunction on the guest — not an FFI
 // cdata — preventing JIT tracing into the host from the guest side.
@@ -238,7 +223,6 @@ static int bridge_push_callback(lua_State *L) {
     return 0;
 }
 
-// bridge.unregister(callback_id)
 static int bridge_unregister(lua_State *L) {
     (void)L;
     if (callback_table_ref == LUA_NOREF) return 0;
@@ -250,53 +234,12 @@ static int bridge_unregister(lua_State *L) {
     return 0;
 }
 
-// bridge.call(guest_L_ptr, guest_fn_ref, arg1, ...) → results...
-// Kept for completeness; hot path uses bound_call via make_callable instead.
-static int bridge_call(lua_State *L) {
-    (void)L;
-    lua_State *guest    = decode_guest_ptr(1);
-    int        fn_ref   = (int)lua_tointeger(host_L, 2);
-    int        nargs    = lua_gettop(host_L) - 2;
-    int        guest_base = lua_gettop(guest);
-
-    lua_rawgeti(guest, LUA_REGISTRYINDEX, fn_ref);
-
-    int i;
-    for (i = 3; i <= 2 + nargs; i++)
-        push_primitive_or_error(host_L, i, guest);
-
-    int status = lua_pcall(guest, nargs, LUA_MULTRET, 0);
-    if (status != 0) {
-        const char *err = lua_tostring(guest, -1);
-        lua_settop(guest, guest_base);
-        lua_pushstring(host_L, err ? err : "bridge: guest error");
-        lua_error(host_L);
-        return 0;
-    }
-
-    int nresults = lua_gettop(guest) - guest_base;
-    for (i = 0; i < nresults; i++) {
-        if (!is_primitive(guest, guest_base + 1 + i)) {
-            lua_settop(guest, guest_base);
-            lua_pushstring(host_L, COMPOUND_RESULT_MSG);
-            lua_error(host_L);
-            return 0;
-        }
-    }
-    for (i = 0; i < nresults; i++)
-        push_primitive(guest, guest_base + 1 + i, host_L);
-
-    lua_settop(guest, guest_base);
-    return nresults;
-}
-
 static const luaL_Reg bridge_funcs[] = {
-    { "call",           bridge_call },
     { "make_callable",  bridge_make_callable },
-    { "compound_tag",   bridge_compound_tag },
-    { "register",       bridge_register },
+    { "compound_tag",   bridge_compound_tag  },
+    { "register",       bridge_register      },
     { "push_callback",  bridge_push_callback },
-    { "unregister",     bridge_unregister },
+    { "unregister",     bridge_unregister    },
     { NULL, NULL }
 };
 

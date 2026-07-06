@@ -64,6 +64,7 @@ int   lua_gettop   (lua_State *L);
 void  lua_settop   (lua_State *L, int idx);
 void  lua_pushvalue(lua_State *L, int idx);
 void  lua_remove   (lua_State *L, int idx);
+void  lua_replace  (lua_State *L, int idx);
 
 /* ── Type inspection ── */
 int         lua_type    (lua_State *L, int idx);
