@@ -15,8 +15,19 @@ if jit.os == "Windows" then
     ext        = "dll"
     flags      = "-shared"
     -- Windows DLLs cannot resolve symbols from the host executable at
-    -- runtime. Generate a minimal import library from a .def file so gcc
-    -- can link against lde.exe's embedded LuaJIT symbols.
+    -- runtime. Generate a minimal import library so gcc can link against
+    -- lde's embedded LuaJIT symbols.
+    --
+    -- Use GetModuleFileNameA to get the actual running executable name
+    -- rather than hardcoding "lde.exe" — works regardless of how the
+    -- binary is named or installed.
+    local ffi = require("ffi")
+    ffi.cdef("unsigned long GetModuleFileNameA(void*, char*, unsigned long);")
+    local buf = ffi.new("char[512]")
+    ffi.C.GetModuleFileNameA(nil, buf, 512)
+    local exe_path = ffi.string(buf)
+    local exe_name = exe_path:match("[^\\/]+$") or "lde.exe"
+
     local def_path = out .. "/lde.def"
     local lib_path = out .. "/liblde.a"
     local def = io.open(def_path, "w")
@@ -35,7 +46,7 @@ if jit.os == "Windows" then
         def:write("    " .. sym .. "\n")
     end
     def:close()
-    build:sh("dlltool -d " .. def_path .. " -l " .. lib_path)
+    build:sh("dlltool --dllname " .. exe_name .. " -d " .. def_path .. " -l " .. lib_path)
     extra_link = " -L" .. out .. " -llde"
 elseif jit.os == "OSX" then
     ext        = "dylib"
