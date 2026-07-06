@@ -13,9 +13,7 @@
 // when it tries to trace FFI calls on a lua_State* pointer encountered during
 // re-entrant execution (host → guest → host). See docs/bridge-design.md.
 
-#include "lua.h"
-#include "lauxlib.h"
-#include "lualib.h"
+#include "lua_bridge.h"
 
 #include <stdint.h>
 
