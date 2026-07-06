@@ -1,20 +1,27 @@
 -- build.lua — Compiles the C bridge module for lua-sys.
 --
--- bridge.c uses only the Lua C API via a bundled minimal header (lua_bridge.h).
+-- Uses gcc (available on all supported platforms).
 -- No system luajit-dev package is needed: lde already embeds LuaJIT and
--- exports all required symbols, so bridge.so resolves them at load time
--- from the process image without an explicit -l flag.
+-- exports all required symbols, so the shared library resolves them at
+-- runtime from the process image without an explicit -l flag.
 
 local build = require("lde-build")
 
 local out = assert(os.getenv("LDE_OUTPUT_DIR"), "LDE_OUTPUT_DIR not set")
 
-local os_name = jit.os  -- "Linux", "OSX", "BSD", ...
+local ext, flags
+if jit.os == "Windows" then
+    ext   = "dll"
+    flags = "-shared"
+elseif jit.os == "OSX" then
+    ext   = "dylib"
+    flags = "-dynamiclib"
+else
+    ext   = "so"
+    flags = "-shared -fPIC"
+end
 
-local shared_flag = os_name == "OSX" and "-dynamiclib" or "-shared -fPIC"
-local ext         = os_name == "OSX" and "dylib"       or "so"
-
-build:sh("cc " .. shared_flag .. " -O2"
-    .. " -I" .. out          -- pick up lua_bridge.h from the output dir
+build:sh("gcc " .. flags .. " -O2"
+    .. " -I" .. out
     .. " -o " .. out .. "/bridge." .. ext
     .. " " .. out .. "/bridge.c")
