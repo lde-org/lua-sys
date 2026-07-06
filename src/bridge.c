@@ -64,22 +64,19 @@ static lua_State *decode_guest_ptr(int stack_pos) {
 
 // ── bound_call ────────────────────────────────────────────────────────────
 //
-// lua_CFunction installed on the host state via bridge.make_callable.
+// lua_CFunction returned by bridge.make_callable. Installed directly as the
+// callable on the host — no Lua wrapper needed.
+//
 // Upvalue 1: lightuserdata  — guest lua_State*
 // Upvalue 2: integer        — guest LUA_REGISTRYINDEX ref for the function
-//
-// Called directly by host Lua code as fn(...). This is a lua_CFunction, not
-// an FFI call, so JIT traces see it as an opaque C boundary and do not
-// attempt to record through it into the guest — preventing the re-entrancy
-// crash described in docs/bridge-design.md.
+// Upvalue 3: table          — guestState (lua.State object)
+// Upvalue 4: integer        — registry ref for callGuestSlow(guestState, guestRef, ...)
 //
 // Return protocol:
-//   All-primitive results: returns them directly (zero overhead on hot path).
-//   Compound results: returns COMPOUND_TAG_ADDR as a lightuserdata sentinel.
-//     The Lua wrapper detects the tag and calls callGuestSlow instead.
-//   Guest error: raises a Lua error normally.
-
-static char COMPOUND_TAG_ADDR;
+//   All-primitive results: pushed directly onto host, returned normally.
+//   Any compound result: calls callGuestSlow(guestState, guestRef, <original args>)
+//     from C and returns its results. No Lua wrapper needed.
+//   Guest error: raises a Lua error on host.
 
 static int bound_call(lua_State *host) {
     lua_State *guest = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
@@ -107,10 +104,20 @@ static int bound_call(lua_State *host) {
 
     for (i = 0; i < nresults; i++) {
         if (push_primitive_typed(guest, guest_base + 1 + i, host) < 0) {
+            // Compound result — call callGuestSlow(guestState, guestRef, <args>).
+            // Undo partial copies from host and restore guest stack first.
             lua_settop(host, nargs);
             lua_settop(guest, guest_base);
-            lua_pushlightuserdata(host, (void *)&COMPOUND_TAG_ADDR);
-            return 1;
+
+            int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(4));
+            lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref); /* callGuestSlow */
+            lua_pushvalue(host, lua_upvalueindex(3));        /* guestState */
+            lua_pushinteger(host, fn_ref);                   /* guestRef */
+            for (i = 1; i <= nargs; i++)
+                lua_pushvalue(host, i);                      /* original args */
+            status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
+            if (status != LUA_OK) lua_error(host);
+            return lua_gettop(host) - nargs;
         }
     }
     lua_settop(guest, guest_base);
@@ -119,16 +126,20 @@ static int bound_call(lua_State *host) {
 
 static int bridge_make_callable(lua_State *L) {
     (void)L;
+    // Args on host_L: (1) guest_L_ptr, (2) guestRef, (3) guestState, (4) callGuestSlow
     lua_State *guest = decode_guest_ptr(1);
-    lua_pushlightuserdata(host_L, (void *)guest);
-    lua_pushvalue(host_L, 2); /* guest_fn_ref */
-    lua_pushcclosure(host_L, bound_call, 2);
+    lua_pushlightuserdata(host_L, (void *)guest); /* upvalue 1 */
+    lua_pushvalue(host_L, 2);                     /* upvalue 2: guestRef */
+    lua_pushvalue(host_L, 3);                     /* upvalue 3: guestState */
+    lua_pushvalue(host_L, 4);                     /* upvalue 4: callGuestSlow ref */
+    lua_pushcclosure(host_L, bound_call, 4);
     return 1;
 }
 
 static int bridge_compound_tag(lua_State *L) {
     (void)L;
-    lua_pushlightuserdata(host_L, (void *)&COMPOUND_TAG_ADDR);
+    /* kept for API compatibility — no longer used by bound_call */
+    lua_pushboolean(host_L, 0);
     return 1;
 }
 

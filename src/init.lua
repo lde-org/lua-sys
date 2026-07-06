@@ -179,11 +179,9 @@ end
 
 -- ─── makeCallable ─────────────────────────────────────────────────────────
 
--- bound_call returns this lightuserdata as the sole return value when the
--- guest function returned compound types. Cheaper to check than pcall+error.
-local COMPOUND_TAG = bridge.compound_tag()
-
--- Slow path for cross-state calls when results include compound types.
+-- Slow path for cross-state calls when results include compound types
+-- (tables, functions, userdata). Called from C via bound_call upvalue 4
+-- when bound_call detects a non-primitive result.
 ---@param guestState lua.State
 ---@param guestRef   integer
 local function callGuestSlow(guestState, guestRef, ...)
@@ -209,16 +207,19 @@ local function callGuestSlow(guestState, guestRef, ...)
 	return unpack(results, 1, nresults)
 end
 
+-- Registry ref for callGuestSlow, stored once and baked into every bound_call
+-- closure as upvalue 4. Allows C to invoke the slow path without a Lua wrapper.
+local callGuestSlowRef = bridge.register(callGuestSlow)
+
 -- Returns a host-callable function backed by a guest registry ref.
 --
--- The hot path returns boundCFn (a bound_call lua_CFunction) directly as
--- the callable. Every host↔guest transition goes through a lua_CFunction
--- boundary, which is required to avoid LuaJIT's FFI re-entrancy crash.
+-- bound_call is returned directly as the callable — no Lua wrapper.
+-- Every host↔guest transition goes through a lua_CFunction boundary,
+-- which is required to avoid LuaJIT's FFI re-entrancy crash.
 -- See docs/bridge-design.md.
 --
--- bound_call returns COMPOUND_TAG when any result is a compound type.
--- The wrapper detects this with a cheap identity check (no pcall needed)
--- and delegates to callGuestSlow for fromLua wrapping.
+-- When bound_call detects a compound result it calls callGuestSlow directly
+-- from C via upvalue 4, so no Lua wrapper or COMPOUND_TAG check is needed.
 ---@param guestState lua.State
 ---@param guestRef   integer
 makeCallable = function(guestState, guestRef)
@@ -226,17 +227,12 @@ makeCallable = function(guestState, guestRef)
 		guestState._guest_L_ptr = tonumber(ffi.cast("intptr_t", guestState.L))
 	end
 
-	local boundCFn = bridge.make_callable(guestState._guest_L_ptr, guestRef)
+	local boundCFn = bridge.make_callable(
+		guestState._guest_L_ptr, guestRef, guestState, callGuestSlowRef)
 
-	local callable = function(...)
-		local a, b, c, d, e, f, g, h = boundCFn(...)
-		if a ~= COMPOUND_TAG then return a, b, c, d, e, f, g, h end
-		return callGuestSlow(guestState, guestRef, ...)
-	end
-
-	guestState._guest_fns = guestState._guest_fns or setmetatable({}, { __mode = "k" })
-	guestState._guest_fns[callable] = guestRef
-	return callable
+	guestState._guest_fns = guestState._guest_fns or {}
+	guestState._guest_fns[boundCFn] = guestRef
+	return boundCFn
 end
 
 -- ─── State ────────────────────────────────────────────────────────────────
