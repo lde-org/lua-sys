@@ -17,8 +17,7 @@
 
 #include <stdint.h>
 
-static lua_State *host_L            = NULL;
-static int        callback_table_ref = LUA_NOREF;
+static lua_State *host_L = NULL;
 
 // ── Value copying ─────────────────────────────────────────────────────────
 
@@ -63,14 +62,6 @@ static lua_State *decode_guest_ptr(int stack_pos) {
     return NULL; /* unreachable: luaL_error longjmps */
 }
 
-// ── Callback table ────────────────────────────────────────────────────────
-
-static void ensure_callback_table(void) {
-    if (callback_table_ref != LUA_NOREF) return;
-    lua_newtable(host_L);
-    callback_table_ref = luaL_ref(host_L, LUA_REGISTRYINDEX);
-}
-
 // ── bound_call ────────────────────────────────────────────────────────────
 //
 // lua_CFunction installed on the host state via bridge.make_callable.
@@ -112,10 +103,11 @@ static int bound_call(lua_State *host) {
     }
 
     int nresults = lua_gettop(guest) - guest_base;
+    if (nresults == 0) return 0; /* guest stack already at guest_base */
+
     for (i = 0; i < nresults; i++) {
         if (push_primitive_typed(guest, guest_base + 1 + i, host) < 0) {
-            /* compound result: undo the i values already copied to host */
-            lua_settop(host, lua_gettop(host) - i);
+            lua_settop(host, nargs);
             lua_settop(guest, guest_base);
             lua_pushlightuserdata(host, (void *)&COMPOUND_TAG_ADDR);
             return 1;
@@ -143,7 +135,11 @@ static int bridge_compound_tag(lua_State *L) {
 // ── dispatch_callback ─────────────────────────────────────────────────────
 //
 // lua_CFunction installed on the guest state via bridge.push_callback.
-// Upvalue 1: integer — callback id in the host callback table.
+// Upvalue 1: integer — LUA_REGISTRYINDEX ref for the host callback function.
+//
+// Each callback is stored as a direct registry ref (luaL_ref / luaL_unref).
+// This allows a single lua_rawgeti to retrieve the function — replacing the
+// old double rawgeti (table ref → table → function) with one call.
 //
 // Called by guest Lua code when it invokes a host-provided function. This is
 // a lua_CFunction on the guest, so it is never called through LuaJIT FFI —
@@ -155,24 +151,13 @@ static int bridge_compound_tag(lua_State *L) {
 // nested guest→host→guest→host chains will corrupt each other's stack frames.
 
 static int dispatch_callback(lua_State *guest) {
-    int callback_id = (int)lua_tointeger(guest, lua_upvalueindex(1));
-    int saved_top   = lua_gettop(host_L);
+    int fn_ref    = (int)lua_tointeger(guest, lua_upvalueindex(1));
+    int saved_top = lua_gettop(host_L);
 
-    // Look up the callback function directly by integer key.
-    // callback_table_ref: rawgeti (O(1)) rather than getfield (string hash).
-    lua_rawgeti(host_L, LUA_REGISTRYINDEX, callback_table_ref);
-    lua_rawgeti(host_L, -1, callback_id);
-    lua_replace(host_L, -2); /* replace the table with the function */
+    lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
 
-    if (lua_isnil(host_L, -1)) {
-        lua_settop(host_L, saved_top);
-        lua_pushfstring(guest, "bridge: callback %d not found", callback_id);
-        lua_error(guest);
-        return 0;
-    }
-
-    int host_fn_idx = lua_gettop(host_L);
-    int nargs       = lua_gettop(guest);
+    // host_fn_idx == saved_top + 1: exactly one value (the fn) was pushed above.
+    int nargs = lua_gettop(guest);
     int i;
     for (i = 1; i <= nargs; i++)
         push_primitive_or_error(guest, i, host_L);
@@ -186,9 +171,11 @@ static int dispatch_callback(lua_State *guest) {
         return 0;
     }
 
-    int nresults = lua_gettop(host_L) - host_fn_idx + 1;
+    int nresults = lua_gettop(host_L) - saved_top;
+    if (nresults == 0) return 0; /* host stack already at saved_top */
+
     for (i = 0; i < nresults; i++)
-        push_primitive_or_error(host_L, host_fn_idx + i, guest);
+        push_primitive_or_error(host_L, saved_top + 1 + i, guest);
 
     lua_settop(host_L, saved_top);
     return nresults;
@@ -196,15 +183,13 @@ static int dispatch_callback(lua_State *guest) {
 
 // ── Exported functions ────────────────────────────────────────────────────
 
+// Stores the host function (arg 1) in the registry and returns its ref as
+// the callback id. bridge.push_callback and bridge.unregister use this ref.
 static int bridge_register(lua_State *L) {
     (void)L;
     luaL_checktype(host_L, 1, LUA_TFUNCTION);
-    ensure_callback_table();
-    lua_rawgeti(host_L, LUA_REGISTRYINDEX, callback_table_ref);
-    int id = (int)lua_objlen(host_L, -1) + 1;
     lua_pushvalue(host_L, 1);
-    lua_rawseti(host_L, -2, id);
-    lua_pop(host_L, 1);
+    int id = luaL_ref(host_L, LUA_REGISTRYINDEX);
     lua_pushinteger(host_L, id);
     return 1;
 }
@@ -215,20 +200,16 @@ static int bridge_register(lua_State *L) {
 static int bridge_push_callback(lua_State *L) {
     (void)L;
     lua_State *guest = decode_guest_ptr(1);
-    int callback_id  = (int)lua_tointeger(host_L, 2);
-    lua_pushinteger(guest, callback_id);
+    int fn_ref       = (int)lua_tointeger(host_L, 2);
+    lua_pushinteger(guest, fn_ref);
     lua_pushcclosure(guest, dispatch_callback, 1);
     return 0;
 }
 
 static int bridge_unregister(lua_State *L) {
     (void)L;
-    if (callback_table_ref == LUA_NOREF) return 0;
-    int callback_id = (int)lua_tointeger(host_L, 1);
-    lua_rawgeti(host_L, LUA_REGISTRYINDEX, callback_table_ref);
-    lua_pushnil(host_L);
-    lua_rawseti(host_L, -2, callback_id);
-    lua_pop(host_L, 1);
+    int fn_ref = (int)lua_tointeger(host_L, 1);
+    luaL_unref(host_L, LUA_REGISTRYINDEX, fn_ref);
     return 0;
 }
 
@@ -242,8 +223,7 @@ static const luaL_Reg bridge_funcs[] = {
 };
 
 int luaopen_lua_sys_bridge(lua_State *L) {
-    host_L             = L;
-    callback_table_ref = LUA_NOREF;
+    host_L = L;
     luaL_register(L, "lua-sys.bridge", bridge_funcs);
     return 1;
 }
