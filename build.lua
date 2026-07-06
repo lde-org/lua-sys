@@ -38,7 +38,9 @@ else
 	extra_link = ""
 end
 
-build:sh("gcc " .. flags .. " -O2"
+local compiler = os.getenv("SEA_CC") or "gcc"
+
+build:sh(compiler .. " " .. flags .. " -O2"
 	.. " -I" .. out
 	.. " -o " .. out .. "/bridge." .. ext
 	.. " " .. out .. "/bridge.c"
