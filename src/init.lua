@@ -100,7 +100,6 @@ function Table:get(key)
 end
 
 ---@param key   string|number|boolean|lua.Value
----@param value string|number|boolean|lua.Value|function|nil
 function Table:set(key, value)
 	local guestState = self._state
 	local L          = guestState.L
@@ -109,6 +108,69 @@ function Table:set(key, value)
 	toLua(guestState, L, value)
 	raw.settable(L, -3)
 	raw.pop(L, 1)
+end
+
+-- Iterate all key/value pairs (equivalent to pairs() on a plain table).
+-- Usage: for k, v in t:pairs() do ... end
+function Table:pairs()
+	local guestState = self._state
+	local L          = guestState.L
+	local key_ref    = nil  -- registry ref for the current iteration key
+	return function()
+		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)  -- push table
+		if key_ref ~= nil then
+			raw.rawgeti(L, LUA_REGISTRYINDEX, key_ref)
+			raw.unref(L, LUA_REGISTRYINDEX, key_ref)
+			key_ref = nil
+		else
+			raw.pushnil(L)  -- initial key
+		end
+		local more = raw.next(L, -2)
+		if not more then
+			raw.pop(L, 1)  -- pop table
+			return nil
+		end
+		-- stack: table, next-key, value
+		local v = fromLua(guestState, L, -1)
+		local k = fromLua(guestState, L, -2)
+		-- save the key for the next lua_next call before popping
+		raw.pushvalue(L, -2)
+		key_ref = raw.ref(L, LUA_REGISTRYINDEX)
+		raw.pop(L, 3)  -- pop value, key, table
+		return k, v
+	end
+end
+
+-- Iterate integer keys 1..# (equivalent to ipairs() on a plain table).
+-- Usage: for i, v in t:ipairs() do ... end
+function Table:ipairs()
+	local guestState = self._state
+	local L          = guestState.L
+	local i          = 0
+	return function()
+		i = i + 1
+		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
+		raw.rawgeti(L, -1, i)
+		if raw.type(L, -1) == 0 then  -- nil — end of sequence
+			raw.pop(L, 2)
+			return nil
+		end
+		local v = fromLua(guestState, L, -1)
+		raw.pop(L, 2)
+		return i, v
+	end
+end
+
+-- Proxy field reads to Table:get() for unknown keys (methods take priority).
+Table.__index = function(self, key)
+	local method = rawget(Table, key)
+	if method ~= nil then return method end
+	return Table.get(self, key)
+end
+
+-- Proxy field writes to Table:set().
+Table.__newindex = function(self, key, value)
+	Table.set(self, key, value)
 end
 
 -- ─── fromLua / toLua ──────────────────────────────────────────────────────

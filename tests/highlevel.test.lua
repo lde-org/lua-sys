@@ -304,7 +304,144 @@ test.it("pcall returns results from wrapped function calls", function()
 	state:close()
 end)
 
--- ─── Null byte handling ───────────────────────────────────────────────────
+-- ─── Table index/newindex proxy ───────────────────────────────────────────
+
+test.it("table[key] reads via __index proxy", function()
+	local state = lua.new()
+	local tbl = state:load("{x = 10, y = 20}")
+	test.equal(10, tbl.x)
+	test.equal(20, tbl.y)
+	test.equal(nil, tbl.z)
+	state:close()
+end)
+
+test.it("table[key] = val writes via __newindex proxy", function()
+	local state = lua.new()
+	local tbl = state:load("{}")
+	tbl.x = 42
+	tbl.msg = "hello"
+	tbl.flag = true
+	test.equal(42,      tbl.x)
+	test.equal("hello", tbl.msg)
+	test.equal(true,    tbl.flag)
+	state:close()
+end)
+
+test.it("__index does not shadow Table methods", function()
+	local state = lua.new()
+	-- guest table has a key named 'get' — the method must still win
+	local tbl = state:load([[{get = "notamethod"}]])
+	test.equal("function", type(tbl.get))  -- method, not the guest string
+	test.equal("notamethod", tbl:get("get"))
+	state:close()
+end)
+
+test.it("__newindex on globals roundtrip", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.answer = 99
+	test.equal(99, g.answer)
+	local v = state:load("return answer")
+	test.equal(99, v)
+	state:close()
+end)
+
+-- ─── Table:pairs ──────────────────────────────────────────────────────────
+
+test.it("pairs() iterates all key/value pairs", function()
+	local state = lua.new()
+	local tbl = state:load("{a = 1, b = 2, c = 3}")
+	local got = {}
+	for k, v in tbl:pairs() do
+		got[k] = v
+	end
+	test.equal(1, got.a)
+	test.equal(2, got.b)
+	test.equal(3, got.c)
+	test.equal(3, (function() local n = 0; for _ in pairs(got) do n = n + 1 end; return n end)())
+	state:close()
+end)
+
+test.it("pairs() on empty table yields nothing", function()
+	local state = lua.new()
+	local tbl = state:load("{}")
+	local count = 0
+	for _ in tbl:pairs() do count = count + 1 end
+	test.equal(0, count)
+	state:close()
+end)
+
+test.it("pairs() can be called multiple times independently", function()
+	local state = lua.new()
+	local tbl = state:load("{x = 1, y = 2}")
+	local first, second = {}, {}
+	for k in tbl:pairs() do first[k] = true end
+	for k in tbl:pairs() do second[k] = true end
+	test.equal(true, first.x and first.y)
+	test.equal(true, second.x and second.y)
+	state:close()
+end)
+
+test.it("pairs() two concurrent iterators on same table", function()
+	local state = lua.new()
+	local tbl = state:load("{a=1, b=2, c=3, d=4}")
+	local iter1 = tbl:pairs()
+	local iter2 = tbl:pairs()
+	local s1, s2 = {}, {}
+	for k, v in iter1 do s1[k] = v end
+	for k, v in iter2 do s2[k] = v end
+	test.equal(s1.a, s2.a)
+	test.equal(s1.b, s2.b)
+	state:close()
+end)
+
+-- ─── Table:ipairs ─────────────────────────────────────────────────────────
+
+test.it("ipairs() iterates sequential integer keys", function()
+	local state = lua.new()
+	local tbl = state:load("{10, 20, 30}")
+	local keys, vals = {}, {}
+	for i, v in tbl:ipairs() do
+		keys[#keys+1] = i
+		vals[#vals+1] = v
+	end
+	test.equal(3, #keys)
+	test.equal(1,  keys[1]); test.equal(10, vals[1])
+	test.equal(2,  keys[2]); test.equal(20, vals[2])
+	test.equal(3,  keys[3]); test.equal(30, vals[3])
+	state:close()
+end)
+
+test.it("ipairs() stops at first nil hole", function()
+	local state = lua.new()
+	local tbl = state:load("{10, 20, nil, 40}")
+	local count = 0
+	for _ in tbl:ipairs() do count = count + 1 end
+	test.equal(2, count)
+	state:close()
+end)
+
+test.it("ipairs() on empty table yields nothing", function()
+	local state = lua.new()
+	local tbl = state:load("{}")
+	local count = 0
+	for _ in tbl:ipairs() do count = count + 1 end
+	test.equal(0, count)
+	state:close()
+end)
+
+test.it("ipairs() returns string values correctly", function()
+	local state = lua.new()
+	local tbl = state:load('{"a", "b", "c"}')
+	local vals = {}
+	for _, v in tbl:ipairs() do vals[#vals+1] = v end
+	test.equal("a", vals[1])
+	test.equal("b", vals[2])
+	test.equal("c", vals[3])
+	state:close()
+end)
+
+
 
 test.it("strings with embedded nulls survive guest fn roundtrip", function()
 	local state = lua.new()
