@@ -355,7 +355,8 @@ end
 ---@class lua
 local lua = {}
 
-lua.raw = raw
+lua.raw      = raw
+lua.profiler = require("lua-sys.profiler")
 
 ---@return lua.State
 function lua.new()

@@ -70,9 +70,9 @@ ffi.cdef [[
   int lua_isuserdata(lua_State *L, int idx);
   int lua_isyieldable(lua_State *L);
   int luaJIT_setmode(lua_State *L, int idx, int mode);
-  void luaJIT_profile_start(lua_State *L, const char *mode, void (*cb)(lua_State *L, void *data), void *data);
+  void luaJIT_profile_start(lua_State *L, const char *mode, void (*cb)(void *data, lua_State *L, int samples, int vmstate), void *data);
   void luaJIT_profile_stop(lua_State *L);
-  int luaJIT_profile_dumpstack(lua_State *L, char *buf, int depth, size_t len);
+  const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt, int depth, int *len);
   void luaL_addlstring(luaL_Buffer *B, const char *s, size_t l);
   void luaL_addstring(luaL_Buffer *B, const char *s);
   void luaL_addvalue(luaL_Buffer *B);
@@ -226,9 +226,9 @@ ffi.cdef [[
 ---@field lua_isyieldable fun(L: lua.raw.State): integer
 ---@field lua_lessthan fun(L: lua.raw.State, idx1: integer, idx2: integer): integer
 ---@field luaJIT_setmode fun(L: lua.raw.State, idx: integer, mode: integer): integer
----@field luaJIT_profile_start fun(L: lua.raw.State, mode: string, cb: fun(L: lua.raw.State, data: ffi.cdata*), data: ffi.cdata*)
+---@field luaJIT_profile_start fun(L: lua.raw.State, mode: string, cb: fun(data: ffi.cdata*, L: lua.raw.State, samples: integer, vmstate: integer), data: ffi.cdata*)
 ---@field luaJIT_profile_stop fun(L: lua.raw.State)
----@field luaJIT_profile_dumpstack fun(L: lua.raw.State, buf: string, depth: integer, len: integer): integer
+---@field luaJIT_profile_dumpstack fun(L: lua.raw.State, fmt: string, depth: integer, len: ffi.cdata*): ffi.cdata*
 ---@field luaL_addlstring fun(B: ffi.cdata*, s: string, l: integer)
 ---@field luaL_addstring fun(B: ffi.cdata*, s: string)
 ---@field luaL_addvalue fun(B: ffi.cdata*)
@@ -607,9 +607,21 @@ raw.openStringBuffer = C.luaopen_string_buffer
 raw.openTable = C.luaopen_table
 
 -- JIT extensions (luaJIT_*)
-raw.jit_setmode = C.luaJIT_setmode
-raw.jit_profile_start = C.luaJIT_profile_start
-raw.jit_profile_stop = C.luaJIT_profile_stop
-raw.jit_profile_dumpstack = C.luaJIT_profile_dumpstack
+raw.jit_setmode        = C.luaJIT_setmode
+raw.jit_profile_start  = C.luaJIT_profile_start
+raw.jit_profile_stop   = C.luaJIT_profile_stop
+
+-- dumpstack returns a const char* into an internal profiler buffer (valid
+-- only until the next dumpstack call or profile_stop). Copy to a Lua string
+-- immediately. len is an int* out-param.
+local _dumpstack_len = ffi.new("int[1]")
+---@param L      lua.raw.State
+---@param fmt    string
+---@param depth  integer
+function raw.jit_profile_dumpstack(L, fmt, depth)
+	local p = C.luaJIT_profile_dumpstack(L, fmt, depth, _dumpstack_len)
+	if p == nil then return "" end
+	return ffi.string(p, _dumpstack_len[0])
+end
 
 return raw
