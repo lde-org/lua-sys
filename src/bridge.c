@@ -90,12 +90,20 @@ static void ensure_callback_table(void) {
 // an FFI call, so JIT traces see it as an opaque C boundary and do not
 // attempt to record through it into the guest — preventing the re-entrancy
 // crash described in docs/bridge-design.md.
+//
+// Return protocol:
+//   All-primitive results: returns them directly (zero overhead on hot path).
+//   Compound results: returns (COMPOUND_TAG lightuserdata) as sole value.
+//     The Lua wrapper detects the tag and calls callGuestSlow instead.
+//   Guest error: raises a Lua error normally.
+
+static char COMPOUND_TAG_ADDR; /* unique address used as lightuserdata tag */
 
 static int bound_call(lua_State *host) {
     lua_State *guest    = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
-    int        guest_fn_ref = (int)lua_tointeger(host, lua_upvalueindex(2));
-    int        nargs    = lua_gettop(host);
-    int        guest_base = lua_gettop(guest);
+    int guest_fn_ref    = (int)lua_tointeger(host, lua_upvalueindex(2));
+    int nargs           = lua_gettop(host);
+    int guest_base      = lua_gettop(guest);
 
     lua_rawgeti(guest, LUA_REGISTRYINDEX, guest_fn_ref);
 
@@ -115,31 +123,32 @@ static int bound_call(lua_State *host) {
     int nresults = lua_gettop(guest) - guest_base;
     for (i = 0; i < nresults; i++) {
         if (!is_primitive(guest, guest_base + 1 + i)) {
-            // Signal the Lua wrapper to fall back to the slow path, which
-            // handles compound types via fromLua/toLua registry refs.
             lua_settop(guest, guest_base);
-            lua_pushstring(host, COMPOUND_RESULT_MSG);
-            lua_error(host);
-            return 0;
+            lua_pushlightuserdata(host, (void *)&COMPOUND_TAG_ADDR);
+            return 1;
         }
     }
+
     for (i = 0; i < nresults; i++)
         push_primitive(guest, guest_base + 1 + i, host);
-
     lua_settop(guest, guest_base);
     return nresults;
 }
 
-// bridge.make_callable(guest_L_ptr, guest_fn_ref) → bound_call closure
-//
-// Creates a bound_call closure on host_L with the guest pointer and ref
-// baked in as upvalues. Returned to Lua as the callable for a guest function.
 static int bridge_make_callable(lua_State *L) {
     (void)L;
     lua_State *guest = decode_guest_ptr(1);
     lua_pushlightuserdata(host_L, (void *)guest);
     lua_pushvalue(host_L, 2); /* guest_fn_ref */
     lua_pushcclosure(host_L, bound_call, 2);
+    return 1;
+}
+
+// bridge.compound_tag() → lightuserdata
+// The sentinel value returned by bound_call when results include compound types.
+static int bridge_compound_tag(lua_State *L) {
+    (void)L;
+    lua_pushlightuserdata(host_L, (void *)&COMPOUND_TAG_ADDR);
     return 1;
 }
 
@@ -286,6 +295,7 @@ static int bridge_call(lua_State *L) {
 static const luaL_Reg bridge_funcs[] = {
     { "call",           bridge_call },
     { "make_callable",  bridge_make_callable },
+    { "compound_tag",   bridge_compound_tag },
     { "register",       bridge_register },
     { "push_callback",  bridge_push_callback },
     { "unregister",     bridge_unregister },

@@ -179,10 +179,11 @@ end
 
 -- ─── makeCallable ─────────────────────────────────────────────────────────
 
-local COMPOUND_RESULT_ERR = "bridge: compound result"
+-- bound_call returns this lightuserdata as the sole return value when the
+-- guest function returned compound types. Cheaper to check than pcall+error.
+local COMPOUND_TAG = bridge.compound_tag()
 
--- Slow path for cross-state calls when args or results include compound types
--- (tables, functions, userdata). Uses toLua/fromLua to marshal each value.
+-- Slow path for cross-state calls when results include compound types.
 ---@param guestState lua.State
 ---@param guestRef   integer
 local function callGuestSlow(guestState, guestRef, ...)
@@ -210,10 +211,14 @@ end
 
 -- Returns a host-callable function backed by a guest registry ref.
 --
--- The hot path uses bridge.make_callable to create a bound_call lua_CFunction
--- with the guest state pointer and ref baked in as C upvalues. This keeps
--- every host↔guest transition behind a lua_CFunction boundary, which is
--- required to avoid LuaJIT's FFI re-entrancy crash. See docs/bridge-design.md.
+-- The hot path returns boundCFn (a bound_call lua_CFunction) directly as
+-- the callable. Every host↔guest transition goes through a lua_CFunction
+-- boundary, which is required to avoid LuaJIT's FFI re-entrancy crash.
+-- See docs/bridge-design.md.
+--
+-- bound_call returns COMPOUND_TAG when any result is a compound type.
+-- The wrapper detects this with a cheap identity check (no pcall needed)
+-- and delegates to callGuestSlow for fromLua wrapping.
 ---@param guestState lua.State
 ---@param guestRef   integer
 makeCallable = function(guestState, guestRef)
@@ -224,12 +229,9 @@ makeCallable = function(guestState, guestRef)
 	local boundCFn = bridge.make_callable(guestState._guest_L_ptr, guestRef)
 
 	local callable = function(...)
-		local ok, a, b, c, d, e, f, g, h = pcall(boundCFn, ...)
-		if ok then return a, b, c, d, e, f, g, h end
-		if type(a) == "string" and a:find(COMPOUND_RESULT_ERR, 1, true) then
-			return callGuestSlow(guestState, guestRef, ...)
-		end
-		error(a, 0)
+		local a, b, c, d, e, f, g, h = boundCFn(...)
+		if a ~= COMPOUND_TAG then return a, b, c, d, e, f, g, h end
+		return callGuestSlow(guestState, guestRef, ...)
 	end
 
 	guestState._guest_fns = guestState._guest_fns or setmetatable({}, { __mode = "k" })
