@@ -239,5 +239,5 @@ int luaopen_lua_sys_bridge(lua_State *L) {
     return 1;
 }
 
-int luaopen_sys_bridge(lua_State *L) __attribute__((alias("luaopen_lua_sys_bridge")));
-int luaopen_bridge(lua_State *L)     __attribute__((alias("luaopen_lua_sys_bridge")));
+int luaopen_sys_bridge(lua_State *L) { return luaopen_lua_sys_bridge(L); }
+int luaopen_bridge(lua_State *L)     { return luaopen_lua_sys_bridge(L); }
