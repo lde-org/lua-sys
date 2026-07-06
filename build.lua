@@ -1,10 +1,12 @@
 -- build.lua — Compiles the C bridge module for lua-sys.
 --
--- Uses gcc (available on all supported platforms via MinGW on Windows).
--- No system luajit-dev package is needed: lde already embeds LuaJIT and
--- exports all required symbols. On Linux/macOS the shared library resolves
--- them at runtime from the process image. On Windows they must be resolved
--- at link time via an import library generated from lde's own export table.
+-- Linux/macOS: bridge.so/.dylib leaves lua* symbols unresolved at link time;
+--   they are satisfied at load time from the host process image.
+--
+-- Windows: PE executables do not export symbols to DLLs, so we download a
+--   pre-built libluajit and link it directly into bridge.dll. Guest states
+--   use this embedded runtime — safe because lua-sys communicates with the
+--   host exclusively through the Lua C API (push/pop, registry refs).
 
 local build = require("lde-build")
 
@@ -12,26 +14,32 @@ local out = assert(os.getenv("LDE_OUTPUT_DIR"), "LDE_OUTPUT_DIR not set")
 
 local ext, flags, extra_link
 if jit.os == "Windows" then
-    ext   = "dll"
-    flags = "-shared"
-    -- lde passes LDE_IMPLIB pointing to the import library it generated via
-    -- --out-implib at compile time. Link bridge.dll against it so it can
-    -- resolve lua* symbols from the host executable at runtime.
-    local imp_path = assert(os.getenv("LDE_IMPLIB"),
-        "LDE_IMPLIB not set — rebuild lde with a version that supports lua-sys")
-    extra_link = " " .. imp_path
+	ext           = "dll"
+	flags         = "-shared"
+
+	local arch    = jit.arch == "arm64" and "aarch64" or "x86-64"
+	local tarName = "libluajit-windows-" .. arch .. "-gnu.tar.gz"
+	local tarUrl  = "https://github.com/lde-org/luajit/releases/download/latest/" .. tarName
+
+	build:write(tarName, build:fetch(tarUrl))
+	build:extract(tarName, "luajit")
+	build:delete(tarName)
+
+	-- Extracted to out/luajit/libluajit-windows-<arch>-gnu/{include,lib}
+	local ljDir = out .. "/luajit/libluajit-windows-" .. arch .. "-gnu"
+	extra_link  = " -I" .. ljDir .. "/include " .. ljDir .. "/lib/libluajit.a -lm"
 elseif jit.os == "OSX" then
-    ext        = "dylib"
-    flags      = "-dynamiclib -undefined dynamic_lookup"
-    extra_link = ""
+	ext        = "dylib"
+	flags      = "-dynamiclib -undefined dynamic_lookup"
+	extra_link = ""
 else
-    ext        = "so"
-    flags      = "-shared -fPIC"
-    extra_link = ""
+	ext        = "so"
+	flags      = "-shared -fPIC"
+	extra_link = ""
 end
 
 build:sh("gcc " .. flags .. " -O2"
-    .. " -I" .. out
-    .. " -o " .. out .. "/bridge." .. ext
-    .. " " .. out .. "/bridge.c"
-    .. extra_link)
+	.. " -I" .. out
+	.. " -o " .. out .. "/bridge." .. ext
+	.. " " .. out .. "/bridge.c"
+	.. extra_link)
