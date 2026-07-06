@@ -14,15 +14,12 @@ local ext, flags, extra_link
 if jit.os == "Windows" then
     ext   = "dll"
     flags = "-shared"
-    -- sea.compile generates an import library (<exename>.a) alongside the exe
-    -- via --out-implib, exporting all lua* symbols. Link against it directly.
-    local ffi = require("ffi")
-    ffi.cdef("unsigned long GetModuleFileNameA(void*, char*, unsigned long);")
-    local buf = ffi.new("char[512]")
-    ffi.C.GetModuleFileNameA(nil, buf, 512)
-    local exe_path = ffi.string(buf)
-    local imp_path = exe_path:gsub("%.exe$", "") .. ".a"
-    extra_link = " -L" .. out .. " " .. imp_path
+    -- lde passes LDE_IMPLIB pointing to the import library it generated via
+    -- --out-implib at compile time. Link bridge.dll against it so it can
+    -- resolve lua* symbols from the host executable at runtime.
+    local imp_path = assert(os.getenv("LDE_IMPLIB"),
+        "LDE_IMPLIB not set — rebuild lde with a version that supports lua-sys")
+    extra_link = " " .. imp_path
 elseif jit.os == "OSX" then
     ext        = "dylib"
     flags      = "-dynamiclib -undefined dynamic_lookup"
