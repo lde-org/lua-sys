@@ -1,0 +1,90 @@
+# Bridge Design
+
+lua-sys exposes LuaJIT's own Lua C API back to a guest `lua_State` created from the host. This document explains why a compiled C bridge is necessary and how the re-entrancy constraints shape every design decision.
+
+## The Problem: Two Independent States
+
+When you call `lua.new()`, it creates a guest state with `luaL_newstate()`. This state is entirely independent of the host LuaJIT interpreter — it has its own heap, its own `global_State`, and its own call stack. The standard mechanism for sharing values between two states that *share* a `global_State` is `lua_xmove`, but that only works for coroutines or threads created from the same root state. It does not apply here.
+
+The only safe way to pass values between two independent states is by copy: read the value out of one state, push an equivalent value into the other. This library only copies primitives (nil, boolean, number, string) directly. Compound types (tables, functions, userdata) are kept in whichever state owns them and accessed via `LUA_REGISTRYINDEX` refs.
+
+## Why Not Use LuaJIT FFI for Calls?
+
+LuaJIT's FFI lets you call C functions and use C pointers from Lua code. The `lua-sys.raw` module exposes the entire Lua C API this way — `raw.pcall`, `raw.rawgeti`, `raw.gettop`, etc. are all FFI-bound functions.
+
+Using FFI calls directly to drive the host→guest transition works fine in simple cases but crashes under re-entrant execution. The crash site is `argv2cdata` inside `recff_cdata_call` in LuaJIT's JIT recorder.
+
+### What triggers the crash
+
+The JIT recorder tries to compile a hot call site. When that call site involves an FFI call on a `lua_State*` pointer, the recorder needs to emit code to pass the pointer as a C argument — this is the `argv2cdata` step. During re-entrant execution the recorder encounters the same FFI call while already in the middle of recording a trace for an outer call, and it crashes.
+
+The re-entrant chain that triggers it:
+
+```
+Host Lua calls fn()                   ← JIT starts recording this call site
+  fn() calls raw.pcall(guest_L, ...)  ← FFI call; JIT records argv2cdata for guest_L
+    guest Lua runs
+      guest calls host_callback()
+        dispatch_callback (C) runs
+          lua_pcall(host_L, ...)       ← executes host Lua inside a C frame
+            host Lua calls fn() again  ← JIT tries to record the same site again
+              raw.pcall(guest_L, ...)  ← argv2cdata on guest_L while trace in progress
+                                          → CRASH
+```
+
+The crash happens regardless of how deeply nested the calls are. It only requires that a guest→host callback ever causes the host to call back into a guest function via FFI.
+
+### Why `jit.off` doesn't fully solve it
+
+Marking the FFI-calling function with `jit.off` prevents the JIT from compiling *that function*, but it does not prevent the JIT from attempting to compile its *callers*. A caller that is hot will still try to record through the call boundary, and the trace will attempt to inline the FFI path if the callee has no JIT metadata to indicate it should be treated as opaque.
+
+More importantly, `jit.off` makes every FFI call in that function run interpreted. Each `raw.pcall`, `raw.gettop`, `raw.settop` etc. costs ~1-8 ns when JIT-compiled but more when interpreted, and they are called on every cross-state transition.
+
+## The Solution: lua_CFunction Boundaries
+
+A `lua_CFunction` is completely opaque to the JIT recorder. When the JIT traces a call to a C function registered via `lua_pushcfunction` or `lua_pushcclosure`, it emits a call instruction and stops recording — it never looks inside. This is the correct boundary.
+
+The bridge registers every cross-state call as a `lua_CFunction`:
+
+**Host → Guest** (`bound_call`): `bridge.make_callable(guest_L_ptr, ref)` pushes a `bound_call` closure onto the host state with the guest pointer and function ref baked in as C upvalues. Host code calls it as a normal Lua function. The JIT compiles the call site up to `bound_call` and stops. Inside `bound_call`, the C code calls `lua_pcall` on the guest state — no FFI involved.
+
+**Guest → Host** (`dispatch_callback`): `bridge.push_callback(guest_L_ptr, cb_id)` pushes a `dispatch_callback` closure onto the guest state. When guest code calls a host-provided function, the guest interpreter dispatches via `BC_FUNCC` — again, a C function call, not FFI. Inside `dispatch_callback`, the C code calls `lua_pcall` on the host state.
+
+In both directions, the transition is always: `Lua interpreter → lua_CFunction (C) → lua_pcall on the other state`. The JIT never sees across the boundary.
+
+## Stack Safety Under Re-entrancy
+
+Because host→guest→host chains are supported, `dispatch_callback` can be called while `bound_call` is already executing on the C stack (and thus while `host_L`'s call stack is active). Both functions save and restore `lua_gettop(host_L)` around their work so that nested calls cannot corrupt each other's result slots.
+
+```
+bound_call called from host:
+  guest_base = lua_gettop(guest)       ← save guest stack
+  lua_pcall(guest, ...)                ← guest runs, may trigger dispatch_callback
+    dispatch_callback:
+      saved_top = lua_gettop(host_L)   ← save host stack depth
+      lua_pcall(host_L, ...)           ← run host callback
+      lua_settop(host_L, saved_top)    ← restore host stack ← MUST happen on all paths
+  results start at guest_base+1
+  lua_settop(guest, guest_base)        ← restore guest stack
+```
+
+If `lua_settop(host_L, saved_top)` were missing, each nested `dispatch_callback` invocation would leave the host stack slightly taller. After enough nesting the stack would overflow; at best results from inner calls would be misread as results from outer calls.
+
+## Value Passing: Why Only Primitives Cross Directly
+
+Compound types (tables, functions) are not copied because they contain references to their owning state's GC heap. A table from the guest state holds pointers into the guest's memory; if the host were to use those pointers after the guest GC ran, they could be dangling.
+
+Instead, compound values are kept in their home state and accessed through `LUA_REGISTRYINDEX` refs. A ref is a stable integer that prevents the GC from collecting the value while the ref is live. When the host receives a guest function, it gets a `makeCallable` wrapper backed by a ref; when the host receives a guest table, it gets a `lua.Table` proxy that holds a ref.
+
+The only exception is strings: LuaJIT interns strings, and `lua_tolstring` returns a C `const char*` that remains valid until the string is collected. Since we immediately `lua_pushlstring` into the destination state (which copies the bytes), this is safe.
+
+## Performance Notes
+
+All cross-state transitions pay at minimum the cost of `lua_rawgeti` + `lua_pcall` on the destination state (~18 ns on a modern CPU). The C bridge adds per-call overhead for:
+
+- Decoding upvalues (guest pointer + ref): ~2 ns
+- Copying primitive arguments: ~2-8 ns each
+- Checking result types and copying them back: ~2-8 ns each
+- `lua_settop` cleanup: ~2 ns
+
+The callback table lookup in `dispatch_callback` uses a cached `luaL_ref` integer (O(1) `lua_rawgeti`) rather than a `lua_getfield` on the registry string key (O(n) hash lookup), saving ~13 ns per guest→host call.
