@@ -22,9 +22,12 @@ print(add(1, 2))  -- 3
 
 -- Expose host functions to guest code
 local g = state:globals()
-g:set("greet", function(name)
+g.greet = function(name)
     print("Hello, " .. name .. "!")
-end)
+end
+
+-- Plain host tables are automatically coerced to guest tables
+g.config = { timeout = 5, retries = 3 }
 
 local runner = state:load('function() greet("world") end')
 runner()  -- Hello, world!
@@ -65,6 +68,8 @@ Creates a new empty guest table. If `init` is provided, it must be a plain host 
 | `lua.Value` (guest ref) | Stored as-is |
 | `function` | Registered as a host callback |
 
+Self-referencing or mutually-referencing tables raise a `"cycle detected"` error, since deep copies cannot reproduce circular references across state boundaries. Non-cyclic duplicates (same table as separate values) produce independent copies.
+
 ```lua
 local t = state:table({ name = "alice", pos = { x = 1, y = 2 }, greet = function(n) return "hi " .. n end })
 print(t.name)       -- alice
@@ -82,16 +87,18 @@ Reads a key from the table. Returns primitives as-is, functions as callables, an
 
 ### `lua.Table:set(key, value)`
 
-Writes a key into the table. Accepts primitives, host Lua functions, guest function callables, and other `lua.Table` values.
+Writes a key into the table. Accepts primitives, host Lua functions, guest function callables, and other `lua.Table` values. Plain host tables (`{ ... }`) are automatically coerced to guest tables.
 
 ### `lua.Table` field access
 
-`lua.Table` proxies field reads and writes directly to `:get()` and `:set()`, so you can use `tbl.key` syntax instead of `tbl:get("key")`:
+`lua.Table` proxies field reads and writes directly to `:get()` and `:set()`, so you can use `tbl.key` syntax instead of `tbl:get("key")`. Plain host tables assigned this way are automatically coerced:
 
 ```lua
 local g = state:globals()
-g.myVar = 42           -- same as g:set("myVar", 42)
-print(g.myVar)         -- same as g:get("myVar")
+g.myVar = 42                     -- same as g:set("myVar", 42)
+g.config = { timeout = 5 }       -- plain table → guest table
+print(g.myVar)                   -- same as g:get("myVar")
+print(g.config.timeout)          -- 5
 ```
 
 Method names (`get`, `set`, `pairs`, `ipairs`, `type`, `value`, `free`) take priority over table keys.

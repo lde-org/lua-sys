@@ -321,9 +321,9 @@ test.it("table[key] = val writes via __newindex proxy", function()
 	tbl.x = 42
 	tbl.msg = "hello"
 	tbl.flag = true
-	test.equal(42,      tbl.x)
+	test.equal(42, tbl.x)
 	test.equal("hello", tbl.msg)
-	test.equal(true,    tbl.flag)
+	test.equal(true, tbl.flag)
 	state:close()
 end)
 
@@ -331,7 +331,7 @@ test.it("__index does not shadow Table methods", function()
 	local state = lua.new()
 	-- guest table has a key named 'get' — the method must still win
 	local tbl = state:load([[{get = "notamethod"}]])
-	test.equal("function", type(tbl.get))  -- method, not the guest string
+	test.equal("function", type(tbl.get)) -- method, not the guest string
 	test.equal("notamethod", tbl:get("get"))
 	state:close()
 end)
@@ -358,7 +358,9 @@ test.it("pairs() iterates all key/value pairs", function()
 	test.equal(1, got.a)
 	test.equal(2, got.b)
 	test.equal(3, got.c)
-	test.equal(3, (function() local n = 0; for _ in pairs(got) do n = n + 1 end; return n end)())
+	test.equal(3, (function()
+		local n = 0; for _ in pairs(got) do n = n + 1 end; return n
+	end)())
 	state:close()
 end)
 
@@ -402,13 +404,13 @@ test.it("ipairs() iterates sequential integer keys", function()
 	local tbl = state:load("{10, 20, 30}")
 	local keys, vals = {}, {}
 	for i, v in tbl:ipairs() do
-		keys[#keys+1] = i
-		vals[#vals+1] = v
+		keys[#keys + 1] = i
+		vals[#vals + 1] = v
 	end
 	test.equal(3, #keys)
-	test.equal(1,  keys[1]); test.equal(10, vals[1])
-	test.equal(2,  keys[2]); test.equal(20, vals[2])
-	test.equal(3,  keys[3]); test.equal(30, vals[3])
+	test.equal(1, keys[1]); test.equal(10, vals[1])
+	test.equal(2, keys[2]); test.equal(20, vals[2])
+	test.equal(3, keys[3]); test.equal(30, vals[3])
 	state:close()
 end)
 
@@ -434,7 +436,7 @@ test.it("ipairs() returns string values correctly", function()
 	local state = lua.new()
 	local tbl = state:load('{"a", "b", "c"}')
 	local vals = {}
-	for _, v in tbl:ipairs() do vals[#vals+1] = v end
+	for _, v in tbl:ipairs() do vals[#vals + 1] = v end
 	test.equal("a", vals[1])
 	test.equal("b", vals[2])
 	test.equal("c", vals[3])
@@ -690,8 +692,8 @@ test.it("state:table({ ... }) populates string/number/boolean keys", function()
 	local state = lua.new()
 	local t = state:table({ name = "alice", score = 42, active = true })
 	test.equal("alice", t:get("name"))
-	test.equal(42,      t:get("score"))
-	test.equal(true,    t:get("active"))
+	test.equal(42, t:get("score"))
+	test.equal(true, t:get("active"))
 	state:close()
 end)
 
@@ -783,5 +785,172 @@ test.it("state:table() result can be mutated by guest code and read on host", fu
 	g:set("counter", t)
 	state:load("counter.count = counter.count + 10")
 	test.equal(10, t:get("count"))
+	state:close()
+end)
+
+-- ─── Table auto-coercion ──────────────────────────────────────────────────
+--
+-- Plain host tables passed to Table:set (or the __newindex proxy) are
+-- automatically coerced into guest tables via toLua → state:table().
+
+test.it("plain table assigned to global becomes a guest table", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.config = { timeout = 5, retries = 3 }
+	local timeout = state:load("return config.timeout")
+	local retries = state:load("return config.retries")
+	test.equal(5, timeout)
+	test.equal(3, retries)
+	state:close()
+end)
+
+test.it("plain table coercion works with :set() too", function()
+	local state = lua.new()
+	local g = state:globals()
+	g:set("data", { x = 10, y = 20 })
+	test.equal(10, g.data.x)
+	test.equal(20, g.data.y)
+	state:close()
+end)
+
+test.it("nested plain tables are recursively coerced", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.player = { name = "alice", pos = { x = 1, y = 2 } }
+	test.equal("alice", g.player.name)
+	test.equal(1, g.player.pos.x)
+	test.equal(2, g.player.pos.y)
+	local fromGuest = state:load("return player.pos.x + player.pos.y")
+	test.equal(3, fromGuest)
+	state:close()
+end)
+
+test.it("array-like plain tables coerce to guest tables with integer keys", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.items = { "a", "b", "c" }
+	local result = state:load("return items[1] .. items[2] .. items[3]")
+	test.equal("abc", result)
+	state:close()
+end)
+
+test.it("coerced table can be passed as argument to guest function", function()
+	local state = lua.new()
+	local fn = state:load("function(t) return t.a + t.b end")
+	local result = fn({ a = 10, b = 32 })
+	test.equal(42, result)
+	state:close()
+end)
+
+test.it("coerced table with nested functions works in guest code", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.api = { greet = function(n) return "hi " .. n end }
+	local result = state:load("return api.greet('world')")
+	test.equal("hi world", result)
+	state:close()
+end)
+
+test.it("coerced table can contain guest values (lua.Table)", function()
+	local state = lua.new()
+	local g = state:globals()
+	local inner = state:table({ key = "inner-value" })
+	g.wrapper = { child = inner, label = "top" }
+	test.equal("top", g.wrapper.label)
+	test.equal("inner-value", g.wrapper.child.key)
+	state:close()
+end)
+
+test.it("coerced table is mutable from guest side", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.counter = { n = 0 }
+	state:load("counter.n = counter.n + 5")
+	state:load("counter.n = counter.n + 7")
+	test.equal(12, g.counter.n)
+	state:close()
+end)
+
+test.it("deeply nested table coercion does not corrupt guest state", function()
+	local state = lua.new()
+	local g = state:globals()
+	g.deep = { a = { b = { c = { d = { e = 42 } } } } }
+	local result = state:load("return deep.a.b.c.d.e")
+	test.equal(42, result)
+	-- After coercion the state should still be usable
+	g.other = "hello"
+	test.equal("hello", state:load("return other"))
+	state:close()
+end)
+
+test.it("multiple table coercions in sequence do not corrupt stack", function()
+	local state = lua.new()
+	local g = state:globals()
+	for i = 1, 20 do
+		g["t" .. i] = { index = i }
+	end
+	for i = 1, 20 do
+		test.equal(i, state:load("return t" .. i .. ".index"))
+	end
+	state:close()
+end)
+
+test.it("self-referencing table raises a cycle error", function()
+	local state = lua.new()
+	local t = {}
+	t.self = t
+	local ok, err = pcall(function()
+		state:table(t)
+	end)
+	test.falsy(ok)
+	test.includes(err, "cycle detected")
+	-- State should still be usable after the error
+	local g = state:globals()
+	g.x = 42
+	test.equal(42, state:load("return x"))
+	state:close()
+end)
+
+test.it("mutually-referencing tables raise a cycle error", function()
+	local state = lua.new()
+	local a = {}
+	local b = { prev = a }
+	a.next = b
+	local ok, err = pcall(function()
+		state:table(a)
+	end)
+	test.falsy(ok)
+	test.includes(err, "cycle detected")
+	state:close()
+end)
+
+test.it("table coercion via __newindex also detects cycles", function()
+	local state = lua.new()
+	local g = state:globals()
+	local t = {}
+	t.self = t
+	local ok, err = pcall(function()
+		g.bad = t
+	end)
+	test.falsy(ok)
+	test.includes(err, "cycle detected")
+	state:close()
+end)
+
+test.it("cycle detection does not false-positive on non-cyclic duplicates", function()
+	local state = lua.new()
+	-- Same table value appearing twice is fine (independent copies)
+	local child = { x = 1 }
+	local t = { a = child, b = child }
+	local gt = state:table(t)
+	local g = state:globals()
+	g.dup = gt
+	-- Both guest tables have x = 1
+	test.equal(1, state:load("return dup.a.x"))
+	test.equal(1, state:load("return dup.b.x"))
+	-- Mutating one does not affect the other (they are independent copies)
+	state:load("dup.a.x = 99")
+	test.equal(99, gt.a.x)
+	test.equal(1, gt.b.x)
 	state:close()
 end)

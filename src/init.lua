@@ -1,8 +1,8 @@
-local ffi    = require("ffi")
-local raw    = require("lua-sys.raw")
-local bridge = require("lua-sys.bridge")
+local ffi               = require("ffi")
+local raw               = require("lua-sys.raw")
+local bridge            = require("lua-sys.bridge")
 
-local unpack = table.unpack or unpack
+local unpack            = table.unpack or unpack
 
 local LUA_REGISTRYINDEX = -10000
 local LUA_GLOBALSINDEX  = -10002
@@ -11,7 +11,7 @@ local LUA_MULTRET       = -1
 local LUA_OK            = 0
 local LUA_YIELD         = 1
 
-local TYPE_NAMES = {
+local TYPE_NAMES        = {
 	[0] = "nil",
 	[1] = "boolean",
 	[2] = "lightuserdata",
@@ -20,7 +20,7 @@ local TYPE_NAMES = {
 	[5] = "table",
 	[6] = "function",
 	[7] = "userdata",
-	[8] = "thread",
+	[8] = "thread"
 }
 
 -- forward declarations: fromLua, toLua and makeCallable are mutually recursive
@@ -76,7 +76,7 @@ end
 -- ─── Table ────────────────────────────────────────────────────────────────
 
 ---@class lua.Table: lua.Value
-local Table = { _is_lua_value = true }
+local Table      = { _is_lua_value = true }
 for k, v in pairs(Value) do Table[k] = v end
 Table.__index = Table
 Table.__gc    = Value.free
@@ -115,19 +115,19 @@ end
 function Table:pairs()
 	local guestState = self._state
 	local L          = guestState.L
-	local key_ref    = nil  -- registry ref for the current iteration key
+	local key_ref    = nil                     -- registry ref for the current iteration key
 	return function()
-		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)  -- push table
+		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref) -- push table
 		if key_ref ~= nil then
 			raw.rawgeti(L, LUA_REGISTRYINDEX, key_ref)
 			raw.unref(L, LUA_REGISTRYINDEX, key_ref)
 			key_ref = nil
 		else
-			raw.pushnil(L)  -- initial key
+			raw.pushnil(L) -- initial key
 		end
 		local more = raw.next(L, -2)
 		if not more then
-			raw.pop(L, 1)  -- pop table
+			raw.pop(L, 1) -- pop table
 			return nil
 		end
 		-- stack: table, next-key, value
@@ -136,7 +136,7 @@ function Table:pairs()
 		-- save the key for the next lua_next call before popping
 		raw.pushvalue(L, -2)
 		key_ref = raw.ref(L, LUA_REGISTRYINDEX)
-		raw.pop(L, 3)  -- pop value, key, table
+		raw.pop(L, 3) -- pop value, key, table
 		return k, v
 	end
 end
@@ -151,7 +151,7 @@ function Table:ipairs()
 		i = i + 1
 		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
 		raw.rawgeti(L, -1, i)
-		if raw.type(L, -1) == 0 then  -- nil — end of sequence
+		if raw.type(L, -1) == 0 then -- nil — end of sequence
 			raw.pop(L, 2)
 			return nil
 		end
@@ -184,21 +184,24 @@ fromLua = function(guestState, L, stackIndex)
 
 	local typename = TYPE_NAMES[typeId]
 	if typename == "boolean" then return raw.toboolean(L, stackIndex) end
-	if typename == "number"  then return raw.tonumber(L, stackIndex)  end
-	if typename == "string"  then return raw.tolstring(L, stackIndex) end
+	if typename == "number" then return raw.tonumber(L, stackIndex) end
+	if typename == "string" then return raw.tolstring(L, stackIndex) end
 
 	raw.pushvalue(L, stackIndex)
 	local ref = raw.ref(L, LUA_REGISTRYINDEX)
 
-	if typename == "function" then return makeCallable(guestState, ref)
-	elseif typename == "table" then return Table._new(guestState, ref)
-	else                            return Value._ref_new(guestState, ref, typename)
+	if typename == "function" then
+		return makeCallable(guestState, ref)
+	elseif typename == "table" then
+		return Table._new(guestState, ref)
+	else
+		return Value._ref_new(guestState, ref, typename)
 	end
 end
 
 ---@param guestState lua.State
 ---@param L          lua.raw.State
----@param value      string|number|boolean|lua.Value|function|nil
+---@param value      string|number|boolean|table|lua.Value|function|nil
 toLua = function(guestState, L, value)
 	local valueType = type(value)
 
@@ -234,6 +237,13 @@ toLua = function(guestState, L, value)
 			table.insert(guestState._callbacks, { id = callbackId, fn = value })
 			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId)
 		end
+	elseif valueType == "table" then
+		-- Plain host table → auto-coerce to a guest table via state:table().
+		-- state:table() creates the table, populates it recursively (which
+		-- re-enters toLua for nested tables/functions), and returns a
+		-- lua.Table wrapper. Push the underlying guest table onto the stack.
+		local t = guestState:table(value)
+		raw.rawgeti(L, LUA_REGISTRYINDEX, t._ref)
 	else
 		error("cannot push value of type '" .. valueType .. "' onto guest stack", 2)
 	end
@@ -247,9 +257,9 @@ end
 ---@param guestState lua.State
 ---@param guestRef   integer
 local function callGuestSlow(guestState, guestRef, ...)
-	local L      = guestState.L
-	local nargs  = select("#", ...)
-	local base   = raw.gettop(L)
+	local L     = guestState.L
+	local nargs = select("#", ...)
+	local base  = raw.gettop(L)
 	raw.rawgeti(L, LUA_REGISTRYINDEX, guestRef)
 	for i = 1, nargs do toLua(guestState, L, (select(i, ...))) end
 	local status = raw.pcall(L, nargs, LUA_MULTRET, 0)
@@ -257,7 +267,9 @@ local function callGuestSlow(guestState, guestRef, ...)
 		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 0)
 	end
 	local nresults = raw.gettop(L) - base
-	if nresults == 0 then raw.settop(L, base); return end
+	if nresults == 0 then
+		raw.settop(L, base); return
+	end
 	if nresults == 1 then
 		local result = fromLua(guestState, L, base + 1)
 		raw.settop(L, base)
@@ -316,7 +328,7 @@ State.__index = State
 ---@param chunk     string
 ---@param chunkName string?
 function State:load(chunk, chunkName)
-	local L      = self.L
+	local L        = self.L
 	local retChunk = "return " .. chunk
 	local status
 	if chunkName then
@@ -358,10 +370,10 @@ end
 
 --- Create a new empty guest table and return it as a lua.Table.
 ---
---- If `init` is provided it must be a plain host table. Keys and values are
---- recursively populated into the guest table using the same rules as toLua:
+--- If `init` is provided it must be a plain host table. Keys and values
+--- are set via tbl:set(k, v) which delegates to toLua for conversion:
 ---   • string / number / boolean  → copied directly
----   • nested plain table         → recursively converted
+---   • nested plain table         → auto-coerced via state:table()
 ---   • lua.Value (guest ref)      → stored as-is
 ---   • function                   → registered as a host callback (CFunction)
 ---   • anything else              → error
@@ -378,38 +390,37 @@ function State:table(init)
 		if type(init) ~= "table" then
 			error("state:table() init argument must be a table, got " .. type(init), 2)
 		end
-		-- Populate using a local recursive helper so we can give a clean error
-		-- path. We reuse toLua for value conversion so all its rules apply.
-		local function populate(dest, src, depth)
-			if depth > 32 then
-				error("state:table(): init table is nested too deeply (max 32 levels)", 0)
+		-- Cycle detection: the seen set lives on the State so it persists
+		-- across recursive state:table() calls triggered by toLua coercion.
+		-- The top-level call wraps v in pcall to guarantee cleanup on error.
+		local seen = self._table_seen
+		local topLevel = (seen == nil)
+		if topLevel then
+			self._table_seen = {}
+			seen = self._table_seen
+		end
+		local function populate()
+			if seen[init] then
+				error("state:table(): cycle detected in init table", 0)
 			end
-			for k, v in pairs(src) do
-				-- keys: only primitives are valid Lua table keys across the boundary
+			seen[init] = true
+			for k, v in pairs(init) do
 				local kt = type(k)
 				if kt ~= "string" and kt ~= "number" and kt ~= "boolean" then
 					error("state:table(): unsupported key type '" .. kt .. "'", 0)
 				end
-				-- values: recurse into plain host tables; everything else via toLua
-				if type(v) == "table" and not isGuestValue(v) then
-					-- Nested plain host table → create a child guest table first,
-					-- then populate it, then set it on the parent.
-					raw.rawgeti(L, LUA_REGISTRYINDEX, dest._ref)  -- push dest table
-					toLua(self, L, k)                              -- push key
-					raw.createtable(L, 0, 8)                       -- push new child table
-					local childRef = raw.ref(L, LUA_REGISTRYINDEX) -- pop & store child ref
-					raw.rawgeti(L, LUA_REGISTRYINDEX, childRef)    -- push child back
-					raw.settable(L, -3)                            -- dest[k] = child; pops key+child
-					raw.pop(L, 1)                                  -- pop dest table
-					local child = Table._new(self, childRef)
-					populate(child, v, depth + 1)
-				else
-					dest:set(k, v)
-				end
+				tbl:set(k, v)
 			end
+			seen[init] = nil -- done with this table; same table appearing as
+			-- a sibling value (not a back-edge) is fine
 		end
-		local ok, err = pcall(populate, tbl, init, 1)
-		if not ok then error(err, 2) end
+		if topLevel then
+			local ok, err = pcall(populate)
+			self._table_seen = nil
+			if not ok then error(err, 2) end
+		else
+			populate()
+		end
 	end
 
 	return tbl
@@ -427,7 +438,7 @@ end
 -- ─── Module ───────────────────────────────────────────────────────────────
 
 ---@class lua
-local lua = {}
+local lua    = {}
 
 lua.raw      = raw
 lua.profiler = require("lua-sys.profiler")
