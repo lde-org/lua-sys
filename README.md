@@ -44,13 +44,33 @@ state:close()
 
 Creates a new guest `lua_State` with all standard libraries loaded.
 
-### `state:load(chunk) → callable`
+### `state:load(chunk [, chunkName]) → callable`
 
 Compiles and evaluates a Lua chunk in the guest state. A bare expression (e.g. `"function(a, b) end"`) is automatically wrapped with `return`. Returns the first result as a callable if it's a function, a `lua.Table` if it's a table, or a primitive value.
+
+An optional `chunkName` sets the chunk name visible to `debug.getinfo(1, "S").source` inside the guest. Prefix with `@` for file paths (e.g. `"@/path/to/file.lua"`), which follows the LuaJIT convention.
 
 ### `state:globals() → lua.Table`
 
 Returns a `lua.Table` wrapping the guest state's global environment (`_G`).
+
+### `state:table([init]) → lua.Table`
+
+Creates a new empty guest table. If `init` is provided, it must be a plain host table whose keys and values are recursively copied into the guest table:
+
+| Host value type | Converted to |
+|---|---|
+| `string`, `number`, `boolean` | Copied directly |
+| Plain nested table | Recursively converted to a guest table |
+| `lua.Value` (guest ref) | Stored as-is |
+| `function` | Registered as a host callback |
+
+```lua
+local t = state:table({ name = "alice", pos = { x = 1, y = 2 }, greet = function(n) return "hi " .. n end })
+print(t.name)       -- alice
+print(t.pos.x)      -- 1
+print(t:get("greet")("world"))  -- hi world
+```
 
 ### `state:close()`
 
@@ -63,6 +83,76 @@ Reads a key from the table. Returns primitives as-is, functions as callables, an
 ### `lua.Table:set(key, value)`
 
 Writes a key into the table. Accepts primitives, host Lua functions, guest function callables, and other `lua.Table` values.
+
+### `lua.Table` field access
+
+`lua.Table` proxies field reads and writes directly to `:get()` and `:set()`, so you can use `tbl.key` syntax instead of `tbl:get("key")`:
+
+```lua
+local g = state:globals()
+g.myVar = 42           -- same as g:set("myVar", 42)
+print(g.myVar)         -- same as g:get("myVar")
+```
+
+Method names (`get`, `set`, `pairs`, `ipairs`, `type`, `value`, `free`) take priority over table keys.
+
+### `lua.Table:pairs() → iterator`
+
+Returns a stateless iterator over all key/value pairs, equivalent to `pairs()` on a plain table:
+
+```lua
+for k, v in t:pairs() do
+    print(k, v)
+end
+```
+
+### `lua.Table:ipairs() → iterator`
+
+Returns a stateless iterator over the integer keys `1..n`, equivalent to `ipairs()`:
+
+```lua
+for i, v in t:ipairs() do
+    print(i, v)
+end
+```
+
+## Profiler
+
+lua-sys includes a sampling profiler that profiles guest `lua_State` instances using LuaJIT's built-in profiler hooks:
+
+```lua
+local profiler = require("lua-sys.profiler")
+
+profiler.start(state, "fi1")
+-- ... run guest code ...
+local report = profiler.stop(state)
+profiler.print(report)
+```
+
+### `profiler.start(state [, mode] [, callback])`
+
+Starts profiling a guest state.
+
+- `mode` — LuaJIT profiler mode string (default `"fi1"`): `f` for function-level, `l` for line-level, `i<ms>` for sampling interval.
+- `callback` — optional `function(stack, samples, vmstate)` called once per sample tick. When omitted, samples are aggregated and returned by `stop()`.
+
+### `profiler.stop(state) → report`
+
+Stops profiling and returns an aggregated report (sorted by sample count descending):
+
+```lua
+{
+    { stack = "fn1;fn2", count = 150, percent = 75.0 },
+    { stack = "fn3",     count = 50,  percent = 25.0 },
+    total = 200,
+}
+```
+
+Returns `nil` if started with a custom callback.
+
+### `profiler.print(report [, out] [, min_percent])`
+
+Prints a report to stdout (or a file handle), hiding entries below `min_percent` (default 1%).
 
 ## How it works
 

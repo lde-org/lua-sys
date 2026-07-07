@@ -568,3 +568,220 @@ test.it("many iterations of nested calls do not corrupt state", function()
 
 	state:close()
 end)
+
+-- ─── Host callbacks returning compound types ──────────────────────────────
+--
+-- dispatch_callback currently calls push_primitive_or_error on the host result
+-- before returning to the guest. If the host function returns a table (compound),
+-- bridge.c calls lua_error(host_L) outside any pcall on host_L — undefined
+-- behaviour that causes crashes or silent exits on macOS/Windows.
+
+test.it("host callback returning a table raises a clear guest error (not a crash)", function()
+	local state = lua.new()
+	local g = state:globals()
+
+	-- Host function returns a compound value (table). The bridge cannot copy
+	-- tables across independent states; it must raise a clear guest-side error
+	-- rather than crashing or calling lua_error on the host outside a pcall.
+	g:set("get_obj", function()
+		return { value = 42 }
+	end)
+
+	local ok, err = pcall(state.load, state, [[
+		local obj = get_obj()
+	]])
+	-- Must fail with a bridge error message, not a process crash
+	test.falsy(ok)
+	test.truthy(type(err) == "string", "expected string error, got " .. type(err))
+	test.includes(err, "bridge:")
+	state:close()
+end)
+
+test.it("host callback returning a table error is catchable with guest pcall", function()
+	local state = lua.new()
+	local g = state:globals()
+
+	g:set("get_obj", function()
+		return { value = 42 }
+	end)
+
+	-- Guest-side pcall should catch the bridge error cleanly
+	local ok, err = pcall(state.load, state, [[
+		local ok, err = pcall(get_obj)
+		assert(not ok, "expected error from get_obj")
+		assert(type(err) == "string" and err:find("bridge:"), "expected bridge error")
+	]])
+	test.truthy(ok, tostring(err))
+	state:close()
+end)
+
+test.it("host callback NOT returning a table still works fine", function()
+	local state = lua.new()
+	local g = state:globals()
+
+	g:set("get_num", function()
+		return 42
+	end)
+
+	local ok, err = pcall(state.load, state, [[
+		local n = get_num()
+		assert(n == 42, "expected 42, got " .. tostring(n))
+	]])
+	test.truthy(ok, tostring(err))
+	state:close()
+end)
+
+-- ─── state:load with chunk name ───────────────────────────────────────────
+--
+-- state:load currently uses luaL_loadstring which does not accept a chunk name.
+-- debug.getinfo inside guest code therefore returns source = "=(load)" instead
+-- of the real file path, breaking packages like git2-sys that locate native
+-- libraries via debug.getinfo(1, "S").source.
+
+test.it("state:load with chunk name exposes correct source via debug.getinfo", function()
+	local state = lua.new()
+
+	local source = [[
+		local info = debug.getinfo(1, "S")
+		return info.source
+	]]
+
+	-- Load with an explicit chunk name (the "@path" convention)
+	local chunkName = "@/some/path/to/file.lua"
+	local result = state:load(source, chunkName)
+	test.equal(chunkName, result)
+	state:close()
+end)
+
+test.it("state:load without chunk name still works (source is =(load) or similar)", function()
+	local state = lua.new()
+	local result = state:load([[
+		local info = debug.getinfo(1, "S")
+		return info.source
+	]])
+	-- Without a chunk name the source will be something like "=(load)" — just
+	-- verify it doesn't crash and returns a string.
+	test.equal("string", type(result))
+	state:close()
+end)
+
+-- ─── state:table() ────────────────────────────────────────────────────────
+
+test.it("state:table() returns an empty lua.Table", function()
+	local state = lua.new()
+	local t = state:table()
+	test.truthy(t)
+	test.equal("table", t:type())
+	state:close()
+end)
+
+test.it("state:table() result is visible to guest code", function()
+	local state = lua.new()
+	local g = state:globals()
+	local t = state:table()
+	t:set("x", 99)
+	g:set("obj", t)
+	local v = state:load("return obj.x")
+	test.equal(99, v)
+	state:close()
+end)
+
+test.it("state:table({ ... }) populates string/number/boolean keys", function()
+	local state = lua.new()
+	local t = state:table({ name = "alice", score = 42, active = true })
+	test.equal("alice", t:get("name"))
+	test.equal(42,      t:get("score"))
+	test.equal(true,    t:get("active"))
+	state:close()
+end)
+
+test.it("state:table() with integer keys", function()
+	local state = lua.new()
+	local t = state:table({ "a", "b", "c" })
+	test.equal("a", t:get(1))
+	test.equal("b", t:get(2))
+	test.equal("c", t:get(3))
+	state:close()
+end)
+
+test.it("state:table() with nested plain table", function()
+	local state = lua.new()
+	local t = state:table({ pos = { x = 1, y = 2 } })
+	local pos = t:get("pos")
+	test.equal("table", pos:type())
+	test.equal(1, pos:get("x"))
+	test.equal(2, pos:get("y"))
+	state:close()
+end)
+
+test.it("state:table() with deeply nested tables", function()
+	local state = lua.new()
+	local t = state:table({ a = { b = { c = { d = 42 } } } })
+	local g = state:globals()
+	g:set("obj", t)
+	local v = state:load("return obj.a.b.c.d")
+	test.equal(42, v)
+	state:close()
+end)
+
+test.it("state:table() with a function value registers it as host callback", function()
+	local state = lua.new()
+	local called = false
+	local t = state:table({
+		greet = function(name)
+			called = true
+			return "hi " .. name
+		end
+	})
+	local g = state:globals()
+	g:set("obj", t)
+	local result = state:load("return obj.greet('world')")
+	test.equal("hi world", result)
+	test.truthy(called)
+	state:close()
+end)
+
+test.it("state:table() with nil init is same as no arg", function()
+	local state = lua.new()
+	local t = state:table(nil)
+	test.truthy(t)
+	test.equal("table", t:type())
+	state:close()
+end)
+
+test.it("state:table() errors on non-table init", function()
+	local state = lua.new()
+	local ok, err = pcall(function() state:table("oops") end)
+	test.falsy(ok)
+	test.includes(err, "init argument must be a table")
+	state:close()
+end)
+
+test.it("state:table() errors on unsupported key type", function()
+	local state = lua.new()
+	local ok, err = pcall(function()
+		state:table({ [{}] = "bad" })
+	end)
+	test.falsy(ok)
+	test.includes(err, "unsupported key type")
+	state:close()
+end)
+
+test.it("state:table() result can be passed to a guest function and read back", function()
+	local state = lua.new()
+	local t = state:table({ value = 7 })
+	local fn = state:load("function(tbl) return tbl.value * 6 end")
+	local result = fn(t)
+	test.equal(42, result)
+	state:close()
+end)
+
+test.it("state:table() result can be mutated by guest code and read on host", function()
+	local state = lua.new()
+	local t = state:table({ count = 0 })
+	local g = state:globals()
+	g:set("counter", t)
+	state:load("counter.count = counter.count + 10")
+	test.equal(10, t:get("count"))
+	state:close()
+end)

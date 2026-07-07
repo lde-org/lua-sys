@@ -309,13 +309,28 @@ State.__index = State
 
 --- Compile and evaluate a Lua chunk. A bare expression is automatically
 --- wrapped in `return` so it produces a value.
----@param chunk string
-function State:load(chunk)
+---
+--- chunkName follows the LuaJIT convention: prefix with "@" for a file path
+--- (e.g. "@/path/to/file.lua") so that debug.getinfo(1,"S").source returns
+--- the correct path inside the guest.
+---@param chunk     string
+---@param chunkName string?
+function State:load(chunk, chunkName)
 	local L      = self.L
-	local status = raw.loadstring(L, "return " .. chunk)
+	local retChunk = "return " .. chunk
+	local status
+	if chunkName then
+		status = raw.loadbuffer(L, retChunk, #retChunk, chunkName)
+	else
+		status = raw.loadstring(L, retChunk)
+	end
 	if status ~= LUA_OK then
 		raw.pop(L, 1)
-		status = raw.loadstring(L, chunk)
+		if chunkName then
+			status = raw.loadbuffer(L, chunk, #chunk, chunkName)
+		else
+			status = raw.loadstring(L, chunk)
+		end
 	end
 	if status ~= LUA_OK then
 		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 2)
@@ -339,6 +354,65 @@ function State:globals()
 	local globals = fromLua(self, L, -1)
 	raw.pop(L, 1)
 	return globals
+end
+
+--- Create a new empty guest table and return it as a lua.Table.
+---
+--- If `init` is provided it must be a plain host table. Keys and values are
+--- recursively populated into the guest table using the same rules as toLua:
+---   • string / number / boolean  → copied directly
+---   • nested plain table         → recursively converted
+---   • lua.Value (guest ref)      → stored as-is
+---   • function                   → registered as a host callback (CFunction)
+---   • anything else              → error
+---
+---@param init table?
+---@return lua.Table
+function State:table(init)
+	local L = self.L
+	raw.createtable(L, 0, init and 16 or 0)
+	local ref = raw.ref(L, LUA_REGISTRYINDEX)
+	local tbl = Table._new(self, ref)
+
+	if init ~= nil then
+		if type(init) ~= "table" then
+			error("state:table() init argument must be a table, got " .. type(init), 2)
+		end
+		-- Populate using a local recursive helper so we can give a clean error
+		-- path. We reuse toLua for value conversion so all its rules apply.
+		local function populate(dest, src, depth)
+			if depth > 32 then
+				error("state:table(): init table is nested too deeply (max 32 levels)", 0)
+			end
+			for k, v in pairs(src) do
+				-- keys: only primitives are valid Lua table keys across the boundary
+				local kt = type(k)
+				if kt ~= "string" and kt ~= "number" and kt ~= "boolean" then
+					error("state:table(): unsupported key type '" .. kt .. "'", 0)
+				end
+				-- values: recurse into plain host tables; everything else via toLua
+				if type(v) == "table" and not isGuestValue(v) then
+					-- Nested plain host table → create a child guest table first,
+					-- then populate it, then set it on the parent.
+					raw.rawgeti(L, LUA_REGISTRYINDEX, dest._ref)  -- push dest table
+					toLua(self, L, k)                              -- push key
+					raw.createtable(L, 0, 8)                       -- push new child table
+					local childRef = raw.ref(L, LUA_REGISTRYINDEX) -- pop & store child ref
+					raw.rawgeti(L, LUA_REGISTRYINDEX, childRef)    -- push child back
+					raw.settable(L, -3)                            -- dest[k] = child; pops key+child
+					raw.pop(L, 1)                                  -- pop dest table
+					local child = Table._new(self, childRef)
+					populate(child, v, depth + 1)
+				else
+					dest:set(k, v)
+				end
+			end
+		end
+		local ok, err = pcall(populate, tbl, init, 1)
+		if not ok then error(err, 2) end
+	end
+
+	return tbl
 end
 
 function State:close()

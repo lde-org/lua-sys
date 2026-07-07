@@ -84,9 +84,34 @@ static int bound_call(lua_State *host) {
     int nargs        = lua_gettop(host);
     int guest_base   = lua_gettop(guest);
 
+    /* Fast path: all args are primitives. */
+    int i;
+    int all_primitive = 1;
+    for (i = 1; i <= nargs; i++) {
+        int t = lua_type(host, i);
+        if (t != LUA_TNIL && t != LUA_TBOOLEAN && t != LUA_TNUMBER && t != LUA_TSTRING) {
+            all_primitive = 0;
+            break;
+        }
+    }
+
+    if (!all_primitive) {
+        /* Slow path: at least one arg is a compound type (e.g. lua.Table).
+           Delegate entirely to callGuestSlow which runs Lua-side toLua()
+           and handles guest registry refs correctly. */
+        int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(4));
+        lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref); /* callGuestSlow */
+        lua_pushvalue(host, lua_upvalueindex(3));        /* guestState */
+        lua_pushinteger(host, fn_ref);                   /* guestRef */
+        for (i = 1; i <= nargs; i++)
+            lua_pushvalue(host, i);
+        int status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
+        if (status != LUA_OK) lua_error(host);
+        return lua_gettop(host) - nargs;
+    }
+
     lua_rawgeti(guest, LUA_REGISTRYINDEX, fn_ref);
 
-    int i;
     for (i = 1; i <= nargs; i++)
         push_primitive_or_error(host, i, guest);
 
@@ -185,8 +210,23 @@ static int dispatch_callback(lua_State *guest) {
     int nresults = lua_gettop(host_L) - saved_top;
     if (nresults == 0) return 0; /* host stack already at saved_top */
 
-    for (i = 0; i < nresults; i++)
-        push_primitive_or_error(host_L, saved_top + 1 + i, guest);
+    for (i = 0; i < nresults; i++) {
+        int t = push_primitive_typed(host_L, saved_top + 1 + i, guest);
+        if (t < 0) {
+            /* Compound value (table, function, userdata, …) — cannot copy
+               across independent states. Restore stacks and raise a clear
+               guest-side error so the caller can handle it with pcall. */
+            lua_settop(host_L, saved_top);
+            lua_settop(guest, 0);
+            lua_pushfstring(guest,
+                "bridge: host callback returned a %s; "
+                "only primitives (nil, boolean, number, string) "
+                "can be returned from host to guest",
+                lua_typename(host_L, lua_type(host_L, saved_top + 1 + i)));
+            lua_error(guest);
+            return 0; /* unreachable */
+        }
+    }
 
     lua_settop(host_L, saved_top);
     return nresults;
