@@ -27,7 +27,9 @@ if jit.os == "Windows" then
 
 	-- Extracted to out/luajit/libluajit-windows-<arch>-gnu/{include,lib}
 	local ljDir = out .. "/luajit/libluajit-windows-" .. arch .. "-gnu"
-	extra_link  = " -I" .. ljDir .. "/include " .. ljDir .. "/lib/libluajit.a -lm"
+	extra_link  = " -I" .. ljDir .. "/include"
+	            .. " -Wl,--whole-archive " .. ljDir .. "/lib/libluajit.a -Wl,--no-whole-archive"
+	            .. " -lm"
 elseif jit.os == "OSX" then
 	ext        = "dylib"
 	flags      = "-dynamiclib -undefined dynamic_lookup"
