@@ -340,14 +340,13 @@ ffi.cdef [[
 ---@field luaopen_string fun(L: lua.raw.State): integer
 ---@field luaopen_string_buffer fun(L: lua.raw.State): integer
 ---@field luaopen_table fun(L: lua.raw.State): integer
--- On Windows, lua symbols are embedded in bridge.dll (libluajit.a linked in).
--- Load them via ffi.load so ffi.C lookups resolve correctly.
--- On Linux/macOS they come from the host process image via ffi.C.
-local C
-if ffi.os == "Windows" then
-	C = ffi.load("bridge")
-else
-	C = ffi.C
+local C = ffi.C
+
+if jit.os == "Windows" then
+	-- On Windows lua symbols are not exported from the process image.
+	-- They are linked into bridge.dll via the lde import library.
+	local here = debug.getinfo(1, "S").source:sub(2):match("(.*[/\\])") or ""
+	C = ffi.load(here .. "bridge.dll")
 end
 
 local raw = {}
