@@ -16,9 +16,16 @@ local lua = require("lua-sys")
 -- Create an independent guest Lua state
 local state = lua.new()
 
--- Load and call guest functions
-local add = state:load("function(a, b) return a + b end")
+-- Evaluate an expression in the guest (shorthand)
+print(state:eval("return 1 + 2"))  -- 3
+
+-- Load a chunk, then evaluate it — returns the first result
+local add = state:load("return function(a, b) return a + b end"):eval()
 print(add(1, 2))  -- 3
+
+-- Shortcut: chunk(...) is equivalent to chunk:eval(...)
+local mul = state:load("return function(a, b) return a * b end")()
+print(mul(3, 4))  -- 12
 
 -- Expose host functions to guest code
 local g = state:globals()
@@ -29,12 +36,16 @@ end
 -- Plain host tables are automatically coerced to guest tables
 g.config = { timeout = 5, retries = 3 }
 
-local runner = state:load('function() greet("world") end')
-runner()  -- Hello, world!
+-- Execute a chunk without expecting a return value
+state:load('function() greet("world") end'):call()  -- Hello, world!
+
+-- Pass arguments that populate ... inside the guest
+state:load("_person = ..."):call("Alice")
+print(g._person)  -- Alice
 
 -- Guest can call back into host, host can call back into guest
 g:set("double", function(x) return x * 2 end)
-local nested = state:load("function(x) return double(x) + double(x) end")
+local nested = state:eval("return function(x) return double(x) + double(x) end")
 print(nested(5))  -- 20
 
 -- Always close when done
@@ -47,11 +58,60 @@ state:close()
 
 Creates a new guest `lua_State` with all standard libraries loaded.
 
-### `state:load(chunk [, chunkName]) → callable`
+### `state:eval(code [, chunkName]) → value`
 
-Compiles and evaluates a Lua chunk in the guest state. A bare expression (e.g. `"function(a, b) end"`) is automatically wrapped with `return`. Returns the first result as a callable if it's a function, a `lua.Table` if it's a table, or a primitive value.
+Compiles and evaluates a Lua chunk immediately, returning the first result. Equivalent to `state:load(code, chunkName):eval()`. A bare expression (e.g. `"1 + 2"`) is automatically wrapped with `return`.
 
-An optional `chunkName` sets the chunk name visible to `debug.getinfo(1, "S").source` inside the guest. Prefix with `@` for file paths (e.g. `"@/path/to/file.lua"`), which follows the LuaJIT convention.
+```lua
+local v = state:eval("return 42")           -- 42
+local fn = state:eval("function(x) return x * 2 end")
+print(fn(5))  -- 10
+```
+
+An optional `chunkName` sets the chunk name visible to `debug.getinfo(1, "S").source` inside the guest. Prefix with `@` for file paths (e.g. `"@/path/to/file.lua"`).
+
+### `state:load(code [, chunkName]) → lua.Chunk`
+
+Loads Lua source code and returns a `lua.Chunk` builder. The chunk is **not** compiled or executed until you call `:eval()` or `:call()` on it. This lets you configure the chunk (e.g. set its debug name) before running it, and pass arguments that populate `...` inside the guest.
+
+```lua
+-- Configure before running
+local chunk = state:load("return ...")
+    :setName("@myscript.lua")
+
+print(chunk:eval("hello"))  -- hello
+print(chunk:eval("world"))  -- world (can re-evaluate multiple times)
+
+-- Execute a script without expecting a return value
+state:load("print(\"hello from guest\")"):call()
+
+-- Pass multiple arguments that populate ...
+state:load("local a, b = ...; _result = a + b"):call(3, 4)
+print(state:globals()._result)  -- 7
+
+-- Chunk is callable: chunk(...) is shorthand for chunk:eval(...)
+print(state:load("return ... * 2")(21))  -- 42
+```
+
+### `lua.Chunk`
+
+A builder object returned by `state:load()` that holds Lua source code and optional configuration. Compilation happens lazily when you execute the chunk.
+
+#### `chunk:eval(...) → value`
+
+Compiles and evaluates the chunk, passing any arguments as `...` inside the guest. Returns the first result, or `nil` if the chunk returns nothing.
+
+#### `chunk:call(...)`
+
+Compiles and executes the chunk, discarding any return values. Arguments are passed as `...` inside the guest. Use this for side-effectful scripts where you don't need a result.
+
+#### `chunk:setName(name) → lua.Chunk`
+
+Sets the chunk name for debug purposes (visible via `debug.getinfo(1, "S").source`). Prefix with `@` for file paths. Returns self for chaining.
+
+#### `chunk(...)`
+
+The `__call` metamethod. Calling a chunk directly is shorthand for `chunk:eval(...)`.
 
 ### `state:globals() → lua.Table`
 
