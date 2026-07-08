@@ -12,10 +12,9 @@ local build = require("lde-build")
 
 local out = assert(os.getenv("LDE_OUTPUT_DIR"), "LDE_OUTPUT_DIR not set")
 
-local ext, flags, extra_link
+local ext, args
 if jit.os == "Windows" then
-	ext           = "dll"
-	flags         = "-shared"
+	ext = "dll"
 
 	local arch    = jit.arch == "arm64" and "aarch64" or "x86-64"
 	local tarName = "libluajit-windows-" .. arch .. "-gnu.tar.gz"
@@ -25,25 +24,33 @@ if jit.os == "Windows" then
 	build:extract(tarName, "luajit")
 	build:delete(tarName)
 
-	-- Extracted to out/luajit/libluajit-windows-<arch>-gnu/{include,lib}
 	local ljDir = out .. "/luajit/libluajit-windows-" .. arch .. "-gnu"
-	extra_link  = " -I" .. ljDir .. "/include"
-	            .. " -Wl,--whole-archive " .. ljDir .. "/lib/libluajit.a -Wl,--no-whole-archive"
-	            .. " -lm"
+
+	args = {
+		"-shared", "-O2",
+		"-I", out,
+		"-I", ljDir .. "/include",
+		"-o", out .. "/bridge." .. ext,
+		out .. "/bridge.c",
+		"-Wl,--whole-archive", ljDir .. "/lib/libluajit.a", "-Wl,--no-whole-archive",
+		"-lm",
+	}
 elseif jit.os == "OSX" then
-	ext        = "dylib"
-	flags      = "-dynamiclib -undefined dynamic_lookup"
-	extra_link = ""
+	ext  = "dylib"
+	args = {
+		"-dynamiclib", "-undefined", "dynamic_lookup", "-O2",
+		"-I", out,
+		"-o", out .. "/bridge." .. ext,
+		out .. "/bridge.c",
+	}
 else
-	ext        = "so"
-	flags      = "-shared -fPIC"
-	extra_link = ""
+	ext  = "so"
+	args = {
+		"-shared", "-fPIC", "-O2",
+		"-I", out,
+		"-o", out .. "/bridge." .. ext,
+		out .. "/bridge.c",
+	}
 end
 
-local compiler = os.getenv("SEA_CC") or "gcc"
-
-build:sh(compiler .. " " .. flags .. " -O2"
-	.. " -I" .. out
-	.. " -o " .. out .. "/bridge." .. ext
-	.. " " .. out .. "/bridge.c"
-	.. extra_link)
+build:cc(args)
