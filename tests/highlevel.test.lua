@@ -14,7 +14,7 @@ end)
 
 test.it("state:load returns a callable function", function()
 	local state = lua.new()
-	local fn = state:load("return function(a, b) return a + b end")
+	local fn = state:eval("return function(a, b) return a + b end")
 	test.truthy(fn)
 	test.equal("function", type(fn))
 	state:close()
@@ -22,21 +22,21 @@ end)
 
 test.it("state:load handles explicit return chunks too", function()
 	local state = lua.new()
-	local v = state:load("return 42")
+	local v = state:eval("return 42")
 	test.equal(42, v)
 	state:close()
 end)
 
 test.it("state:load returns nil for a void chunk", function()
 	local state = lua.new()
-	local v = state:load("local x = 1")
+	local v = state:eval("local x = 1")
 	test.equal(nil, v)
 	state:close()
 end)
 
 test.it("state:load raises on syntax error", function()
 	local state = lua.new()
-	local ok, err = pcall(function() state:load(")(invalid") end)
+	local ok, err = pcall(function() state:eval(")(invalid") end)
 	test.equal(false, ok)
 	test.truthy(err)
 	state:close()
@@ -46,7 +46,7 @@ end)
 
 test.it("calling a guest function returns plain values", function()
 	local state = lua.new()
-	local fn = state:load("function(a, b) return a + b end")
+	local fn = state:eval("function(a, b) return a + b end")
 	local result = fn(3, 4)
 	test.equal(7, result)
 	state:close()
@@ -54,7 +54,7 @@ end)
 
 test.it("guest function passes string arguments", function()
 	local state = lua.new()
-	local fn = state:load("function(s) return s .. '!' end")
+	local fn = state:eval("function(s) return s .. '!' end")
 	local result = fn("hello")
 	test.equal("hello!", result)
 	state:close()
@@ -62,7 +62,7 @@ end)
 
 test.it("guest function passes boolean arguments", function()
 	local state = lua.new()
-	local fn = state:load("function(b) return not b end")
+	local fn = state:eval("function(b) return not b end")
 	local result = fn(true)
 	test.equal(false, result)
 	state:close()
@@ -70,7 +70,7 @@ end)
 
 test.it("guest function returns multiple results", function()
 	local state = lua.new()
-	local fn = state:load("function(a, b) return a, b, a + b end")
+	local fn = state:eval("function(a, b) return a, b, a + b end")
 	local r1, r2, r3 = fn(10, 20)
 	test.equal(10, r1)
 	test.equal(20, r2)
@@ -80,7 +80,7 @@ end)
 
 test.it("pcall on guest function returns true and results on success", function()
 	local state = lua.new()
-	local fn = state:load("function(x) return x * 2 end")
+	local fn = state:eval("function(x) return x * 2 end")
 	local ok, result = pcall(fn, 21)
 	test.equal(true, ok)
 	test.equal(42, result)
@@ -89,7 +89,7 @@ end)
 
 test.it("pcall on guest function returns false and error on failure", function()
 	local state = lua.new()
-	local fn = state:load("function() error('boom') end")
+	local fn = state:eval("function() error('boom') end")
 	local ok, err = pcall(fn)
 	test.equal(false, ok)
 	test.equal("string", type(err))
@@ -99,7 +99,7 @@ end)
 
 test.it("can pass result of guest call to another guest call", function()
 	local state = lua.new()
-	local double = state:load("function(x) return x * 2 end")
+	local double = state:eval("function(x) return x * 2 end")
 	local r = double(5)
 	local again = double(r)
 	test.equal(20, again)
@@ -174,11 +174,11 @@ end)
 
 test.it("globals:set accepts a guest function and it stays callable", function()
 	local state = lua.new()
-	local fn    = state:load("function(x) return x + 1 end")
+	local fn    = state:eval("function(x) return x + 1 end")
 	local g     = state:globals()
 	g:set("increment", fn)
 	-- verify it's visible from within Lua
-	local runner = state:load("function() return increment(9) end")
+	local runner = state:eval("function() return increment(9) end")
 	local v = runner()
 	test.equal(10, v)
 	state:close()
@@ -194,7 +194,7 @@ test.it("globals:set accepts a plain Lua function (wrapped as CFunction)", funct
 		return a + b
 	end)
 
-	local v = state:load("return add(3, 4)")
+	local v = state:eval("return add(3, 4)")
 	test.equal(7, v)
 	state:close()
 end)
@@ -207,7 +207,7 @@ test.it("wrapped Lua function can return multiple values", function()
 		return b, a
 	end)
 
-	local fn = state:load("function() return swap(1, 2) end")
+	local fn = state:eval("function() return swap(1, 2) end")
 	local r1, r2 = fn()
 	test.equal(2, r1)
 	test.equal(1, r2)
@@ -223,7 +223,7 @@ test.it("wrapped Lua function returning nil produces no results", function()
 		called = true
 	end)
 
-	local fn = state:load("function() noop(); return 'done' end")
+	local fn = state:eval("function() noop(); return 'done' end")
 	local v = fn()
 	test.equal(true, called)
 	test.equal("done", v)
@@ -234,7 +234,7 @@ end)
 
 test.it("state:load of a table returns lua.Table", function()
 	local state = lua.new()
-	local tbl = state:load("{}")
+	local tbl = state:eval("{}")
 	test.truthy(tbl)
 	test.equal("table", tbl:type())
 	state:close()
@@ -242,7 +242,7 @@ end)
 
 test.it("table from guest has get/set", function()
 	local state = lua.new()
-	local tbl = state:load("{x = 10}")
+	local tbl = state:eval("{x = 10}")
 	test.equal(10, tbl:get("x"))
 	tbl:set("y", 20)
 	test.equal(20, tbl:get("y"))
@@ -255,7 +255,7 @@ test.it("stack is balanced after every operation", function()
 	local raw   = lua.raw
 	local base  = raw.gettop(L)
 
-	local fn    = state:load("function(x) return x end")
+	local fn    = state:eval("function(x) return x end")
 	local g     = state:globals()
 	g:set("x", 10)
 	local v = g:get("x")
@@ -272,7 +272,7 @@ test.it("pcall succeeds when function calls wrapped Lua function", function()
 	g:set("double", function(x)
 		return x * 2
 	end)
-	local fn = state:load("function(x) return double(x) end")
+	local fn = state:eval("function(x) return double(x) end")
 	local ok, result = pcall(fn, 5)
 	test.equal(true, ok)
 	test.equal(10, result)
@@ -283,7 +283,7 @@ test.it("pcall catches errors that occur after wrapped calls", function()
 	local state = lua.new()
 	local g = state:globals()
 	g:set("noop", function() end)
-	local fn = state:load("function() noop(); error('kaboom') end")
+	local fn = state:eval("function() noop(); error('kaboom') end")
 	local ok, err = pcall(fn)
 	test.equal(false, ok)
 	test.equal("string", type(err))
@@ -297,7 +297,7 @@ test.it("pcall returns results from wrapped function calls", function()
 	g:set("add", function(a, b)
 		return a + b
 	end)
-	local fn = state:load("function(a, b) return add(a, b) end")
+	local fn = state:eval("function(a, b) return add(a, b) end")
 	local ok, result = pcall(fn, 10, 20)
 	test.equal(true, ok)
 	test.equal(30, result)
@@ -308,7 +308,7 @@ end)
 
 test.it("table[key] reads via __index proxy", function()
 	local state = lua.new()
-	local tbl = state:load("{x = 10, y = 20}")
+	local tbl = state:eval("{x = 10, y = 20}")
 	test.equal(10, tbl.x)
 	test.equal(20, tbl.y)
 	test.equal(nil, tbl.z)
@@ -317,7 +317,7 @@ end)
 
 test.it("table[key] = val writes via __newindex proxy", function()
 	local state = lua.new()
-	local tbl = state:load("{}")
+	local tbl = state:eval("{}")
 	tbl.x = 42
 	tbl.msg = "hello"
 	tbl.flag = true
@@ -330,7 +330,7 @@ end)
 test.it("__index does not shadow Table methods", function()
 	local state = lua.new()
 	-- guest table has a key named 'get' — the method must still win
-	local tbl = state:load([[{get = "notamethod"}]])
+	local tbl = state:eval([[{get = "notamethod"}]])
 	test.equal("function", type(tbl.get)) -- method, not the guest string
 	test.equal("notamethod", tbl:get("get"))
 	state:close()
@@ -341,7 +341,7 @@ test.it("__newindex on globals roundtrip", function()
 	local g = state:globals()
 	g.answer = 99
 	test.equal(99, g.answer)
-	local v = state:load("return answer")
+	local v = state:eval("return answer")
 	test.equal(99, v)
 	state:close()
 end)
@@ -350,7 +350,7 @@ end)
 
 test.it("pairs() iterates all key/value pairs", function()
 	local state = lua.new()
-	local tbl = state:load("{a = 1, b = 2, c = 3}")
+	local tbl = state:eval("{a = 1, b = 2, c = 3}")
 	local got = {}
 	for k, v in tbl:pairs() do
 		got[k] = v
@@ -366,7 +366,7 @@ end)
 
 test.it("pairs() on empty table yields nothing", function()
 	local state = lua.new()
-	local tbl = state:load("{}")
+	local tbl = state:eval("{}")
 	local count = 0
 	for _ in tbl:pairs() do count = count + 1 end
 	test.equal(0, count)
@@ -375,7 +375,7 @@ end)
 
 test.it("pairs() can be called multiple times independently", function()
 	local state = lua.new()
-	local tbl = state:load("{x = 1, y = 2}")
+	local tbl = state:eval("{x = 1, y = 2}")
 	local first, second = {}, {}
 	for k in tbl:pairs() do first[k] = true end
 	for k in tbl:pairs() do second[k] = true end
@@ -386,7 +386,7 @@ end)
 
 test.it("pairs() two concurrent iterators on same table", function()
 	local state = lua.new()
-	local tbl = state:load("{a=1, b=2, c=3, d=4}")
+	local tbl = state:eval("{a=1, b=2, c=3, d=4}")
 	local iter1 = tbl:pairs()
 	local iter2 = tbl:pairs()
 	local s1, s2 = {}, {}
@@ -401,7 +401,7 @@ end)
 
 test.it("ipairs() iterates sequential integer keys", function()
 	local state = lua.new()
-	local tbl = state:load("{10, 20, 30}")
+	local tbl = state:eval("{10, 20, 30}")
 	local keys, vals = {}, {}
 	for i, v in tbl:ipairs() do
 		keys[#keys + 1] = i
@@ -416,7 +416,7 @@ end)
 
 test.it("ipairs() stops at first nil hole", function()
 	local state = lua.new()
-	local tbl = state:load("{10, 20, nil, 40}")
+	local tbl = state:eval("{10, 20, nil, 40}")
 	local count = 0
 	for _ in tbl:ipairs() do count = count + 1 end
 	test.equal(2, count)
@@ -425,7 +425,7 @@ end)
 
 test.it("ipairs() on empty table yields nothing", function()
 	local state = lua.new()
-	local tbl = state:load("{}")
+	local tbl = state:eval("{}")
 	local count = 0
 	for _ in tbl:ipairs() do count = count + 1 end
 	test.equal(0, count)
@@ -434,7 +434,7 @@ end)
 
 test.it("ipairs() returns string values correctly", function()
 	local state = lua.new()
-	local tbl = state:load('{"a", "b", "c"}')
+	local tbl = state:eval('{"a", "b", "c"}')
 	local vals = {}
 	for _, v in tbl:ipairs() do vals[#vals + 1] = v end
 	test.equal("a", vals[1])
@@ -447,7 +447,7 @@ end)
 
 test.it("strings with embedded nulls survive guest fn roundtrip", function()
 	local state = lua.new()
-	local id = state:load("function(s) return s end")
+	local id = state:eval("function(s) return s end")
 	local original = "hello\0world"
 	test.equal(11, #original)
 	local result = id(original)
@@ -470,7 +470,7 @@ test.it("strings with embedded nulls survive table set/get in Lua evaluation", f
 	local state = lua.new()
 	local original = "a\0b\0c"
 	test.equal(5, #original)
-	local getter = state:load("function() return tbl end")
+	local getter = state:eval("function() return tbl end")
 	local g = state:globals()
 	g:set("tbl", original)
 	local result = getter()
@@ -484,7 +484,7 @@ test.it("host callback can call back into guest (Host → Guest → Host)", func
 	local state = lua.new()
 	local g = state:globals()
 
-	local guest_inc = state:load("function(x) return inc(x) end")
+	local guest_inc = state:eval("function(x) return inc(x) end")
 
 	g:set("inc", function(x)
 		return x + 1
@@ -495,7 +495,7 @@ test.it("host callback can call back into guest (Host → Guest → Host)", func
 		return r + 1
 	end)
 
-	local v = state:load("return nested_test(40)")
+	local v = state:eval("return nested_test(40)")
 	test.equal(42, v)
 	state:close()
 end)
@@ -504,8 +504,8 @@ test.it("deeper nesting: guest → host_A → guest → host_B → guest", funct
 	local state     = lua.new()
 	local g         = state:globals()
 
-	local inc_fn    = state:load("function(x) return inc(x) end")
-	local double_fn = state:load("function(x) return double(x) end")
+	local inc_fn    = state:eval("function(x) return inc(x) end")
+	local double_fn = state:eval("function(x) return double(x) end")
 
 	g:set("inc", function(x) return x + 1 end)
 	g:set("double", function(x)
@@ -517,7 +517,7 @@ test.it("deeper nesting: guest → host_A → guest → host_B → guest", funct
 		return r * 3
 	end)
 
-	local fn = state:load("function(x) return triple(x) end")
+	local fn = state:eval("function(x) return triple(x) end")
 	local result = fn(5)
 	test.equal(36, result)
 	state:close()
@@ -529,7 +529,7 @@ test.it("guest stack is balanced after nested cross-boundary calls", function()
 	local g = state:globals()
 	local base = raw.gettop(state.L)
 
-	local guest_fn = state:load("function() return inner() end")
+	local guest_fn = state:eval("function() return inner() end")
 
 	g:set("inner", function() return 1 end)
 	g:set("outer", function()
@@ -537,7 +537,7 @@ test.it("guest stack is balanced after nested cross-boundary calls", function()
 		return r + 2
 	end)
 
-	local fn = state:load("function() return outer() end")
+	local fn = state:eval("function() return outer() end")
 
 	for _ = 1, 100 do
 		local v = fn()
@@ -552,7 +552,7 @@ test.it("many iterations of nested calls do not corrupt state", function()
 	local state = lua.new()
 	local g = state:globals()
 
-	local guest_add = state:load("function(a, b) return add(a, b) end")
+	local guest_add = state:eval("function(a, b) return add(a, b) end")
 
 	g:set("add", function(a, b) return a + b end)
 	g:set("multiply_add", function(a, b, c)
@@ -561,7 +561,7 @@ test.it("many iterations of nested calls do not corrupt state", function()
 		return r2
 	end)
 
-	local fn = state:load("function(a, b, c) return multiply_add(a, b, c) end")
+	local fn = state:eval("function(a, b, c) return multiply_add(a, b, c) end")
 
 	for _ = 1, 1000 do
 		local result = fn(2, 3, 4)
@@ -589,7 +589,7 @@ test.it("host callback returning a table raises a clear guest error (not a crash
 		return { value = 42 }
 	end)
 
-	local ok, err = pcall(state.load, state, [[
+	local ok, err = pcall(state.eval, state, [[
 		local obj = get_obj()
 	]])
 	-- Must fail with a bridge error message, not a process crash
@@ -608,7 +608,7 @@ test.it("host callback returning a table error is catchable with guest pcall", f
 	end)
 
 	-- Guest-side pcall should catch the bridge error cleanly
-	local ok, err = pcall(state.load, state, [[
+	local ok, err = pcall(state.eval, state, [[
 		local ok, err = pcall(get_obj)
 		assert(not ok, "expected error from get_obj")
 		assert(type(err) == "string" and err:find("bridge:"), "expected bridge error")
@@ -625,7 +625,7 @@ test.it("host callback NOT returning a table still works fine", function()
 		return 42
 	end)
 
-	local ok, err = pcall(state.load, state, [[
+	local ok, err = pcall(state.eval, state, [[
 		local n = get_num()
 		assert(n == 42, "expected 42, got " .. tostring(n))
 	]])
@@ -650,20 +650,215 @@ test.it("state:load with chunk name exposes correct source via debug.getinfo", f
 
 	-- Load with an explicit chunk name (the "@path" convention)
 	local chunkName = "@/some/path/to/file.lua"
-	local result = state:load(source, chunkName)
+	local result = state:eval(source, chunkName)
 	test.equal(chunkName, result)
 	state:close()
 end)
 
 test.it("state:load without chunk name still works (source is =(load) or similar)", function()
 	local state = lua.new()
-	local result = state:load([[
+	local result = state:eval([[
 		local info = debug.getinfo(1, "S")
 		return info.source
 	]])
 	-- Without a chunk name the source will be something like "=(load)" — just
 	-- verify it doesn't crash and returns a string.
 	test.equal("string", type(result))
+	state:close()
+end)
+
+-- ─── Chunk ────────────────────────────────────────────────────────────────
+
+test.it("state:load returns a lua.Chunk", function()
+	local state = lua.new()
+	local chunk = state:load("return 42")
+	test.truthy(chunk)
+	test.equal("table", type(chunk))
+	test.truthy(chunk.eval)
+	test.truthy(chunk.call)
+	test.truthy(chunk.setName)
+	state:close()
+end)
+
+test.it("Chunk:eval compiles and returns result", function()
+	local state = lua.new()
+	local chunk = state:load("return 42")
+	local v = chunk:eval()
+	test.equal(42, v)
+	state:close()
+end)
+
+test.it("Chunk:eval with args populates ... (single arg)", function()
+	local state = lua.new()
+	local chunk = state:load("return ...")
+	local v = chunk:eval("hello")
+	test.equal("hello", v)
+	state:close()
+end)
+
+test.it("Chunk:eval with args populates ... (multiple args via return)", function()
+	local state = lua.new()
+	local chunk = state:load("return ...")
+	local v = chunk:eval(10, 20, 30)
+	test.equal(10, v)
+	state:close()
+end)
+
+test.it("Chunk:eval with args populates ... (multi-assign in chunk)", function()
+	local state = lua.new()
+	local chunk = state:load("local a, b = ...; return a + b")
+	local v = chunk:eval(3, 4)
+	test.equal(7, v)
+	state:close()
+end)
+
+test.it("Chunk:eval with args sets global via ...", function()
+	local state = lua.new()
+	local chunk = state:load("_test_a, _test_b = ...")
+	chunk:eval(100, 200)
+	local g = state:globals()
+	test.equal(100, g._test_a)
+	test.equal(200, g._test_b)
+	state:close()
+end)
+
+test.it("Chunk:eval returns nil for void chunk", function()
+	local state = lua.new()
+	local chunk = state:load("local x = 1")
+	local v = chunk:eval()
+	test.equal(nil, v)
+	state:close()
+end)
+
+test.it("Chunk:eval returns a callable function", function()
+	local state = lua.new()
+	local fn = state:load("return function(a, b) return a + b end"):eval()
+	test.truthy(fn)
+	test.equal("function", type(fn))
+	test.equal(7, fn(3, 4))
+	state:close()
+end)
+
+test.it("Chunk:call executes without returning anything", function()
+	local state = lua.new()
+	local chunk = state:load("_call_ran = true")
+	chunk:call()
+	local g = state:globals()
+	test.truthy(g._call_ran)
+	state:close()
+end)
+
+test.it("Chunk:call with args populates ...", function()
+	local state = lua.new()
+	local chunk = state:load("_call_a, _call_b = ...")
+	chunk:call("x", "y")
+	local g = state:globals()
+	test.equal("x", g._call_a)
+	test.equal("y", g._call_b)
+	state:close()
+end)
+
+test.it("Chunk:call ignores return value", function()
+	local state = lua.new()
+	-- This chunk returns a value, but :call should discard it
+	local chunk = state:load("return 999")
+	chunk:call()
+	state:close()
+end)
+
+test.it("Chunk:setName sets chunk name visible in debug info", function()
+	local state = lua.new()
+	local chunkName = "@test/set_name.lua"
+	local source = [[
+		local info = debug.getinfo(1, "S")
+		return info.source
+	]]
+	local result = state:load(source):setName(chunkName):eval()
+	test.equal(chunkName, result)
+	state:close()
+end)
+
+test.it("Chunk:setName returns self for chaining", function()
+	local state = lua.new()
+	local chunk = state:load("return 5")
+	local same = chunk:setName("@chained.lua")
+	test.equal(chunk, same)
+	state:close()
+end)
+
+test.it("Chunk __call metamethod is equivalent to :eval()", function()
+	local state = lua.new()
+	local chunk = state:load("return 77")
+	test.equal(77, chunk())
+	state:close()
+end)
+
+test.it("Chunk __call with args populates ...", function()
+	local state = lua.new()
+	local chunk = state:load("local a, b = ...; return a * b")
+	local v = chunk(6, 7)
+	test.equal(42, v)
+	state:close()
+end)
+
+test.it("Chunk:eval raises on runtime error", function()
+	local state = lua.new()
+	local chunk = state:load("error('boom from chunk')")
+	local ok, err = pcall(function() chunk:eval() end)
+	test.falsy(ok)
+	test.truthy(err)
+	test.includes(err, "boom from chunk")
+	state:close()
+end)
+
+test.it("Chunk:call raises on runtime error", function()
+	local state = lua.new()
+	local chunk = state:load("error('call boom')")
+	local ok, err = pcall(function() chunk:call() end)
+	test.falsy(ok)
+	test.truthy(err)
+	test.includes(err, "call boom")
+	state:close()
+end)
+
+test.it("state:load raises on syntax error without evaluating", function()
+	local state = lua.new()
+	-- load should NOT raise here — it just returns a Chunk
+	local chunk = state:load(")(invalid")
+	test.truthy(chunk)
+	-- compiling (eval) should raise
+	local ok, err = pcall(function() chunk:eval() end)
+	test.falsy(ok)
+	test.truthy(err)
+	state:close()
+end)
+
+test.it("state:eval is equivalent to :load():eval()", function()
+	local state = lua.new()
+	local v1 = state:eval("return 42")
+	local v2 = state:load("return 42"):eval()
+	test.equal(v1, v2)
+	state:close()
+end)
+
+test.it("state:eval with chunk name passes it through", function()
+	local state = lua.new()
+	local chunkName = "@test/eval_name.lua"
+	local source = [[
+		local info = debug.getinfo(1, "S")
+		return info.source
+	]]
+	local result = state:eval(source, chunkName)
+	test.equal(chunkName, result)
+	state:close()
+end)
+
+test.it("Chunk:eval can be called multiple times", function()
+	local state = lua.new()
+	local chunk = state:load("_counter = (_counter or 0) + 1; return _counter")
+	test.equal(1, chunk:eval())
+	test.equal(2, chunk:eval())
+	test.equal(3, chunk:eval())
 	state:close()
 end)
 
@@ -683,7 +878,7 @@ test.it("state:table() result is visible to guest code", function()
 	local t = state:table()
 	t:set("x", 99)
 	g:set("obj", t)
-	local v = state:load("return obj.x")
+	local v = state:eval("return obj.x")
 	test.equal(99, v)
 	state:close()
 end)
@@ -721,7 +916,7 @@ test.it("state:table() with deeply nested tables", function()
 	local t = state:table({ a = { b = { c = { d = 42 } } } })
 	local g = state:globals()
 	g:set("obj", t)
-	local v = state:load("return obj.a.b.c.d")
+	local v = state:eval("return obj.a.b.c.d")
 	test.equal(42, v)
 	state:close()
 end)
@@ -737,7 +932,7 @@ test.it("state:table() with a function value registers it as host callback", fun
 	})
 	local g = state:globals()
 	g:set("obj", t)
-	local result = state:load("return obj.greet('world')")
+	local result = state:eval("return obj.greet('world')")
 	test.equal("hi world", result)
 	test.truthy(called)
 	state:close()
@@ -772,7 +967,7 @@ end)
 test.it("state:table() result can be passed to a guest function and read back", function()
 	local state = lua.new()
 	local t = state:table({ value = 7 })
-	local fn = state:load("function(tbl) return tbl.value * 6 end")
+	local fn = state:eval("function(tbl) return tbl.value * 6 end")
 	local result = fn(t)
 	test.equal(42, result)
 	state:close()
@@ -783,7 +978,7 @@ test.it("state:table() result can be mutated by guest code and read on host", fu
 	local t = state:table({ count = 0 })
 	local g = state:globals()
 	g:set("counter", t)
-	state:load("counter.count = counter.count + 10")
+	state:eval("counter.count = counter.count + 10")
 	test.equal(10, t:get("count"))
 	state:close()
 end)
@@ -797,8 +992,8 @@ test.it("plain table assigned to global becomes a guest table", function()
 	local state = lua.new()
 	local g = state:globals()
 	g.config = { timeout = 5, retries = 3 }
-	local timeout = state:load("return config.timeout")
-	local retries = state:load("return config.retries")
+	local timeout = state:eval("return config.timeout")
+	local retries = state:eval("return config.retries")
 	test.equal(5, timeout)
 	test.equal(3, retries)
 	state:close()
@@ -820,7 +1015,7 @@ test.it("nested plain tables are recursively coerced", function()
 	test.equal("alice", g.player.name)
 	test.equal(1, g.player.pos.x)
 	test.equal(2, g.player.pos.y)
-	local fromGuest = state:load("return player.pos.x + player.pos.y")
+	local fromGuest = state:eval("return player.pos.x + player.pos.y")
 	test.equal(3, fromGuest)
 	state:close()
 end)
@@ -829,14 +1024,14 @@ test.it("array-like plain tables coerce to guest tables with integer keys", func
 	local state = lua.new()
 	local g = state:globals()
 	g.items = { "a", "b", "c" }
-	local result = state:load("return items[1] .. items[2] .. items[3]")
+	local result = state:eval("return items[1] .. items[2] .. items[3]")
 	test.equal("abc", result)
 	state:close()
 end)
 
 test.it("coerced table can be passed as argument to guest function", function()
 	local state = lua.new()
-	local fn = state:load("function(t) return t.a + t.b end")
+	local fn = state:eval("function(t) return t.a + t.b end")
 	local result = fn({ a = 10, b = 32 })
 	test.equal(42, result)
 	state:close()
@@ -846,7 +1041,7 @@ test.it("coerced table with nested functions works in guest code", function()
 	local state = lua.new()
 	local g = state:globals()
 	g.api = { greet = function(n) return "hi " .. n end }
-	local result = state:load("return api.greet('world')")
+	local result = state:eval("return api.greet('world')")
 	test.equal("hi world", result)
 	state:close()
 end)
@@ -865,8 +1060,8 @@ test.it("coerced table is mutable from guest side", function()
 	local state = lua.new()
 	local g = state:globals()
 	g.counter = { n = 0 }
-	state:load("counter.n = counter.n + 5")
-	state:load("counter.n = counter.n + 7")
+	state:eval("counter.n = counter.n + 5")
+	state:eval("counter.n = counter.n + 7")
 	test.equal(12, g.counter.n)
 	state:close()
 end)
@@ -875,11 +1070,11 @@ test.it("deeply nested table coercion does not corrupt guest state", function()
 	local state = lua.new()
 	local g = state:globals()
 	g.deep = { a = { b = { c = { d = { e = 42 } } } } }
-	local result = state:load("return deep.a.b.c.d.e")
+	local result = state:eval("return deep.a.b.c.d.e")
 	test.equal(42, result)
 	-- After coercion the state should still be usable
 	g.other = "hello"
-	test.equal("hello", state:load("return other"))
+	test.equal("hello", state:eval("return other"))
 	state:close()
 end)
 
@@ -890,7 +1085,7 @@ test.it("multiple table coercions in sequence do not corrupt stack", function()
 		g["t" .. i] = { index = i }
 	end
 	for i = 1, 20 do
-		test.equal(i, state:load("return t" .. i .. ".index"))
+		test.equal(i, state:eval("return t" .. i .. ".index"))
 	end
 	state:close()
 end)
@@ -907,7 +1102,7 @@ test.it("self-referencing table raises a cycle error", function()
 	-- State should still be usable after the error
 	local g = state:globals()
 	g.x = 42
-	test.equal(42, state:load("return x"))
+	test.equal(42, state:eval("return x"))
 	state:close()
 end)
 
@@ -946,10 +1141,10 @@ test.it("cycle detection does not false-positive on non-cyclic duplicates", func
 	local g = state:globals()
 	g.dup = gt
 	-- Both guest tables have x = 1
-	test.equal(1, state:load("return dup.a.x"))
-	test.equal(1, state:load("return dup.b.x"))
+	test.equal(1, state:eval("return dup.a.x"))
+	test.equal(1, state:eval("return dup.b.x"))
 	-- Mutating one does not affect the other (they are independent copies)
-	state:load("dup.a.x = 99")
+	state:eval("dup.a.x = 99")
 	test.equal(99, gt.a.x)
 	test.equal(1, gt.b.x)
 	state:close()

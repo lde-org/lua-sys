@@ -309,6 +309,109 @@ makeCallable = function(guestState, guestRef)
 	return boundCFn
 end
 
+-- ─── Chunk ────────────────────────────────────────────────────────────────
+
+---@class lua.Chunk
+---@field _state     lua.State
+---@field _code      string
+---@field _chunkName string?
+local Chunk = {}
+Chunk.__index = Chunk
+
+---@param state lua.State
+---@param code  string
+---@param name  string?
+function Chunk._new(state, code, name)
+	return setmetatable({ _state = state, _code = code, _chunkName = name }, Chunk)
+end
+
+--- Set the chunk name (for debug info). Returns self for chaining.
+---
+--- Prefix with "@" for a file path (e.g. "@/path/to/file.lua") so that
+--- debug.getinfo(1,"S").source returns the correct path inside the guest.
+---@param name string
+---@return lua.Chunk
+function Chunk:setName(name)
+	self._chunkName = name
+	return self
+end
+
+-- Internal: compile the chunk and push the function onto the guest stack.
+-- Leaves the compiled function at the top of the guest stack on success.
+-- Returns the stack base (the index of the function) so the caller can
+-- protect-call it.
+---@return lua.raw.State L
+---@return integer       fnIndex
+function Chunk:_compile()
+	local L        = self._state.L
+	local code     = self._code
+	local name     = self._chunkName
+	local retChunk = "return " .. code
+
+	local status
+	if name then
+		status = raw.loadbuffer(L, retChunk, #retChunk, name)
+	else
+		status = raw.loadstring(L, retChunk)
+	end
+	if status ~= LUA_OK then
+		raw.pop(L, 1)
+		if name then
+			status = raw.loadbuffer(L, code, #code, name)
+		else
+			status = raw.loadstring(L, code)
+		end
+	end
+	if status ~= LUA_OK then
+		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 2)
+	end
+	return L, raw.gettop(L)
+end
+
+--- Compile and evaluate the chunk with the given arguments (accessible
+--- as `...` inside the guest), returning the first result.
+---
+--- If no value is returned by the chunk, returns nil.
+---@param ... any
+function Chunk:eval(...)
+	local L, fnIndex = self:_compile()
+	local nargs = select("#", ...)
+	local state = self._state
+	for i = 1, nargs do toLua(state, L, (select(i, ...))) end
+	local base = fnIndex - 1
+	local status = raw.pcall(L, nargs, LUA_MULTRET, 0)
+	if status ~= LUA_OK and status ~= LUA_YIELD then
+		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 2)
+	end
+	local nresults = raw.gettop(L) - base
+	if nresults == 0 then
+		raw.settop(L, base)
+		return nil
+	end
+	local result = fromLua(state, L, base + 1)
+	raw.settop(L, base)
+	return result
+end
+
+-- Allow calling chunk as shorthand
+Chunk.__call = Chunk.eval
+
+--- Compile and execute the chunk with the given arguments, discarding
+--- any return values.
+---@param ... any
+function Chunk:call(...)
+	local L, fnIndex = self:_compile()
+	local nargs = select("#", ...)
+	local state = self._state
+	for i = 1, nargs do toLua(state, L, (select(i, ...))) end
+	local base = fnIndex - 1
+	local status = raw.pcall(L, nargs, 0, 0)
+	if status ~= LUA_OK and status ~= LUA_YIELD then
+		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 2)
+	end
+	raw.settop(L, base)
+end
+
 -- ─── State ────────────────────────────────────────────────────────────────
 
 ---@class lua.State
@@ -319,44 +422,29 @@ end
 local State = {}
 State.__index = State
 
---- Compile and evaluate a Lua chunk. A bare expression is automatically
---- wrapped in `return` so it produces a value.
+--- Load a Lua chunk as a builder that can be configured before
+--- execution. Call :eval() or :call() on the returned Chunk to run it.
 ---
---- chunkName follows the LuaJIT convention: prefix with "@" for a file path
---- (e.g. "@/path/to/file.lua") so that debug.getinfo(1,"S").source returns
---- the correct path inside the guest.
 ---@param chunk     string
 ---@param chunkName string?
+---@return lua.Chunk
 function State:load(chunk, chunkName)
-	local L        = self.L
-	local retChunk = "return " .. chunk
-	local status
-	if chunkName then
-		status = raw.loadbuffer(L, retChunk, #retChunk, chunkName)
-	else
-		status = raw.loadstring(L, retChunk)
-	end
-	if status ~= LUA_OK then
-		raw.pop(L, 1)
-		if chunkName then
-			status = raw.loadbuffer(L, chunk, #chunk, chunkName)
-		else
-			status = raw.loadstring(L, chunk)
-		end
-	end
-	if status ~= LUA_OK then
-		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 2)
-	end
-	local base = raw.gettop(L) - 1
-	status = raw.pcall(L, 0, LUA_MULTRET, 0)
-	if status ~= LUA_OK and status ~= LUA_YIELD then
-		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 2)
-	end
-	local nresults = raw.gettop(L) - base
-	if nresults == 0 then return nil end
-	local result = fromLua(self, L, base + 1)
-	raw.settop(L, base)
-	return result
+	return Chunk._new(self, chunk, chunkName)
+end
+
+--- Compile and evaluate a Lua chunk immediately. Equivalent to
+--- `state:load(code, chunkName):eval(...)`.
+---
+--- A bare expression is automatically wrapped in `return` so it
+--- produces a value.
+---
+--- chunkName follows the LuaJIT convention: prefix with "@" for a
+--- file path so that debug.getinfo(1,"S").source returns the correct
+--- path inside the guest.
+---@param code      string
+---@param chunkName string?
+function State:eval(code, chunkName)
+	return self:load(code, chunkName):eval()
 end
 
 ---@return lua.Table

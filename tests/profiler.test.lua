@@ -4,18 +4,18 @@ local test     = require("lde-test")
 
 local function make_state_with_work()
 	local state = lua.new()
+
 	-- fib burns CPU in the guest so the profiler actually fires
 	local work = state:load([[
-		function()
-			local function fib(n)
-				if n < 2 then return n end
-				return fib(n-1) + fib(n-2)
-			end
-			local x = 0
-			for i = 1, 300 do x = x + fib(20) end
-			return x
+		local function fib(n)
+			if n < 2 then return n end
+			return fib(n-1) + fib(n-2)
 		end
+		local x = 0
+		for i = 1, 300 do x = x + fib(20) end
+		return x
 	]])
+
 	return state, work
 end
 
@@ -46,7 +46,7 @@ test.it("report entries are sorted by count descending", function()
 	work()
 	local report = profiler.stop(state)
 	for i = 2, #report do
-		test.truthy(report[i-1].count >= report[i].count)
+		test.truthy(report[i - 1].count >= report[i].count)
 	end
 	state:close()
 end)
@@ -93,11 +93,11 @@ test.it("custom callback receives stack, samples and vmstate", function()
 	local state, work = make_state_with_work()
 	local hits = {}
 	profiler.start(state, "fi1", function(stack, n, vmstate)
-		hits[#hits+1] = { stack=stack, n=n, vm=vmstate }
+		hits[#hits + 1] = { stack = stack, n = n, vm = vmstate }
 	end)
 	work()
 	local result = profiler.stop(state)
-	test.equal(nil, result)   -- no report in custom mode
+	test.equal(nil, result) -- no report in custom mode
 	test.truthy(#hits > 0)
 	test.equal("string", type(hits[1].stack))
 	test.equal("number", type(hits[1].n))
@@ -154,7 +154,7 @@ test.it("profiler.print writes a formatted report", function()
 	work()
 	local report = profiler.stop(state)
 	local out = {}
-	local fake = { write = function(_, s) out[#out+1] = s end }
+	local fake = { write = function(_, s) out[#out + 1] = s end }
 	profiler.print(report, fake)
 	local text = table.concat(out)
 	test.truthy(text:find("samples"))

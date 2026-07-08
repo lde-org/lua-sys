@@ -16,7 +16,7 @@ do
 	local state = lua.new()
 	local g = state:globals()
 	g:set("host_noop", function() end)
-	local wrapper = state:load("function() host_noop() end")
+	local wrapper = state:eval("function() host_noop() end")
 
 	print("[1] Guest → Host: no args, no returns")
 	for _ = 1, ITERATIONS do
@@ -72,7 +72,7 @@ for _, cfg in ipairs(configs) do
 	local args = {}
 	for i = 1, n do args[i] = "42" end
 	local arg_str = table.concat(args, ", ")
-	local wrapper = state:load(string.format("function() host_fn(%s) end", arg_str))
+	local wrapper = state:eval(string.format("function() host_fn(%s) end", arg_str))
 
 	print(string.format("[2] Guest → Host: %d arg(s), %d return(s)", n, y))
 	for _ = 1, ITERATIONS do
@@ -87,7 +87,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 do
 	local state = lua.new()
-	local fn = state:load("function() end")
+	local fn = state:eval("function() end")
 
 	print("[3] Host → Guest: no args, no returns")
 	for _ = 1, ITERATIONS do
