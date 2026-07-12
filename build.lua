@@ -53,4 +53,6 @@ else
 	}
 end
 
-build:cc(args)
+-- build:cc(args)
+local compiler = os.getenv("SEA_CC") or "gcc"
+build:sh(compiler .. " " .. table.concat(args, " "))
