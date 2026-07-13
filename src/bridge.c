@@ -198,7 +198,25 @@ static int dispatch_callback(lua_State *guest) {
     for (i = 1; i <= nargs; i++)
         push_primitive_or_error(guest, i, host_L);
 
+    // Disable the JIT engine for the duration of the host callback.
+    //
+    // When a host callback runs, it may call lua.new(), state:eval(), raw.*,
+    // or any other lua-sys API that makes FFI calls with lua_State* cdata
+    // arguments. If the JIT is recording a trace at the call site, it will
+    // attempt argv2cdata conversion for those cdata arguments and crash
+    // (recff_cdata_call in LuaJIT's JIT recorder).
+    //
+    // Turning the JIT engine off before executing the host callback prevents
+    // any trace from being recorded or continued during that call. All Lua and
+    // FFI code inside the callback runs interpreted for this duration, which is
+    // safe and correct. The JIT is re-enabled unconditionally on every exit path
+    // so that compiled code resumes normally after the callback returns.
+    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+
     int status = lua_pcall(host_L, nargs, LUA_MULTRET, 0);
+
+    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+
     if (status != LUA_OK) {
         const char *err = lua_tostring(host_L, -1);
         lua_pushstring(guest, err ? err : "bridge: host error");
@@ -264,12 +282,31 @@ static int bridge_unregister(lua_State *L) {
     return 0;
 }
 
+// Creates a new guest lua_State with all standard libraries loaded.
+// Called entirely in C so the host never makes an FFI call with a lua_State*
+// cdata argument — safe to invoke from any context, including from within a
+// host callback triggered by guest code (where the JIT may be recording).
+// Returns the new state as a lightuserdata on host_L.
+static int bridge_new_state(lua_State *L) {
+    (void)L;
+    lua_State *new_state = luaL_newstate();
+    if (!new_state) {
+        lua_pushstring(host_L, "bridge_new_state: luaL_newstate() returned NULL");
+        lua_error(host_L);
+        return 0; /* unreachable */
+    }
+    luaL_openlibs(new_state);
+    lua_pushlightuserdata(host_L, (void *)new_state);
+    return 1;
+}
+
 static const luaL_Reg bridge_funcs[] = {
     { "make_callable",  bridge_make_callable },
     { "compound_tag",   bridge_compound_tag  },
     { "register",       bridge_register      },
     { "push_callback",  bridge_push_callback },
     { "unregister",     bridge_unregister    },
+    { "new_state",      bridge_new_state     },
     { NULL, NULL }
 };
 

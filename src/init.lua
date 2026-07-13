@@ -533,8 +533,12 @@ lua.profiler = require("lua-sys.profiler")
 
 ---@return lua.State
 function lua.new()
-	local L = raw.lnewstate()
-	raw.openlibs(L)
+	-- bridge.new_state() calls luaL_newstate() + luaL_openlibs() entirely in C,
+	-- returning the pointer as lightuserdata. This is safe to call from any
+	-- context — including from within a host callback triggered by guest code —
+	-- because no FFI cdata argument is involved at the call boundary.
+	-- We cast to lua_State* cdata here, on host_L outside any guest execution.
+	local L = ffi.cast("lua_State*", bridge.new_state())
 	return setmetatable({ L = L, _callbacks = {} }, State)
 end
 

@@ -52,6 +52,36 @@ The bridge registers every cross-state call as a `lua_CFunction`:
 
 In both directions, the transition is always: `Lua interpreter → lua_CFunction (C) → lua_pcall on the other state`. The JIT never sees across the boundary.
 
+## Callbacks That Create New States or Call lua-sys APIs
+
+A host callback triggered by guest code runs inside `dispatch_callback`'s `lua_pcall(host_L, ...)`. At that point the JIT may be in the middle of recording a trace for the call site that triggered the guest execution. Any FFI call made from the host callback that takes a `lua_State*` cdata argument (virtually every `raw.*` function) causes the JIT recorder to attempt `argv2cdata` conversion — the same crash path as the original re-entrancy problem, but now triggered from the *host* side.
+
+This matters for lde's test runner, which creates a new `lua_State` (via `lua.new()`) from within a host callback that is invoked from a guest test runner state.
+
+### Fix: JIT engine off for the duration of each callback
+
+`dispatch_callback` disables the JIT engine before calling `lua_pcall(host_L, ...)` and re-enables it unconditionally afterward (including on all error paths):
+
+```c
+luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+int status = lua_pcall(host_L, nargs, LUA_MULTRET, 0);
+luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+```
+
+While the JIT is off, all code inside the callback runs interpreted. FFI calls are still legal interpreted — only JIT recording is prevented, so `argv2cdata` is never attempted. The JIT resumes compilation normally the moment the callback returns.
+
+The performance cost is that host callback bodies run interpreted for their duration. Callbacks invoked from tight guest loops that are otherwise JIT-compiled will run slightly slower. In practice lua-sys callbacks are almost always short (record a result, create a state, call a function) so the overhead is negligible.
+
+### Fix: bridge_new_state for safe state creation
+
+`lua.new()` previously called `raw.lnewstate()` (FFI) followed by `raw.openlibs()` (FFI). Both take or return a `lua_State*` cdata. Although the JIT-off fix makes this safe from callbacks, there is also `bridge_new_state`: a C function that calls `luaL_newstate()` and `luaL_openlibs()` entirely in C and returns the pointer as a lightuserdata (not cdata). `lua.new()` calls this and casts the result to `lua_State*` cdata on the host side:
+
+```lua
+local L = ffi.cast("lua_State*", bridge.new_state())
+```
+
+This keeps state creation behind a C boundary regardless of JIT state, matching the design principle that all cross-state operations go through `lua_CFunction` boundaries.
+
 ## Stack Safety Under Re-entrancy
 
 Because host→guest→host chains are supported, `dispatch_callback` can be called while `bound_call` is already executing on the C stack (and thus while `host_L`'s call stack is active). Both functions save and restore `lua_gettop(host_L)` around their work so that nested calls cannot corrupt each other's result slots.
