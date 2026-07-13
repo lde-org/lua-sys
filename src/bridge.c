@@ -198,24 +198,12 @@ static int dispatch_callback(lua_State *guest) {
     for (i = 1; i <= nargs; i++)
         push_primitive_or_error(guest, i, host_L);
 
-    // Disable the JIT engine for the duration of the host callback.
-    //
-    // When a host callback runs, it may call lua.new(), state:eval(), raw.*,
-    // or any other lua-sys API that makes FFI calls with lua_State* cdata
-    // arguments. If the JIT is recording a trace at the call site, it will
-    // attempt argv2cdata conversion for those cdata arguments and crash
-    // (recff_cdata_call in LuaJIT's JIT recorder).
-    //
-    // Turning the JIT engine off before executing the host callback prevents
-    // any trace from being recorded or continued during that call. All Lua and
-    // FFI code inside the callback runs interpreted for this duration, which is
-    // safe and correct. The JIT is re-enabled unconditionally on every exit path
-    // so that compiled code resumes normally after the callback returns.
-    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
-
+    // The host callback was marked LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF at
+    // registration time (bridge_register), so the JIT never compiles it.
+    // This prevents the recorder from attempting argv2cdata on lua_State* cdata
+    // arguments in FFI calls made by the callback — the re-entrancy crash
+    // described in docs/bridge-design.md. No engine-level toggle needed here.
     int status = lua_pcall(host_L, nargs, LUA_MULTRET, 0);
-
-    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
     if (status != LUA_OK) {
         const char *err = lua_tostring(host_L, -1);
@@ -254,10 +242,19 @@ static int dispatch_callback(lua_State *guest) {
 
 // Stores the host function (arg 1) in the registry and returns its ref as
 // the callback id. bridge.push_callback and bridge.unregister use this ref.
+//
+// Also marks the function with LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF so the JIT
+// never compiles it. This prevents the JIT recorder from attempting argv2cdata
+// on lua_State* cdata arguments inside FFI calls made by the callback body —
+// the root cause of the re-entrancy crash described in docs/bridge-design.md.
+// All code *outside* registered callbacks continues to be JIT-compiled normally.
 static int bridge_register(lua_State *L) {
     (void)L;
     luaL_checktype(host_L, 1, LUA_TFUNCTION);
     lua_pushvalue(host_L, 1);
+    // Mark the function as non-JIT-compilable before storing it.
+    // Stack top is the function copy — idx = -1.
+    luaJIT_setmode(host_L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
     int id = luaL_ref(host_L, LUA_REGISTRYINDEX);
     lua_pushinteger(host_L, id);
     return 1;
