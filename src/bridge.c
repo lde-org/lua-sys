@@ -16,15 +16,21 @@
 #include "lua_bridge.h"
 
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 static lua_State *host_L = NULL;
 
+/* Set to 1 while dispatch_callback is executing a host←→guest transition.
+ * luaJIT_profile_dumpstack is unsafe during this period because the guest
+ * Lua stack has an incomplete FFI continuation frame. The profiler callback
+ * skips dumpstack when this flag is set and records an empty stack instead. */
+static volatile int bridge_in_transition = 0;
+
 // ── Value copying ─────────────────────────────────────────────────────────
 
-// Pushes src[idx] onto dst if it is a primitive type, returns the lua_type.
-// Returns -1 for compound types (nothing pushed onto dst).
-// Single lua_type call covers both the check and the dispatch — eliminates
-// the double type-check of a separate is_primitive() + push_primitive().
+// Returns lua_type and pushes the value onto dst, or returns -1 for compound
+// types (nothing pushed).
 static int push_primitive_typed(lua_State *src, int idx, lua_State *dst) {
     int t = lua_type(src, idx);
     switch (t) {
@@ -64,19 +70,15 @@ static lua_State *decode_guest_ptr(int stack_pos) {
 
 // ── bound_call ────────────────────────────────────────────────────────────
 //
-// lua_CFunction returned by bridge.make_callable. Installed directly as the
-// callable on the host — no Lua wrapper needed.
+// lua_CFunction returned by bridge.make_callable.
 //
 // Upvalue 1: lightuserdata  — guest lua_State*
-// Upvalue 2: integer        — guest LUA_REGISTRYINDEX ref for the function
+// Upvalue 2: integer        — guest registry ref for the function
 // Upvalue 3: table          — guestState (lua.State object)
 // Upvalue 4: integer        — registry ref for callGuestSlow(guestState, guestRef, ...)
 //
-// Return protocol:
-//   All-primitive results: pushed directly onto host, returned normally.
-//   Any compound result: calls callGuestSlow(guestState, guestRef, <original args>)
-//     from C and returns its results. No Lua wrapper needed.
-//   Guest error: raises a Lua error on host.
+// All-primitive args/results go through the fast path (direct copy).
+// Any compound arg or result falls back to callGuestSlow on the Lua side.
 
 static int bound_call(lua_State *host) {
     lua_State *guest = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
@@ -96,13 +98,11 @@ static int bound_call(lua_State *host) {
     }
 
     if (!all_primitive) {
-        /* Slow path: at least one arg is a compound type (e.g. lua.Table).
-           Delegate entirely to callGuestSlow which runs Lua-side toLua()
-           and handles guest registry refs correctly. */
+        /* Slow path: delegate to callGuestSlow for Lua-side toLua() handling. */
         int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(4));
-        lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref); /* callGuestSlow */
-        lua_pushvalue(host, lua_upvalueindex(3));        /* guestState */
-        lua_pushinteger(host, fn_ref);                   /* guestRef */
+        lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref);
+        lua_pushvalue(host, lua_upvalueindex(3));
+        lua_pushinteger(host, fn_ref);
         for (i = 1; i <= nargs; i++)
             lua_pushvalue(host, i);
         int status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
@@ -129,17 +129,16 @@ static int bound_call(lua_State *host) {
 
     for (i = 0; i < nresults; i++) {
         if (push_primitive_typed(guest, guest_base + 1 + i, host) < 0) {
-            // Compound result — call callGuestSlow(guestState, guestRef, <args>).
-            // Undo partial copies from host and restore guest stack first.
+            // Compound result — fall back to callGuestSlow with original args.
             lua_settop(host, nargs);
             lua_settop(guest, guest_base);
 
             int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(4));
-            lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref); /* callGuestSlow */
-            lua_pushvalue(host, lua_upvalueindex(3));        /* guestState */
-            lua_pushinteger(host, fn_ref);                   /* guestRef */
+            lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref);
+            lua_pushvalue(host, lua_upvalueindex(3));
+            lua_pushinteger(host, fn_ref);
             for (i = 1; i <= nargs; i++)
-                lua_pushvalue(host, i);                      /* original args */
+                lua_pushvalue(host, i);
             status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
             if (status != LUA_OK) lua_error(host);
             return lua_gettop(host) - nargs;
@@ -151,7 +150,6 @@ static int bound_call(lua_State *host) {
 
 static int bridge_make_callable(lua_State *L) {
     (void)L;
-    // Args on host_L: (1) guest_L_ptr, (2) guestRef, (3) guestState, (4) callGuestSlow
     lua_State *guest = decode_guest_ptr(1);
     lua_pushlightuserdata(host_L, (void *)guest); /* upvalue 1 */
     lua_pushvalue(host_L, 2);                     /* upvalue 2: guestRef */
@@ -171,20 +169,10 @@ static int bridge_compound_tag(lua_State *L) {
 // ── dispatch_callback ─────────────────────────────────────────────────────
 //
 // lua_CFunction installed on the guest state via bridge.push_callback.
-// Upvalue 1: integer — LUA_REGISTRYINDEX ref for the host callback function.
+// Upvalue 1: integer — registry ref for the host callback function.
 //
-// Each callback is stored as a direct registry ref (luaL_ref / luaL_unref).
-// This allows a single lua_rawgeti to retrieve the function — replacing the
-// old double rawgeti (table ref → table → function) with one call.
-//
-// Called by guest Lua code when it invokes a host-provided function. This is
-// a lua_CFunction on the guest, so it is never called through LuaJIT FFI —
-// the guest interpreter dispatches it via BC_FUNCC, keeping the C boundary
-// intact in the guest→host direction as well.
-//
-// saved_top/lua_settop: host_L's stack must be fully restored on every exit
-// path. If this function returns without restoring, re-entrant calls from
-// nested guest→host→guest→host chains will corrupt each other's stack frames.
+// host_L's stack must be fully restored on every exit path to avoid
+// corrupting nested guest→host→guest→host call chains.
 
 static int dispatch_callback(lua_State *guest) {
     int fn_ref    = (int)lua_tointeger(guest, lua_upvalueindex(1));
@@ -192,18 +180,16 @@ static int dispatch_callback(lua_State *guest) {
 
     lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
 
-    // host_fn_idx == saved_top + 1: exactly one value (the fn) was pushed above.
     int nargs = lua_gettop(guest);
     int i;
     for (i = 1; i <= nargs; i++)
         push_primitive_or_error(guest, i, host_L);
 
-    // The host callback was marked LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF at
-    // registration time (bridge_register), so the JIT never compiles it.
-    // This prevents the recorder from attempting argv2cdata on lua_State* cdata
-    // arguments in FFI calls made by the callback — the re-entrancy crash
-    // described in docs/bridge-design.md. No engine-level toggle needed here.
+    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    bridge_in_transition = 1;
     int status = lua_pcall(host_L, nargs, LUA_MULTRET, 0);
+    bridge_in_transition = 0;
+    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
     if (status != LUA_OK) {
         const char *err = lua_tostring(host_L, -1);
@@ -219,9 +205,6 @@ static int dispatch_callback(lua_State *guest) {
     for (i = 0; i < nresults; i++) {
         int t = push_primitive_typed(host_L, saved_top + 1 + i, guest);
         if (t < 0) {
-            /* Compound value (table, function, userdata, …) — cannot copy
-               across independent states. Restore stacks and raise a clear
-               guest-side error so the caller can handle it with pcall. */
             lua_settop(host_L, saved_top);
             lua_settop(guest, 0);
             lua_pushfstring(guest,
@@ -230,7 +213,7 @@ static int dispatch_callback(lua_State *guest) {
                 "can be returned from host to guest",
                 lua_typename(host_L, lua_type(host_L, saved_top + 1 + i)));
             lua_error(guest);
-            return 0; /* unreachable */
+            return 0;
         }
     }
 
@@ -240,29 +223,22 @@ static int dispatch_callback(lua_State *guest) {
 
 // ── Exported functions ────────────────────────────────────────────────────
 
-// Stores the host function (arg 1) in the registry and returns its ref as
-// the callback id. bridge.push_callback and bridge.unregister use this ref.
-//
-// Also marks the function with LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF so the JIT
-// never compiles it. This prevents the JIT recorder from attempting argv2cdata
-// on lua_State* cdata arguments inside FFI calls made by the callback body —
-// the root cause of the re-entrancy crash described in docs/bridge-design.md.
-// All code *outside* registered callbacks continues to be JIT-compiled normally.
+// Stores the host function in the registry, marks it LUAJIT_MODE_FUNC|OFF so
+// the JIT never compiles it (prevents argv2cdata on lua_State* cdata args in
+// FFI calls made by the callback — see docs/bridge-design.md), and returns
+// the ref id.
 static int bridge_register(lua_State *L) {
     (void)L;
     luaL_checktype(host_L, 1, LUA_TFUNCTION);
     lua_pushvalue(host_L, 1);
-    // Mark the function as non-JIT-compilable before storing it.
-    // Stack top is the function copy — idx = -1.
     luaJIT_setmode(host_L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
     int id = luaL_ref(host_L, LUA_REGISTRYINDEX);
     lua_pushinteger(host_L, id);
     return 1;
 }
 
-// Pushes a dispatch_callback closure onto the guest state.
-// Done in C so the closure is a real lua_CFunction on the guest — not an FFI
-// cdata — preventing JIT tracing into the host from the guest side.
+// Pushes a dispatch_callback closure onto the guest state as a real
+// lua_CFunction (not FFI cdata), preventing JIT tracing into the host.
 static int bridge_push_callback(lua_State *L) {
     (void)L;
     lua_State *guest = decode_guest_ptr(1);
@@ -279,31 +255,200 @@ static int bridge_unregister(lua_State *L) {
     return 0;
 }
 
-// Creates a new guest lua_State with all standard libraries loaded.
-// Called entirely in C so the host never makes an FFI call with a lua_State*
-// cdata argument — safe to invoke from any context, including from within a
-// host callback triggered by guest code (where the JIT may be recording).
-// Returns the new state as a lightuserdata on host_L.
+// Returns the new state as a lightuserdata so no lua_State* cdata crosses
+// the call boundary — safe to call from within a guest callback.
 static int bridge_new_state(lua_State *L) {
     (void)L;
     lua_State *new_state = luaL_newstate();
     if (!new_state) {
         lua_pushstring(host_L, "bridge_new_state: luaL_newstate() returned NULL");
         lua_error(host_L);
-        return 0; /* unreachable */
+        return 0;
     }
     luaL_openlibs(new_state);
     lua_pushlightuserdata(host_L, (void *)new_state);
     return 1;
 }
 
+// ── Profiler buffer ───────────────────────────────────────────────────────
+//
+// On Windows, LuaJIT fires the profiler callback on a separate timer thread.
+// Calling back into LuaJIT from that thread is unsafe, so the callback only
+// calls luaJIT_profile_dumpstack (safe — the guest state is paused) and
+// writes into a plain C buffer. The main thread drains the buffer after
+// luaJIT_profile_stop() returns, which joins the timer thread and guarantees
+// no further writes. This is why profiling is handled here rather than in Lua.
+
+#define PROFILER_STACK_MAX  256
+#define PROFILER_BUF_INIT   65536
+
+typedef struct {
+    char stack[PROFILER_STACK_MAX];
+    int  samples;
+    char vmstate;
+} profiler_sample_t;
+
+typedef struct profiler_buf {
+    profiler_sample_t *entries;
+    volatile int       count;
+} profiler_buf_t;
+
+typedef struct profiler_node {
+    lua_State            *guest;
+    profiler_buf_t       *buf;
+    struct profiler_node *next;
+} profiler_node_t;
+
+static profiler_node_t *profiler_list = NULL;
+
+static profiler_buf_t *profiler_find(lua_State *guest) {
+    profiler_node_t *n = profiler_list;
+    while (n) {
+        if (n->guest == guest) return n->buf;
+        n = n->next;
+    }
+    return NULL;
+}
+
+static profiler_buf_t *profiler_alloc(lua_State *guest) {
+    profiler_buf_t *buf = (profiler_buf_t *)malloc(sizeof(profiler_buf_t));
+    if (!buf) return NULL;
+    buf->entries = (profiler_sample_t *)malloc(
+        PROFILER_BUF_INIT * sizeof(profiler_sample_t));
+    if (!buf->entries) { free(buf); return NULL; }
+    buf->count = 0;
+
+    profiler_node_t *node = (profiler_node_t *)malloc(sizeof(profiler_node_t));
+    if (!node) { free(buf->entries); free(buf); return NULL; }
+    node->guest   = guest;
+    node->buf     = buf;
+    node->next    = profiler_list;
+    profiler_list = node;
+    return buf;
+}
+
+static void profiler_free(lua_State *guest) {
+    profiler_node_t **pp = &profiler_list;
+    while (*pp) {
+        if ((*pp)->guest == guest) {
+            profiler_node_t *dead = *pp;
+            *pp = dead->next;
+            free(dead->buf->entries);
+            free(dead->buf);
+            free(dead);
+            return;
+        }
+        pp = &(*pp)->next;
+    }
+}
+
+static void profiler_callback(void *data, lua_State *L, int samples, int vmstate) {
+    profiler_buf_t *buf = (profiler_buf_t *)data;
+    int idx = buf->count;
+    if (idx >= PROFILER_BUF_INIT) return;
+
+    profiler_sample_t *s = &buf->entries[idx];
+
+    /* Skip dumpstack while a host←→guest transition is in progress.
+     * At that point the guest Lua stack has an incomplete FFI frame that
+     * lj_debug_dumpstack cannot walk safely. bridge_profile_stop will fill
+     * in empty stacks with the guest's stack at stop time. */
+    if (!bridge_in_transition) {
+        int len = 0;
+        const char *stack = luaJIT_profile_dumpstack(L, "f;", 32, &len);
+        if (stack && len > 0) {
+            int copy = len < PROFILER_STACK_MAX - 1 ? len : PROFILER_STACK_MAX - 1;
+            memcpy(s->stack, stack, (size_t)copy);
+            s->stack[copy] = '\0';
+        } else {
+            s->stack[0] = '\0';
+        }
+    } else {
+        s->stack[0] = '\0';
+    }
+
+    s->samples = samples;
+    s->vmstate = (char)vmstate;
+    buf->count = idx + 1;
+}
+
+static int bridge_profile_start(lua_State *L) {
+    (void)L;
+    lua_State  *guest = decode_guest_ptr(1);
+    const char *mode  = lua_tostring(host_L, 2);
+    if (!mode || mode[0] == '\0') mode = "fi1";
+
+    if (profiler_find(guest)) {
+        lua_pushstring(host_L, "bridge_profile_start: profiler already active for this state");
+        lua_error(host_L);
+        return 0;
+    }
+
+    profiler_buf_t *buf = profiler_alloc(guest);
+    if (!buf) {
+        lua_pushstring(host_L, "bridge_profile_start: out of memory");
+        lua_error(host_L);
+        return 0;
+    }
+
+    luaJIT_profile_start(guest, mode, profiler_callback, (void *)buf);
+    return 0;
+}
+
+static int bridge_profile_stop(lua_State *L) {
+    (void)L;
+    lua_State      *guest = decode_guest_ptr(1);
+    profiler_buf_t *buf   = profiler_find(guest);
+
+    if (buf) luaJIT_profile_stop(guest);
+
+    int n = buf ? buf->count : 0;
+    lua_createtable(host_L, n, 0);
+
+    if (buf) {
+        /* After stop the profiler is quiesced and the guest stack is stable.
+         * Do a single dumpstack here — safe since we are on the main thread
+         * with no FFI frames in flight — and assign it to all buffered samples
+         * that did not record a stack during sampling. */
+        int len = 0;
+        const char *cur_stack = luaJIT_profile_dumpstack(guest, "f;", 32, &len);
+        char stack_str[PROFILER_STACK_MAX];
+        if (cur_stack && len > 0) {
+            int copy = len < PROFILER_STACK_MAX - 1 ? len : PROFILER_STACK_MAX - 1;
+            memcpy(stack_str, cur_stack, (size_t)copy);
+            stack_str[copy] = '\0';
+        } else {
+            stack_str[0] = '\0';
+        }
+
+        int i;
+        for (i = 0; i < n; i++) {
+            profiler_sample_t *s = &buf->entries[i];
+            const char *stack = s->stack[0] ? s->stack : stack_str;
+            lua_createtable(host_L, 0, 3);
+            lua_pushstring(host_L, stack);
+            lua_setfield(host_L, -2, "stack");
+            lua_pushinteger(host_L, s->samples);
+            lua_setfield(host_L, -2, "samples");
+            lua_pushlstring(host_L, &s->vmstate, 1);
+            lua_setfield(host_L, -2, "vmstate");
+            lua_rawseti(host_L, -2, i + 1);
+        }
+        profiler_free(guest);
+    }
+
+    return 1;
+}
+
 static const luaL_Reg bridge_funcs[] = {
-    { "make_callable",  bridge_make_callable },
-    { "compound_tag",   bridge_compound_tag  },
-    { "register",       bridge_register      },
-    { "push_callback",  bridge_push_callback },
-    { "unregister",     bridge_unregister    },
-    { "new_state",      bridge_new_state     },
+    { "make_callable",   bridge_make_callable  },
+    { "compound_tag",    bridge_compound_tag   },
+    { "register",        bridge_register       },
+    { "push_callback",   bridge_push_callback  },
+    { "unregister",      bridge_unregister     },
+    { "new_state",       bridge_new_state      },
+    { "profile_start",   bridge_profile_start  },
+    { "profile_stop",    bridge_profile_stop   },
     { NULL, NULL }
 };
 
