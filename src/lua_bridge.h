@@ -102,6 +102,7 @@ int  lua_error (lua_State *L);
 /* ── State ── */
 lua_State *luaL_newstate(void);
 void       luaL_openlibs(lua_State *L);
+void       lua_close  (lua_State *L);
 
 /* ── JIT control ── */
 /* luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF/ON) */

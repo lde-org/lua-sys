@@ -517,7 +517,7 @@ end
 function State:close()
 	if self.L then
 		for _, cb in ipairs(self._callbacks) do bridge.unregister(cb.id) end
-		raw.close(self.L)
+		bridge.close_state(tonumber(ffi.cast("intptr_t", self.L)))
 		self.L          = nil
 		self._callbacks = {}
 	end

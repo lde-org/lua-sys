@@ -270,6 +270,19 @@ static int bridge_new_state(lua_State *L) {
     return 1;
 }
 
+// Close a guest Lua state created by bridge_new_state.
+// This must be called instead of raw lua_close() so that on Windows the
+// state is freed by bridge.dll's CRT — the same one that allocated it via
+// luaL_newstate(). Using the host's lua_close() (via ffi.C) on a state
+// allocated by bridge.dll's luaL_newstate() is a cross-CRT free and
+// corrupts the heap.
+static int bridge_close_state(lua_State *L) {
+    (void)L;
+    lua_State *guest = decode_guest_ptr(1);
+    lua_close(guest);
+    return 0;
+}
+
 // ── Profiler buffer ───────────────────────────────────────────────────────
 //
 // On Windows, LuaJIT fires the profiler callback on a separate timer thread.
@@ -447,6 +460,7 @@ static const luaL_Reg bridge_funcs[] = {
     { "push_callback",   bridge_push_callback  },
     { "unregister",      bridge_unregister     },
     { "new_state",       bridge_new_state      },
+    { "close_state",     bridge_close_state    },
     { "profile_start",   bridge_profile_start  },
     { "profile_stop",    bridge_profile_stop   },
     { NULL, NULL }
