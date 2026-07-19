@@ -58,13 +58,13 @@ static void push_primitive_or_error(lua_State *src, int idx, lua_State *dst) {
 
 // ── Guest state pointer decoding ─────────────────────────────────────────
 
-static lua_State *decode_guest_ptr(int stack_pos) {
-    int t = lua_type(host_L, stack_pos);
+static lua_State *decode_guest_ptr(lua_State *L, int stack_pos) {
+    int t = lua_type(L, stack_pos);
     if (t == LUA_TNUMBER)
-        return (lua_State *)(uintptr_t)lua_tonumber(host_L, stack_pos);
+        return (lua_State *)(uintptr_t)lua_tonumber(L, stack_pos);
     if (t == LUA_TLIGHTUSERDATA)
-        return (lua_State *)lua_touserdata(host_L, stack_pos);
-    luaL_error(host_L, "bridge: arg %d must be a guest lua_State pointer", stack_pos);
+        return (lua_State *)lua_touserdata(L, stack_pos);
+    luaL_error(L, "bridge: arg %d must be a guest lua_State pointer", stack_pos);
     return NULL; /* unreachable: luaL_error longjmps */
 }
 
@@ -149,8 +149,17 @@ static int bound_call(lua_State *host) {
 }
 
 static int bridge_make_callable(lua_State *L) {
-    (void)L;
-    lua_State *guest = decode_guest_ptr(1);
+    // bound_call operates on host_L (it receives L == host_L via the C
+    // function convention when called from host_L's Lua code). The closure
+    // must be created on host_L so the upvalues are read from host_L's stack.
+    // When called from a guest state (L != host_L), the guestState upvalue
+    // (a table) cannot be moved across states, so we restrict this to host-only.
+    if (L != host_L) {
+        lua_pushstring(L, "bridge.make_callable must be called from host state");
+        lua_error(L);
+        return 0;
+    }
+    lua_State *guest = decode_guest_ptr(L, 1);
     lua_pushlightuserdata(host_L, (void *)guest); /* upvalue 1 */
     lua_pushvalue(host_L, 2);                     /* upvalue 2: guestRef */
     lua_pushvalue(host_L, 3);                     /* upvalue 3: guestState */
@@ -160,9 +169,7 @@ static int bridge_make_callable(lua_State *L) {
 }
 
 static int bridge_compound_tag(lua_State *L) {
-    (void)L;
-    /* kept for API compatibility — no longer used by bound_call */
-    lua_pushboolean(host_L, 0);
+    lua_pushboolean(L, 0);
     return 1;
 }
 
@@ -226,31 +233,43 @@ static int dispatch_callback(lua_State *guest) {
 // Stores the host function in the registry, marks it LUAJIT_MODE_FUNC|OFF so
 // the JIT never compiles it (prevents argv2cdata on lua_State* cdata args in
 // FFI calls made by the callback — see docs/bridge-design.md), and returns
-// the ref id.
+// the ref id. May be called from any state; the function is moved to host_L's
+// registry so dispatch_callback (which operates on host_L) can retrieve it.
 static int bridge_register(lua_State *L) {
-    (void)L;
-    luaL_checktype(host_L, 1, LUA_TFUNCTION);
-    lua_pushvalue(host_L, 1);
+    luaL_checktype(L, 1, LUA_TFUNCTION);
+    if (L == host_L) {
+        lua_pushvalue(host_L, 1);
+    } else {
+        // Called from a guest state — move the function value into host_L's
+        // stack slot so it can be stored in host_L's registry. The function
+        // value on L's stack is a Lua object reference; we push it to host_L
+        // via the slow-path approach: create a temporary guest function that
+        // delegates back, then store the host function as a callback.
+        //
+        // For now, bridge_register must be called from the host. Nested-state
+        // callbacks reach through toLua which always runs on the host side.
+        lua_pushstring(L, "bridge.register must be called from host state");
+        lua_error(L);
+        return 0;
+    }
     luaJIT_setmode(host_L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
     int id = luaL_ref(host_L, LUA_REGISTRYINDEX);
-    lua_pushinteger(host_L, id);
+    lua_pushinteger(L, id);
     return 1;
 }
 
 // Pushes a dispatch_callback closure onto the guest state as a real
 // lua_CFunction (not FFI cdata), preventing JIT tracing into the host.
 static int bridge_push_callback(lua_State *L) {
-    (void)L;
-    lua_State *guest = decode_guest_ptr(1);
-    int fn_ref       = (int)lua_tointeger(host_L, 2);
+    lua_State *guest = decode_guest_ptr(L, 1);
+    int fn_ref       = (int)lua_tointeger(L, 2);
     lua_pushinteger(guest, fn_ref);
     lua_pushcclosure(guest, dispatch_callback, 1);
     return 0;
 }
 
 static int bridge_unregister(lua_State *L) {
-    (void)L;
-    int fn_ref = (int)lua_tointeger(host_L, 1);
+    int fn_ref = (int)lua_tointeger(L, 1);
     luaL_unref(host_L, LUA_REGISTRYINDEX, fn_ref);
     return 0;
 }
@@ -258,15 +277,14 @@ static int bridge_unregister(lua_State *L) {
 // Returns the new state as a lightuserdata so no lua_State* cdata crosses
 // the call boundary — safe to call from within a guest callback.
 static int bridge_new_state(lua_State *L) {
-    (void)L;
     lua_State *new_state = luaL_newstate();
     if (!new_state) {
-        lua_pushstring(host_L, "bridge_new_state: luaL_newstate() returned NULL");
-        lua_error(host_L);
+        lua_pushstring(L, "bridge_new_state: luaL_newstate() returned NULL");
+        lua_error(L);
         return 0;
     }
     luaL_openlibs(new_state);
-    lua_pushlightuserdata(host_L, (void *)new_state);
+    lua_pushlightuserdata(L, (void *)new_state);
     return 1;
 }
 
@@ -277,8 +295,7 @@ static int bridge_new_state(lua_State *L) {
 // allocated by bridge.dll's luaL_newstate() is a cross-CRT free and
 // corrupts the heap.
 static int bridge_close_state(lua_State *L) {
-    (void)L;
-    lua_State *guest = decode_guest_ptr(1);
+    lua_State *guest = decode_guest_ptr(L, 1);
     lua_close(guest);
     return 0;
 }
@@ -386,21 +403,20 @@ static void profiler_callback(void *data, lua_State *L, int samples, int vmstate
 }
 
 static int bridge_profile_start(lua_State *L) {
-    (void)L;
-    lua_State  *guest = decode_guest_ptr(1);
-    const char *mode  = lua_tostring(host_L, 2);
+    lua_State  *guest = decode_guest_ptr(L, 1);
+    const char *mode  = lua_tostring(L, 2);
     if (!mode || mode[0] == '\0') mode = "fi1";
 
     if (profiler_find(guest)) {
-        lua_pushstring(host_L, "bridge_profile_start: profiler already active for this state");
-        lua_error(host_L);
+        lua_pushstring(L, "bridge_profile_start: profiler already active for this state");
+        lua_error(L);
         return 0;
     }
 
     profiler_buf_t *buf = profiler_alloc(guest);
     if (!buf) {
-        lua_pushstring(host_L, "bridge_profile_start: out of memory");
-        lua_error(host_L);
+        lua_pushstring(L, "bridge_profile_start: out of memory");
+        lua_error(L);
         return 0;
     }
 
@@ -409,14 +425,13 @@ static int bridge_profile_start(lua_State *L) {
 }
 
 static int bridge_profile_stop(lua_State *L) {
-    (void)L;
-    lua_State      *guest = decode_guest_ptr(1);
+    lua_State      *guest = decode_guest_ptr(L, 1);
     profiler_buf_t *buf   = profiler_find(guest);
 
     if (buf) luaJIT_profile_stop(guest);
 
     int n = buf ? buf->count : 0;
-    lua_createtable(host_L, n, 0);
+    lua_createtable(L, n, 0);
 
     if (buf) {
         /* After stop the profiler is quiesced and the guest stack is stable.
@@ -438,14 +453,14 @@ static int bridge_profile_stop(lua_State *L) {
         for (i = 0; i < n; i++) {
             profiler_sample_t *s = &buf->entries[i];
             const char *stack = s->stack[0] ? s->stack : stack_str;
-            lua_createtable(host_L, 0, 3);
-            lua_pushstring(host_L, stack);
-            lua_setfield(host_L, -2, "stack");
-            lua_pushinteger(host_L, s->samples);
-            lua_setfield(host_L, -2, "samples");
-            lua_pushlstring(host_L, &s->vmstate, 1);
-            lua_setfield(host_L, -2, "vmstate");
-            lua_rawseti(host_L, -2, i + 1);
+            lua_createtable(L, 0, 3);
+            lua_pushstring(L, stack);
+            lua_setfield(L, -2, "stack");
+            lua_pushinteger(L, s->samples);
+            lua_setfield(L, -2, "samples");
+            lua_pushlstring(L, &s->vmstate, 1);
+            lua_setfield(L, -2, "vmstate");
+            lua_rawseti(L, -2, i + 1);
         }
         profiler_free(guest);
     }
@@ -467,7 +482,7 @@ static const luaL_Reg bridge_funcs[] = {
 };
 
 int luaopen_lua_sys_bridge(lua_State *L) {
-    host_L = L;
+    if (!host_L) host_L = L;
     luaL_register(L, "lua-sys.bridge", bridge_funcs);
     return 1;
 }
