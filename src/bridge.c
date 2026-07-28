@@ -19,6 +19,71 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── Windows symbol resolution ────────────────────────────────────────────
+ *
+ * PE DLLs cannot leave symbols unresolved for the loader to bind against the
+ * process image (unlike ELF/Mach-O). Instead, lde exports all LuaJIT symbols
+ * from the exe (-Wl,--export-all-symbols), and we resolve them here at module
+ * load via GetProcAddress on the process handle. The lua_* names are defined
+ * as static function pointers (lua_bridge.h hides its prototypes on Windows),
+ * so bridge.dll has no undefined lua_* symbols and needs no import library.
+ * This keeps a single LuaJIT runtime and a single allocator in the process,
+ * exactly like the POSIX build. */
+#ifdef _WIN32
+#include <windows.h>
+
+#define LDE_LUA_SYMS(X) \
+    X(int,          lua_gettop,             (lua_State *L)) \
+    X(void,         lua_settop,             (lua_State *L, int idx)) \
+    X(void,         lua_pushvalue,          (lua_State *L, int idx)) \
+    X(int,          lua_type,               (lua_State *L, int idx)) \
+    X(const char *, lua_typename,           (lua_State *L, int tp)) \
+    X(void,         lua_pushnil,            (lua_State *L)) \
+    X(void,         lua_pushboolean,        (lua_State *L, int b)) \
+    X(void,         lua_pushnumber,         (lua_State *L, lua_Number n)) \
+    X(void,         lua_pushinteger,        (lua_State *L, lua_Integer n)) \
+    X(void,         lua_pushlstring,        (lua_State *L, const char *s, size_t len)) \
+    X(void,         lua_pushstring,         (lua_State *L, const char *s)) \
+    X(const char *, lua_pushfstring,        (lua_State *L, const char *fmt, ...)) \
+    X(void,         lua_pushlightuserdata,  (lua_State *L, void *p)) \
+    X(void,         lua_pushcclosure,       (lua_State *L, lua_CFunction fn, int n)) \
+    X(int,          lua_toboolean,          (lua_State *L, int idx)) \
+    X(lua_Number,   lua_tonumber,           (lua_State *L, int idx)) \
+    X(const char *, lua_tolstring,          (lua_State *L, int idx, size_t *len)) \
+    X(void *,       lua_touserdata,         (lua_State *L, int idx)) \
+    X(void,         lua_createtable,        (lua_State *L, int narr, int nrec)) \
+    X(void,         lua_rawgeti,            (lua_State *L, int idx, int n)) \
+    X(void,         lua_rawseti,            (lua_State *L, int idx, int n)) \
+    X(void,         lua_setfield,           (lua_State *L, int idx, const char *k)) \
+    X(int,          lua_pcall,              (lua_State *L, int nargs, int nresults, int errfunc)) \
+    X(int,          lua_error,              (lua_State *L)) \
+    X(lua_State *,  luaL_newstate,          (void)) \
+    X(void,         luaL_openlibs,          (lua_State *L)) \
+    X(void,         lua_close,              (lua_State *L)) \
+    X(int,          luaJIT_setmode,         (lua_State *L, int idx, int mode)) \
+    X(void,         luaJIT_profile_start,   (lua_State *L, const char *mode, luaJIT_profile_callback cb, void *data)) \
+    X(void,         luaJIT_profile_stop,    (lua_State *L)) \
+    X(const char *, luaJIT_profile_dumpstack,(lua_State *L, const char *fmt, int depth, int *len)) \
+    X(int,          luaL_ref,               (lua_State *L, int t)) \
+    X(void,         luaL_unref,             (lua_State *L, int t, int ref)) \
+    X(int,          luaL_error,             (lua_State *L, const char *fmt, ...)) \
+    X(void,         luaL_checktype,         (lua_State *L, int narg, int t)) \
+    X(void,         luaL_register,          (lua_State *L, const char *libname, const luaL_Reg *l))
+
+/* Each lua_* name becomes a static function pointer; every call site below
+ * calls through it unchanged. */
+#define LDE_DECLARE(ret, name, args) static ret (*name) args;
+LDE_LUA_SYMS(LDE_DECLARE)
+#undef LDE_DECLARE
+
+static void bridge_resolve_symbols(void) {
+    HMODULE exe = GetModuleHandleA(NULL);
+#define LDE_RESOLVE(ret, name, args) *(FARPROC *)&name = GetProcAddress(exe, #name);
+    LDE_LUA_SYMS(LDE_RESOLVE)
+#undef LDE_RESOLVE
+}
+#endif /* _WIN32 */
+
 static lua_State *host_L = NULL;
 
 /* Set to 1 while dispatch_callback is executing a host←→guest transition.
@@ -482,6 +547,9 @@ static const luaL_Reg bridge_funcs[] = {
 };
 
 int luaopen_lua_sys_bridge(lua_State *L) {
+#ifdef _WIN32
+    bridge_resolve_symbols();
+#endif
     if (!host_L) host_L = L;
     luaL_register(L, "lua-sys.bridge", bridge_funcs);
     return 1;

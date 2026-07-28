@@ -342,13 +342,6 @@ ffi.cdef [[
 ---@field luaopen_table fun(L: lua.raw.State): integer
 local C = ffi.C
 
-if jit.os == "Windows" then
-	-- On Windows lua symbols are not exported from the process image.
-	-- They are linked into bridge.dll via the lde import library.
-	local here = debug.getinfo(1, "S").source:sub(2):match("(.*[/\\])") or ""
-	C = ffi.load(here .. "bridge.dll")
-end
-
 local raw = {}
 
 -- Core API

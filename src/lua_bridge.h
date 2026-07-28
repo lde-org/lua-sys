@@ -59,6 +59,12 @@ typedef ptrdiff_t lua_Integer;
 #define lua_tostring(L, i)   lua_tolstring(L, i, NULL)
 #define lua_tointeger(L, i)  ((lua_Integer)lua_tonumber(L, i))
 
+/* On Windows the exe exports these symbols and bridge.c resolves them at
+ * load time via GetProcAddress, defining them there as static function
+ * pointers with the same names and signatures. The prototypes are hidden
+ * so they don't conflict with those pointers. */
+#ifndef _WIN32
+
 /* ── Stack ── */
 int   lua_gettop   (lua_State *L);
 void  lua_settop   (lua_State *L, int idx);
@@ -104,13 +110,18 @@ lua_State *luaL_newstate(void);
 void       luaL_openlibs(lua_State *L);
 void       lua_close  (lua_State *L);
 
+#endif /* !_WIN32 */
+
 /* ── JIT control ── */
 /* luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF/ON) */
 #define LUAJIT_MODE_ENGINE  0
 #define LUAJIT_MODE_FUNC    2
 #define LUAJIT_MODE_OFF     0x0000
 #define LUAJIT_MODE_ON      0x0100
+
+#ifndef _WIN32
 int luaJIT_setmode(lua_State *L, int idx, int mode);
+#endif /* !_WIN32 */
 
 /* ── LuaJIT profiler ── */
 /* Callback signature: void cb(void *data, lua_State *L, int samples, int vmstate)
@@ -119,6 +130,8 @@ int luaJIT_setmode(lua_State *L, int idx, int mode);
  * so after it returns the callback will never fire again. */
 typedef void (*luaJIT_profile_callback)(void *data, lua_State *L,
                                         int samples, int vmstate);
+
+#ifndef _WIN32
 void        luaJIT_profile_start    (lua_State *L, const char *mode,
                                      luaJIT_profile_callback cb, void *data);
 void        luaJIT_profile_stop     (lua_State *L);
@@ -131,5 +144,6 @@ void luaL_unref    (lua_State *L, int t, int ref);
 int  luaL_error    (lua_State *L, const char *fmt, ...);
 void luaL_checktype(lua_State *L, int narg, int t);
 void luaL_register (lua_State *L, const char *libname, const luaL_Reg *l);
+#endif /* !_WIN32 */
 
 #endif /* LUA_BRIDGE_H */
