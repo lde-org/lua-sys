@@ -1,28 +1,12 @@
 -- src/profiler.lua
 --
 -- Sampling profiler for guest lua_State instances.
---
--- On POSIX, LuaJIT delivers profiler events through the normal interpreter
--- dispatch (SIGPROF sets a hook flag; the callback fires when the VM next
--- checks it). Calling luaJIT_profile_dumpstack from that context is safe, so
--- we use a direct Lua FFI callback as before.
---
--- On Windows, LuaJIT fires the callback on a separate timer thread. Calling
--- back into the interpreter from another thread is unsafe, so sample
--- collection is handled entirely in bridge.c (pure C, no Lua calls) and
--- drained after luaJIT_profile_stop() joins the timer thread.
 
 local raw    = require("lua-sys.raw")
-local ffi    = require("ffi")
 
 local profiler = {}
 
 local _active  = {}
-local _windows = jit.os == "Windows"
-
-local function L_ptr(state)
-	return tonumber(ffi.cast("intptr_t", state.L))
-end
 
 -- ── POSIX path ────────────────────────────────────────────────────────────
 
@@ -79,54 +63,6 @@ local function stop_posix(state)
 	return entries
 end
 
--- ── Windows path (C bridge buffer) ────────────────────────────────────────
-
-local bridge
-
-local function start_windows(state, mode, cb)
-	if not bridge then bridge = require("lua-sys.bridge") end
-	local key = tostring(state.L)
-	bridge.profile_start(L_ptr(state), mode)
-	_active[key] = { custom = cb ~= nil, cb = cb }
-end
-
-local function stop_windows(state)
-	if not bridge then bridge = require("lua-sys.bridge") end
-	local key     = tostring(state.L)
-	local samples = bridge.profile_stop(L_ptr(state))
-	local entry   = _active[key]
-	_active[key]  = nil
-
-	if entry.custom then
-		for _, s in ipairs(samples) do entry.cb(s.stack, s.samples, s.vmstate) end
-		return nil
-	end
-
-	local counts = {}
-	local total  = 0
-	for _, s in ipairs(samples) do
-		local k = s.stack .. "\0" .. s.vmstate
-		local e = counts[k]
-		if e then e.count = e.count + s.samples
-		else counts[k] = { stack = s.stack, vmstate = s.vmstate, count = s.samples }
-		end
-		total = total + s.samples
-	end
-
-	local entries = {}
-	for _, e in pairs(counts) do
-		entries[#entries + 1] = {
-			stack   = e.stack,
-			vmstate = e.vmstate,
-			count   = e.count,
-			percent = total > 0 and e.count / total * 100 or 0,
-		}
-	end
-	table.sort(entries, function(a, b) return a.count > b.count end)
-	entries.total = total
-	return entries
-end
-
 -- ── Public API ────────────────────────────────────────────────────────────
 
 ---@param state lua.State
@@ -138,11 +74,7 @@ function profiler.start(state, mode, cb)
 	assert(not _active[key], "profiler already running for this state")
 	mode = mode or "fi1"
 
-	if _windows then
-		start_windows(state, mode, cb)
-	else
-		start_posix(state, mode, cb)
-	end
+	start_posix(state, mode, cb)
 end
 
 ---@param state lua.State
@@ -152,11 +84,7 @@ function profiler.stop(state)
 	local key = tostring(state.L)
 	assert(_active[key], "profiler not running for this state")
 
-	if _windows then
-		return stop_windows(state)
-	else
-		return stop_posix(state)
-	end
+	return stop_posix(state)
 end
 
 ---@param report      table
