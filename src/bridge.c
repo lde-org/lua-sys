@@ -61,9 +61,6 @@
     X(void,         luaL_openlibs,          (lua_State *L)) \
     X(void,         lua_close,              (lua_State *L)) \
     X(int,          luaJIT_setmode,         (lua_State *L, int idx, int mode)) \
-    X(void,         luaJIT_profile_start,   (lua_State *L, const char *mode, luaJIT_profile_callback cb, void *data)) \
-    X(void,         luaJIT_profile_stop,    (lua_State *L)) \
-    X(const char *, luaJIT_profile_dumpstack,(lua_State *L, const char *fmt, int depth, int *len)) \
     X(int,          luaL_ref,               (lua_State *L, int t)) \
     X(void,         luaL_unref,             (lua_State *L, int t, int ref)) \
     X(int,          luaL_error,             (lua_State *L, const char *fmt, ...)) \
@@ -85,12 +82,6 @@ static void bridge_resolve_symbols(void) {
 #endif /* _WIN32 */
 
 static lua_State *host_L = NULL;
-
-/* Set to 1 while dispatch_callback is executing a host←→guest transition.
- * luaJIT_profile_dumpstack is unsafe during this period because the guest
- * Lua stack has an incomplete FFI continuation frame. The profiler callback
- * skips dumpstack when this flag is set and records an empty stack instead. */
-static volatile int bridge_in_transition = 0;
 
 // ── Value copying ─────────────────────────────────────────────────────────
 
@@ -258,9 +249,7 @@ static int dispatch_callback(lua_State *guest) {
         push_primitive_or_error(guest, i, host_L);
 
     luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
-    bridge_in_transition = 1;
     int status = lua_pcall(host_L, nargs, LUA_MULTRET, 0);
-    bridge_in_transition = 0;
     luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
     if (status != LUA_OK) {
@@ -365,174 +354,6 @@ static int bridge_close_state(lua_State *L) {
     return 0;
 }
 
-// ── Profiler buffer ───────────────────────────────────────────────────────
-//
-// On Windows, LuaJIT fires the profiler callback on a separate timer thread.
-// Calling back into LuaJIT from that thread is unsafe, so the callback only
-// calls luaJIT_profile_dumpstack (safe — the guest state is paused) and
-// writes into a plain C buffer. The main thread drains the buffer after
-// luaJIT_profile_stop() returns, which joins the timer thread and guarantees
-// no further writes. This is why profiling is handled here rather than in Lua.
-
-#define PROFILER_STACK_MAX  256
-#define PROFILER_BUF_INIT   65536
-
-typedef struct {
-    char stack[PROFILER_STACK_MAX];
-    int  samples;
-    char vmstate;
-} profiler_sample_t;
-
-typedef struct profiler_buf {
-    profiler_sample_t *entries;
-    volatile int       count;
-} profiler_buf_t;
-
-typedef struct profiler_node {
-    lua_State            *guest;
-    profiler_buf_t       *buf;
-    struct profiler_node *next;
-} profiler_node_t;
-
-static profiler_node_t *profiler_list = NULL;
-
-static profiler_buf_t *profiler_find(lua_State *guest) {
-    profiler_node_t *n = profiler_list;
-    while (n) {
-        if (n->guest == guest) return n->buf;
-        n = n->next;
-    }
-    return NULL;
-}
-
-static profiler_buf_t *profiler_alloc(lua_State *guest) {
-    profiler_buf_t *buf = (profiler_buf_t *)malloc(sizeof(profiler_buf_t));
-    if (!buf) return NULL;
-    buf->entries = (profiler_sample_t *)malloc(
-        PROFILER_BUF_INIT * sizeof(profiler_sample_t));
-    if (!buf->entries) { free(buf); return NULL; }
-    buf->count = 0;
-
-    profiler_node_t *node = (profiler_node_t *)malloc(sizeof(profiler_node_t));
-    if (!node) { free(buf->entries); free(buf); return NULL; }
-    node->guest   = guest;
-    node->buf     = buf;
-    node->next    = profiler_list;
-    profiler_list = node;
-    return buf;
-}
-
-static void profiler_free(lua_State *guest) {
-    profiler_node_t **pp = &profiler_list;
-    while (*pp) {
-        if ((*pp)->guest == guest) {
-            profiler_node_t *dead = *pp;
-            *pp = dead->next;
-            free(dead->buf->entries);
-            free(dead->buf);
-            free(dead);
-            return;
-        }
-        pp = &(*pp)->next;
-    }
-}
-
-static void profiler_callback(void *data, lua_State *L, int samples, int vmstate) {
-    profiler_buf_t *buf = (profiler_buf_t *)data;
-    int idx = buf->count;
-    if (idx >= PROFILER_BUF_INIT) return;
-
-    profiler_sample_t *s = &buf->entries[idx];
-
-    /* Skip dumpstack while a host←→guest transition is in progress.
-     * At that point the guest Lua stack has an incomplete FFI frame that
-     * lj_debug_dumpstack cannot walk safely. bridge_profile_stop will fill
-     * in empty stacks with the guest's stack at stop time. */
-    if (!bridge_in_transition) {
-        int len = 0;
-        const char *stack = luaJIT_profile_dumpstack(L, "f;", 32, &len);
-        if (stack && len > 0) {
-            int copy = len < PROFILER_STACK_MAX - 1 ? len : PROFILER_STACK_MAX - 1;
-            memcpy(s->stack, stack, (size_t)copy);
-            s->stack[copy] = '\0';
-        } else {
-            s->stack[0] = '\0';
-        }
-    } else {
-        s->stack[0] = '\0';
-    }
-
-    s->samples = samples;
-    s->vmstate = (char)vmstate;
-    buf->count = idx + 1;
-}
-
-static int bridge_profile_start(lua_State *L) {
-    lua_State  *guest = decode_guest_ptr(L, 1);
-    const char *mode  = lua_tostring(L, 2);
-    if (!mode || mode[0] == '\0') mode = "fi1";
-
-    if (profiler_find(guest)) {
-        lua_pushstring(L, "bridge_profile_start: profiler already active for this state");
-        lua_error(L);
-        return 0;
-    }
-
-    profiler_buf_t *buf = profiler_alloc(guest);
-    if (!buf) {
-        lua_pushstring(L, "bridge_profile_start: out of memory");
-        lua_error(L);
-        return 0;
-    }
-
-    luaJIT_profile_start(guest, mode, profiler_callback, (void *)buf);
-    return 0;
-}
-
-static int bridge_profile_stop(lua_State *L) {
-    lua_State      *guest = decode_guest_ptr(L, 1);
-    profiler_buf_t *buf   = profiler_find(guest);
-
-    if (buf) luaJIT_profile_stop(guest);
-
-    int n = buf ? buf->count : 0;
-    lua_createtable(L, n, 0);
-
-    if (buf) {
-        /* After stop the profiler is quiesced and the guest stack is stable.
-         * Do a single dumpstack here — safe since we are on the main thread
-         * with no FFI frames in flight — and assign it to all buffered samples
-         * that did not record a stack during sampling. */
-        int len = 0;
-        const char *cur_stack = luaJIT_profile_dumpstack(guest, "f;", 32, &len);
-        char stack_str[PROFILER_STACK_MAX];
-        if (cur_stack && len > 0) {
-            int copy = len < PROFILER_STACK_MAX - 1 ? len : PROFILER_STACK_MAX - 1;
-            memcpy(stack_str, cur_stack, (size_t)copy);
-            stack_str[copy] = '\0';
-        } else {
-            stack_str[0] = '\0';
-        }
-
-        int i;
-        for (i = 0; i < n; i++) {
-            profiler_sample_t *s = &buf->entries[i];
-            const char *stack = s->stack[0] ? s->stack : stack_str;
-            lua_createtable(L, 0, 3);
-            lua_pushstring(L, stack);
-            lua_setfield(L, -2, "stack");
-            lua_pushinteger(L, s->samples);
-            lua_setfield(L, -2, "samples");
-            lua_pushlstring(L, &s->vmstate, 1);
-            lua_setfield(L, -2, "vmstate");
-            lua_rawseti(L, -2, i + 1);
-        }
-        profiler_free(guest);
-    }
-
-    return 1;
-}
-
 static const luaL_Reg bridge_funcs[] = {
     { "make_callable",   bridge_make_callable  },
     { "compound_tag",    bridge_compound_tag   },
@@ -541,8 +362,6 @@ static const luaL_Reg bridge_funcs[] = {
     { "unregister",      bridge_unregister     },
     { "new_state",       bridge_new_state      },
     { "close_state",     bridge_close_state    },
-    { "profile_start",   bridge_profile_start  },
-    { "profile_stop",    bridge_profile_stop   },
     { NULL, NULL }
 };
 

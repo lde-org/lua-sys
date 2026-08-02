@@ -123,21 +123,7 @@ void       lua_close  (lua_State *L);
 int luaJIT_setmode(lua_State *L, int idx, int mode);
 #endif /* !_WIN32 */
 
-/* ── LuaJIT profiler ── */
-/* Callback signature: void cb(void *data, lua_State *L, int samples, int vmstate)
- * On Windows the callback fires on a separate timer thread — do not call back
- * into LuaJIT from it. luaJIT_profile_stop() joins the thread before returning,
- * so after it returns the callback will never fire again. */
-typedef void (*luaJIT_profile_callback)(void *data, lua_State *L,
-                                        int samples, int vmstate);
-
 #ifndef _WIN32
-void        luaJIT_profile_start    (lua_State *L, const char *mode,
-                                     luaJIT_profile_callback cb, void *data);
-void        luaJIT_profile_stop     (lua_State *L);
-const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt,
-                                     int depth, int *len);
-
 /* ── luaL aux ── */
 int  luaL_ref      (lua_State *L, int t);
 void luaL_unref    (lua_State *L, int t, int ref);

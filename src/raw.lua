@@ -609,11 +609,9 @@ raw.openTable = C.luaopen_table
 -- JIT extensions (luaJIT_*)
 raw.jit_setmode = C.luaJIT_setmode
 
--- raw.jit_profile_start and raw.jit_profile_stop are safe to use on POSIX
--- (the profiler callback fires from the interpreter, not a separate thread).
--- On Windows, LuaJIT fires the callback on a timer thread — calling back into
--- the interpreter from there is unsafe. Use lua-sys.profiler which routes
--- through bridge.c on Windows and uses these directly on POSIX.
+-- The profiler callback runs from the interpreter on the main thread on all
+-- platforms; the OS timer (SIGPROF on POSIX, a timer thread on Windows) only
+-- arms the sampling hook. lua-sys.profiler uses these directly everywhere.
 raw.jit_profile_start = C.luaJIT_profile_start
 raw.jit_profile_stop  = C.luaJIT_profile_stop
 
