@@ -23,9 +23,28 @@ if jit.os == "Windows" then
 		out .. "/bridge.c",
 	}
 elseif jit.os == "OSX" then
-	ext  = "dylib"
+	ext = "dylib"
+	-- macOS dyld dedupes dylibs by install name (LC_ID_DYLIB): if a copy of
+	-- this dylib is already loaded (e.g. the one embedded in the lde binary,
+	-- whose install name defaults to its build path), dlopen'ing a fresh
+	-- build at that same path returns the stale image — e.g. bridge.new_state
+	-- coming back nil on macOS. A content-derived install name means identical
+	-- copies share a name (harmless) but different versions never shadow each
+	-- other. The require path is unchanged.
+	local hash = 5381
+	do
+		local f = io.open(out .. "/bridge.c", "rb")
+		if f then
+			local data = f:read("*a")
+			f:close()
+			for i = 1, #data do
+				hash = bit.band(hash * 33 + string.byte(data, i), 0xFFFFFFFF)
+			end
+		end
+	end
 	args = {
 		"-dynamiclib", "-undefined", "dynamic_lookup", "-O2",
+		"-install_name", "@rpath/bridge-" .. bit.tohex(hash, 8) .. ".dylib",
 		"-I", out,
 		"-o", out .. "/bridge." .. ext,
 		out .. "/bridge.c",
