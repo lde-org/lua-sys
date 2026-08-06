@@ -1149,3 +1149,227 @@ test.it("cycle detection does not false-positive on non-cyclic duplicates", func
 	test.equal(1, gt.b.x)
 	state:close()
 end)
+
+-- ─── Debug hooks ──────────────────────────────────────────────────────────
+
+test.it("setHook with count mask aborts an infinite loop", function()
+	local state = lua.new()
+
+	-- Fire the hook every 1000 instructions and abort from inside it
+	state:setHook(function(event, info)
+		error("timeout: infinite loop detected")
+	end, "count", 1000)
+
+	local ok, err = pcall(function()
+		state:eval("while true do end")
+	end)
+	test.falsy(ok)
+	test.includes(err, "infinite loop")
+
+	state:close()
+end)
+
+test.it("setHook with line mask fires on each executed line", function()
+	local state = lua.new()
+	local events = {}
+
+	state:setHook(function(event, info)
+		events[#events + 1] = { event, info.currentline }
+	end, "line")
+
+	-- Multi-statement chunk: state:eval evaluates it directly and returns sum
+	local result = state:eval("local sum = 0\nfor i = 1, 10 do\n\tsum = sum + i\nend\nreturn sum")
+	test.equal(55, result)
+
+	-- lines 1..5 each fire at least once (the JIT is disabled while the hook
+	-- is installed, so every executed line produces a line event)
+	test.truthy(#events >= 5, "expected >= 5 line events, got " .. #events)
+	local lines = {}
+	for _, e in ipairs(events) do
+		test.equal("line", e[1])
+		lines[e[2]] = true
+	end
+	test.truthy(lines[1] and lines[3] and lines[5], "expected events on lines 1, 3, 5")
+
+	state:close()
+end)
+
+test.it("setHook with call/return mask reports function calls", function()
+	local state = lua.new()
+	local log = {}
+
+	state:setHook(function(event, info)
+		log[#log + 1] = event
+	end, "call return")
+
+	local fn = state:eval("function() return math.abs(-5) end")
+	test.equal(5, fn())
+
+	local sawCall, sawReturn = false, false
+	for _, e in ipairs(log) do
+		if e == "call" then sawCall = true end
+		if e == "return" then sawReturn = true end
+	end
+	test.truthy(sawCall, "expected a call event")
+	test.truthy(sawReturn, "expected a return event")
+
+	state:close()
+end)
+
+test.it("hook info table exposes source, line and what fields", function()
+	local state = lua.new()
+	local seen = {}
+
+	state:setHook(function(event, info)
+		seen[#seen + 1] = info
+	end, "line")
+
+	state:load("local a = 1"):setName("@hooktest.lua"):call()
+
+	test.truthy(#seen > 0, "expected at least one line event")
+	local info = seen[1]
+	test.equal("line", info.event)
+	test.equal("@hooktest.lua", info.source)
+	test.truthy(info.currentline >= 1)
+	test.truthy(info.what)
+
+	state:close()
+end)
+
+test.it("setHook accepts an integer bitmask", function()
+	local state = lua.new()
+	local count = 0
+
+	-- 4 == LUA_MASKLINE
+	state:setHook(function() count = count + 1 end, 4)
+	state:eval("local x = 1")
+	test.truthy(count > 0, "expected line events with integer mask")
+
+	state:close()
+end)
+
+test.it("setHook(nil) removes the hook", function()
+	local state = lua.new()
+	local calls = 0
+
+	state:setHook(function() calls = calls + 1 end, "line")
+	state:eval("local x = 1")
+	test.truthy(calls > 0, "hook should have fired")
+
+	calls = 0
+	state:setHook(nil)
+	state:eval("local y = 2")
+	test.equal(0, calls)
+
+	state:close()
+end)
+
+test.it("calling sethook again replaces the previous hook", function()
+	local state = lua.new()
+	local first, second = 0, 0
+
+	state:setHook(function() first = first + 1 end, "line")
+	state:setHook(function() second = second + 1 end, "line")
+	state:eval("local x = 1")
+
+	test.equal(0, first, "old hook must be replaced")
+	test.truthy(second > 0, "new hook should fire")
+
+	state:close()
+end)
+
+test.it("hook can be installed, removed, and reinstalled", function()
+	local state = lua.new()
+	local calls = 0
+	local fn = function() calls = calls + 1 end
+
+	state:setHook(fn, "line")
+	state:eval("local a = 1")
+	test.truthy(calls > 0)
+
+	state:setHook(nil)
+	calls = 0
+	state:eval("local b = 2")
+	test.equal(0, calls)
+
+	state:setHook(fn, "line")
+	state:eval("local c = 3")
+	test.truthy(calls > 0)
+
+	state:close()
+end)
+
+-- ─── JIT control ─────────────────────────────────────────────────────────
+
+test.it("setHook disables the JIT while installed and re-enables on removal", function()
+	local state = lua.new()
+
+	test.equal(true, state:eval("return jit.status()"))
+
+	-- A hot loop: without JIT control the count hook would stop firing once
+	-- the loop is compiled to a trace, so sethook must disable the engine.
+	local fires = 0
+	state:setHook(function() fires = fires + 1 end, "count", 1000)
+	test.equal(false, state:eval("return jit.status()"))
+
+	state:eval("local s = 0; for i = 1, 200000 do s = s + i end")
+	test.truthy(fires >= 100, "expected the count hook to keep firing, got " .. fires)
+
+	state:setHook(nil)
+	test.equal(true, state:eval("return jit.status()"))
+
+	state:close()
+end)
+
+test.it("state:jitOff() / state:jitOn() control the guest JIT engine", function()
+	local state = lua.new()
+
+	test.equal(true, state:eval("return jit.status()"))
+	state:jitOff()
+	test.equal(false, state:eval("return jit.status()"))
+	state:jitOn()
+	test.equal(true, state:eval("return jit.status()"))
+
+	state:close()
+end)
+
+test.it("state:jitOff(fn) / state:jitOn(fn) target a single guest function", function()
+	local state = lua.new()
+	local fn = state:eval("function(x) return x * 2 end")
+
+	-- Per-function mode leaves the engine status untouched (unlike
+	-- state:jitOff(), which turns the whole engine off)
+	state:jitOff(fn)
+	test.equal(true, state:eval("return jit.status()"))
+	test.equal(4, fn(2))
+	test.equal(20, fn(10))
+
+	state:jitOn(fn)
+	test.equal(6, fn(3))
+
+	state:close()
+end)
+
+test.it("state:jitOff rejects functions that are not guest callables", function()
+	local state = lua.new()
+
+	local ok, err = pcall(function()
+		state:jitOff(function() end)
+	end)
+	test.falsy(ok)
+	test.includes(err, "guest callable")
+
+	state:close()
+end)
+
+test.it("state:jitFlush() drops compiled traces without crashing", function()
+	local state = lua.new()
+	local fn = state:eval("function(x) return x + 1 end")
+
+	-- Compile the function a few times so traces exist, then flush them
+	for _ = 1, 100 do fn(1) end
+	state:jitFlush()
+	test.equal(42, fn(41))
+
+	state:close()
+end)

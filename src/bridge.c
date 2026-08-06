@@ -65,7 +65,11 @@
     X(void,         luaL_unref,             (lua_State *L, int t, int ref)) \
     X(int,          luaL_error,             (lua_State *L, const char *fmt, ...)) \
     X(void,         luaL_checktype,         (lua_State *L, int narg, int t)) \
-    X(void,         luaL_register,          (lua_State *L, const char *libname, const luaL_Reg *l))
+    X(void,         luaL_register,          (lua_State *L, const char *libname, const luaL_Reg *l)) \
+    X(void,         lua_rawget,             (lua_State *L, int idx)) \
+    X(void,         lua_rawset,             (lua_State *L, int idx)) \
+    X(int,          lua_sethook,            (lua_State *L, lua_Hook func, int mask, int count)) \
+    X(int,          lua_getinfo,            (lua_State *L, const char *what, lua_Debug *ar))
 
 /* Each lua_* name becomes a static function pointer; every call site below
  * calls through it unchanged. */
@@ -328,6 +332,122 @@ static int bridge_unregister(lua_State *L) {
     return 0;
 }
 
+// ── Debug hooks ───────────────────────────────────────────────────────────
+//
+// High-level counterpart to lua_sethook: the hook fires on the guest state
+// while guest code runs, and dispatches to a host function stored in
+// host_L's registry — the same host↔guest pattern as dispatch_callback.
+// A lua_Hook is a plain C function pointer with no upvalues, so the host
+// callback ref is parked in the guest registry under a private key that the
+// hook looks up on every event.
+
+static char hook_registry_key;
+
+static const char *hook_event_name(int event) {
+    switch (event) {
+    case LUA_HOOKCALL:      return "call";
+    case LUA_HOOKRET:       return "return";
+    case LUA_HOOKLINE:      return "line";
+    case LUA_HOOKCOUNT:     return "count";
+    case LUA_HOOKTAILCALL:  return "tailcall";
+    default:                return "?";
+    }
+}
+
+// lua_Hook installed on the guest state by bridge_set_hook.
+//
+// ar is filled in by the VM with the event; lua_getinfo("Sln", ar) then
+// populates the standard debug fields (source, what, currentline, name, ...)
+// which we surface to the host callback as a plain info table.
+static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
+    int saved_top = lua_gettop(host_L);
+
+    /* Locate the host callback ref stored by bridge_set_hook. */
+    lua_pushlightuserdata(guest, (void *)&hook_registry_key);
+    lua_rawget(guest, LUA_REGISTRYINDEX);
+    if (lua_isnil(guest, -1)) {
+        lua_pop(guest, 1);
+        return; /* hook removed between events — no-op */
+    }
+    int fn_ref = (int)lua_tointeger(guest, -1);
+    lua_pop(guest, 1);
+
+    lua_getinfo(guest, "Sln", ar);
+
+    /* Arg 1: event name. */
+    lua_pushstring(host_L, hook_event_name(ar->event));
+
+    /* Arg 2: info table with the standard debug fields. */
+    lua_createtable(host_L, 0, 10);
+    lua_pushstring(host_L, hook_event_name(ar->event));
+    lua_setfield(host_L, -2, "event");
+    if (ar->name)     { lua_pushstring(host_L, ar->name); lua_setfield(host_L, -2, "name"); }
+    if (ar->namewhat) { lua_pushstring(host_L, ar->namewhat); lua_setfield(host_L, -2, "namewhat"); }
+    if (ar->what)     { lua_pushstring(host_L, ar->what); lua_setfield(host_L, -2, "what"); }
+    if (ar->source)   { lua_pushstring(host_L, ar->source); lua_setfield(host_L, -2, "source"); }
+    lua_pushstring(host_L, ar->short_src);
+    lua_setfield(host_L, -2, "short_src");
+    lua_pushinteger(host_L, ar->currentline); lua_setfield(host_L, -2, "currentline");
+    lua_pushinteger(host_L, ar->linedefined); lua_setfield(host_L, -2, "linedefined");
+    lua_pushinteger(host_L, ar->lastlinedefined); lua_setfield(host_L, -2, "lastlinedefined");
+    lua_pushinteger(host_L, ar->nups); lua_setfield(host_L, -2, "nups");
+
+    lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref); /* callback fn */
+    lua_pushvalue(host_L, -3);                      /* event */
+    lua_pushvalue(host_L, -3);                      /* info table */
+
+    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    int status = lua_pcall(host_L, 2, 0, 0);
+    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+
+    if (status != LUA_OK) {
+        /* A hook that raises aborts the running guest code with that error. */
+        const char *err = lua_tostring(host_L, -1);
+        lua_pushstring(guest, err ? err : "bridge: hook error");
+        lua_settop(host_L, saved_top);
+        lua_error(guest);
+        return; /* unreachable: lua_error longjmps */
+    }
+    lua_settop(host_L, saved_top);
+}
+
+// Stores the host callback ref in the guest registry and installs
+// hook_dispatch as the guest's debug hook.
+//
+// LuaJIT only fires debug hooks from the interpreter — code compiled to
+// traces never dispatches through the hook. To make hooks reliable we
+// unpatch any existing traces and disable the JIT engine for as long as the
+// hook is installed; bridge_remove_hook re-enables it.
+static int bridge_set_hook(lua_State *L) {
+    lua_State *guest = decode_guest_ptr(L, 1);
+    int fn_ref       = (int)lua_tointeger(L, 2);
+    int mask         = (int)lua_tointeger(L, 3);
+    int count        = (int)lua_tointeger(L, 4);
+
+    lua_pushlightuserdata(guest, (void *)&hook_registry_key);
+    lua_pushinteger(guest, fn_ref);
+    lua_rawset(guest, LUA_REGISTRYINDEX);
+
+    lua_sethook(guest, hook_dispatch, mask, count);
+    luaJIT_setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_FLUSH); /* unpatch traces */
+    luaJIT_setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);   /* stop compilation */
+    return 0;
+}
+
+// Removes the debug hook, drops the stored callback ref, and re-enables
+// the JIT engine that bridge_set_hook turned off.
+static int bridge_remove_hook(lua_State *L) {
+    lua_State *guest = decode_guest_ptr(L, 1);
+
+    lua_pushlightuserdata(guest, (void *)&hook_registry_key);
+    lua_pushnil(guest);
+    lua_rawset(guest, LUA_REGISTRYINDEX);
+
+    lua_sethook(guest, NULL, 0, 0);
+    luaJIT_setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    return 0;
+}
+
 // Returns the new state as a lightuserdata so no lua_State* cdata crosses
 // the call boundary — safe to call from within a guest callback.
 static int bridge_new_state(lua_State *L) {
@@ -360,6 +480,8 @@ static const luaL_Reg bridge_funcs[] = {
     { "register",        bridge_register       },
     { "push_callback",   bridge_push_callback  },
     { "unregister",      bridge_unregister     },
+    { "set_hook",        bridge_set_hook       },
+    { "remove_hook",     bridge_remove_hook    },
     { "new_state",       bridge_new_state      },
     { "close_state",     bridge_close_state    },
     { NULL, NULL }

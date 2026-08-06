@@ -357,7 +357,12 @@ test.it("debug hook with LUA_MASKCOUNT aborts infinite loop", function()
 	local st = lua.lnewstate()
 	lua.openlibs(st)
 
-	local LUA_MASKCOUNT = 4
+	local LUA_MASKCOUNT = 8
+
+	-- LuaJIT only fires hooks on interpreted code, so disable the JIT engine:
+	-- the infinite loop would otherwise be compiled to a trace and never fire.
+	-- mode 0 == LUAJIT_MODE_ENGINE + LUAJIT_MODE_OFF
+	lua.jit_setmode(st, 0, 0)
 
 	-- Keep the hook callback alive so it's not GC'd
 	local hook = ffi.cast("lua_Hook", function(L, ar)

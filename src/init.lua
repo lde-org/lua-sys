@@ -11,6 +11,18 @@ local LUA_MULTRET       = -1
 local LUA_OK            = 0
 local LUA_YIELD         = 1
 
+local LUA_MASKCALL  = 1
+local LUA_MASKRET   = 2
+local LUA_MASKLINE  = 4
+local LUA_MASKCOUNT = 8
+
+-- LuaJIT JIT mode constants for state:jitOff / state:jitOn / state:jitFlush
+local LUAJIT_MODE_ENGINE = 0
+local LUAJIT_MODE_FUNC   = 2
+local LUAJIT_MODE_OFF    = 0x0000
+local LUAJIT_MODE_ON     = 0x0100
+local LUAJIT_MODE_FLUSH  = 0x0200
+
 local TYPE_NAMES        = {
 	[0] = "nil",
 	[1] = "boolean",
@@ -419,6 +431,7 @@ end
 ---@field _callbacks   table
 ---@field _guest_L_ptr number?
 ---@field _guest_fns   table?
+---@field _hook_ref    integer?
 local State = {}
 State.__index = State
 
@@ -514,8 +527,163 @@ function State:table(init)
 	return tbl
 end
 
+-- ─── JIT control ─────────────────────────────────────────────────────────
+
+-- Shared helper: apply a per-function JIT mode to a guest callable.
+---@param guestState lua.State
+---@param guestRef   integer
+---@param mode       integer
+local function setFuncJitMode(guestState, guestRef, mode)
+	local L = guestState.L
+	if L == nil then error("state is closed", 2) end
+	raw.rawgeti(L, LUA_REGISTRYINDEX, guestRef)
+	raw.jit_setmode(L, -1, LUAJIT_MODE_FUNC + mode)
+	raw.pop(L, 1)
+end
+
+--- Disable the JIT compiler for the guest state, or for a single guest
+--- function when `fn` (a callable obtained from this state) is given.
+--- Returns self for chaining.
+---
+--- Debug hooks only fire on interpreted code, so disabling the JIT is
+--- required for line/count hooks to fire reliably on hot code (note that
+--- state:setHook does this automatically for the whole state while a hook
+--- is installed).
+---@param fn function?
+function State:jitOff(fn)
+	local L = self.L
+	if L == nil then error("state is closed", 2) end
+	if fn == nil then
+		raw.jit_setmode(L, 0, LUAJIT_MODE_ENGINE + LUAJIT_MODE_OFF)
+	else
+		local ref = self._guest_fns and self._guest_fns[fn]
+		if ref == nil then
+			error("jitOff: fn must be a guest callable obtained from this state", 2)
+		end
+		setFuncJitMode(self, ref, LUAJIT_MODE_OFF)
+	end
+	return self
+end
+
+--- Re-enable the JIT compiler for the guest state, or for a single guest
+--- function when `fn` is given. Returns self for chaining.
+---@param fn function?
+function State:jitOn(fn)
+	local L = self.L
+	if L == nil then error("state is closed", 2) end
+	if fn == nil then
+		raw.jit_setmode(L, 0, LUAJIT_MODE_ENGINE + LUAJIT_MODE_ON)
+	else
+		local ref = self._guest_fns and self._guest_fns[fn]
+		if ref == nil then
+			error("jitOn: fn must be a guest callable obtained from this state", 2)
+		end
+		setFuncJitMode(self, ref, LUAJIT_MODE_ON)
+	end
+	return self
+end
+
+--- Flush all compiled traces from the guest state. Useful after disabling
+--- the JIT or before re-enabling it, to drop previously compiled code.
+function State:jitFlush()
+	local L = self.L
+	if L == nil then error("state is closed", 2) end
+	raw.jit_setmode(L, 0, LUAJIT_MODE_ENGINE + LUAJIT_MODE_FLUSH)
+end
+
+-- ─── Debug hooks ──────────────────────────────────────────────────────────
+
+local HOOK_MASK_NAMES = {
+	call        = LUA_MASKCALL,
+	["return"] = LUA_MASKRET,
+	ret         = LUA_MASKRET,
+	line        = LUA_MASKLINE,
+	count       = LUA_MASKCOUNT,
+}
+
+--- Parse a hook mask into LuaJIT's LUA_MASK* bitmask: a space-separated
+--- string of event names ("line", "call return", "count", ...) or a raw
+--- integer bitmask.
+---@param mask string|integer
+---@return integer
+local function parseHookMask(mask)
+	if type(mask) == "number" then return mask end
+	if type(mask) ~= "string" then
+		error("setHook: mask must be a string like \"line\" or an integer bitmask, got " .. type(mask), 3)
+	end
+	local bits = 0
+	for word in mask:gmatch("%S+") do
+		local bit = HOOK_MASK_NAMES[word]
+		if bit == nil then
+			error("setHook: unknown hook event '" .. word .. "' (expected call, return, line, count)", 3)
+		end
+		bits = bits + bit
+	end
+	if bits == 0 then error("setHook: hook mask cannot be empty", 3) end
+	return bits
+end
+
+--- Install or remove a debug hook on the guest state. This is the
+--- high-level counterpart to the raw lua_sethook API — no FFI casting or
+--- raw callback plumbing required.
+---
+--- `fn` is a host Lua function called as `fn(event, info)` for every hook
+--- event, where `event` is one of "call", "return", "line", "count" or
+--- "tailcall" and `info` is a plain table with the standard debug fields:
+---   event, name, namewhat, what, source, short_src, currentline,
+---   linedefined, lastlinedefined, nups
+---
+--- `mask` selects which events fire: a space-separated string of event
+--- names ("line", "call return line", "count", ...) or an integer bitmask
+--- (LUA_MASKCALL=1, LUA_MASKRET=2, LUA_MASKLINE=4, LUA_MASKCOUNT=8).
+---
+--- `count` is the instruction interval for the "count" event (default 1).
+---
+--- LuaJIT only fires hooks on interpreted code, so while a hook is installed
+--- the guest JIT engine is disabled (and existing traces flushed); removing
+--- the hook re-enables it. Use state:jitOff / state:jitOn for explicit
+--- control.
+---
+--- Passing nil removes the hook: `state:setHook(nil)`.
+---
+--- A hook that errors aborts the running guest code with that error
+--- (catchable with pcall around state:eval / chunk:eval), mirroring what
+--- calling lua_error from a raw hook does.
+---@param fn    function|nil
+---@param mask  string|integer
+---@param count integer?
+function State:setHook(fn, mask, count)
+	local L = self.L
+	if L == nil then error("state is closed", 2) end
+
+	-- Drop the previous hook callback (if any) before installing a new one.
+	if self._hook_ref then
+		bridge.unregister(self._hook_ref)
+		self._hook_ref = nil
+	end
+
+	if fn == nil then
+		bridge.remove_hook(tonumber(ffi.cast("intptr_t", L)))
+		return
+	end
+
+	if type(fn) ~= "function" then
+		error("setHook: fn must be a function or nil, got " .. type(fn), 2)
+	end
+
+	local bits = parseHookMask(mask)
+	count = count or 1
+
+	self._hook_ref = bridge.register(fn)
+	bridge.set_hook(tonumber(ffi.cast("intptr_t", L)), self._hook_ref, bits, count)
+end
+
 function State:close()
 	if self.L then
+		if self._hook_ref then
+			bridge.unregister(self._hook_ref)
+			self._hook_ref = nil
+		end
 		for _, cb in ipairs(self._callbacks) do bridge.unregister(cb.id) end
 		bridge.close_state(tonumber(ffi.cast("intptr_t", self.L)))
 		self.L          = nil

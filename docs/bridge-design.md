@@ -82,6 +82,21 @@ local L = ffi.cast("lua_State*", bridge.new_state())
 
 This keeps state creation behind a C boundary regardless of JIT state, matching the design principle that all cross-state operations go through `lua_CFunction` boundaries.
 
+## Debug Hooks
+
+`state:setHook` installs a `lua_Hook` on the guest state that dispatches back to a host function — the same host↔guest pattern as `dispatch_callback`. A `lua_Hook` is a plain C function pointer with no upvalues, so the host callback ref is parked in the guest registry under a private lightuserdata key and looked up on every event:
+
+```
+hook fires (guest interpreter)
+  hook_dispatch (C, lua_Hook)
+    lua_getinfo(guest, "Sln", ar)     ← fill debug fields on the guest
+    push event name + build info table on host_L
+    lua_pcall(host_L, ...)            ← run host callback (JIT engine off, like dispatch_callback)
+    lua_error(guest) on callback error ← aborts guest execution, catchable via pcall
+```
+
+LuaJIT only fires hooks from the interpreter — code compiled to traces never dispatches through the hook (a hot `while true do end` becomes a `LOOP` bytecode that is JIT-compiled, after which count hooks silently stop firing). `bridge_set_hook` therefore flushes existing traces and disables the guest JIT engine for as long as the hook is installed; `bridge_remove_hook` re-enables it. `state:jitoff`/`state:jiton`/`state:jitflush` expose the same `luaJIT_setmode` calls directly for explicit control.
+
 ## Stack Safety Under Re-entrancy
 
 Because host→guest→host chains are supported, `dispatch_callback` can be called while `bound_call` is already executing on the C stack (and thus while `host_L`'s call stack is active). Both functions save and restore `lua_gettop(host_L)` around their work so that nested calls cannot corrupt each other's result slots.

@@ -51,6 +51,36 @@ typedef ptrdiff_t lua_Integer;
 #define LUA_OK      0
 #define LUA_MULTRET (-1)
 
+/* Debug interface (LuaJIT / Lua 5.1 ABI) */
+#define LUA_IDSIZE 60
+
+#define LUA_HOOKCALL   0
+#define LUA_HOOKRET    1
+#define LUA_HOOKLINE   2
+#define LUA_HOOKCOUNT  3
+#define LUA_HOOKTAILCALL 4
+
+#define LUA_MASKCALL  (1 << LUA_HOOKCALL)
+#define LUA_MASKRET   (1 << LUA_HOOKRET)
+#define LUA_MASKLINE  (1 << LUA_HOOKLINE)
+#define LUA_MASKCOUNT (1 << LUA_HOOKCOUNT)
+
+typedef struct lua_Debug {
+  int event;                 /* (hook) */
+  const char *name;          /* (n) */
+  const char *namewhat;      /* (n) */
+  const char *what;          /* (S) */
+  const char *source;        /* (S) */
+  int currentline;           /* (l) */
+  int nups;                  /* (u) */
+  int linedefined;           /* (S) */
+  int lastlinedefined;       /* (S) */
+  char short_src[LUA_IDSIZE];/* (S) */
+  int i_ci;                  /* private part */
+} lua_Debug;
+
+typedef void (*lua_Hook)(lua_State *L, lua_Debug *ar);
+
 /* Convenience macros (matching LuaJIT / Lua 5.1 definitions) */
 #define lua_upvalueindex(i)  (LUA_GLOBALSINDEX - (i))
 #define lua_newtable(L)      lua_createtable(L, 0, 0)
@@ -100,6 +130,12 @@ void lua_rawseti    (lua_State *L, int idx, int n);
 void lua_getfield   (lua_State *L, int idx, const char *k);
 void lua_setfield   (lua_State *L, int idx, const char *k);
 int  lua_objlen     (lua_State *L, int idx);
+void lua_rawget     (lua_State *L, int idx);
+void lua_rawset     (lua_State *L, int idx);
+
+/* ── Debug hooks ── */
+int lua_sethook(lua_State *L, lua_Hook func, int mask, int count);
+int lua_getinfo (lua_State *L, const char *what, lua_Debug *ar);
 
 /* ── Call / error ── */
 int  lua_pcall (lua_State *L, int nargs, int nresults, int errfunc);
@@ -113,11 +149,12 @@ void       lua_close  (lua_State *L);
 #endif /* !_WIN32 */
 
 /* ── JIT control ── */
-/* luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF/ON) */
+/* luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF/ON/FLUSH) */
 #define LUAJIT_MODE_ENGINE  0
 #define LUAJIT_MODE_FUNC    2
 #define LUAJIT_MODE_OFF     0x0000
 #define LUAJIT_MODE_ON      0x0100
+#define LUAJIT_MODE_FLUSH   0x0200
 
 #ifndef _WIN32
 int luaJIT_setmode(lua_State *L, int idx, int mode);

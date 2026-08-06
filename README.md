@@ -141,6 +141,43 @@ print(t:get("greet")("world"))  -- hi world
 
 Closes the guest state and releases all resources. Must be called when the state is no longer needed.
 
+### `state:setHook(fn, mask [, count])`
+
+Installs a debug hook on the guest state — the high-level counterpart to the raw `lua_sethook` API, so you don't need FFI casts or raw callback plumbing. `fn` is a host Lua function called as `fn(event, info)` on each hook event:
+
+- `event` — one of `"call"`, `"return"`, `"line"`, `"count"`, `"tailcall"`
+- `info` — a plain table with the standard debug fields: `event`, `name`, `namewhat`, `what`, `source`, `short_src`, `currentline`, `linedefined`, `lastlinedefined`, `nups`
+
+`mask` selects which events fire: a space-separated string of event names (`"line"`, `"call return"`, `"count"`, ...) or an integer bitmask (`LUA_MASKCALL`=1, `LUA_MASKRET`=2, `LUA_MASKLINE`=4, `LUA_MASKCOUNT`=8). `count` sets the instruction interval for the `"count"` event (default 1).
+
+Passing `nil` removes the hook: `state:setHook(nil)`.
+
+LuaJIT only fires hooks on interpreted code, so while a hook is installed the guest JIT engine is disabled (and existing traces flushed); removing the hook re-enables it. A hook that errors aborts the running guest code with that error (catchable with `pcall` around `state:eval`/`chunk:eval`), which makes count hooks a convenient way to enforce execution timeouts:
+
+```lua
+state:setHook(function(event, info)
+    error("timeout: infinite loop detected")
+end, "count", 1000)
+
+local ok, err = pcall(function()
+    state:eval("while true do end")
+end)
+-- ok == false, err contains "timeout"
+```
+
+### `state:jitOff([fn])` / `state:jitOn([fn])` / `state:jitFlush()`
+
+Disable/re-enable the JIT compiler for the guest state — or for a single guest function when a callable obtained from the state is passed — and drop all compiled traces:
+
+```lua
+state:jitOff()        -- disable JIT for the whole guest state
+state:jitOff(fn)      -- disable JIT for just one guest function
+state:jitOn()         -- re-enable
+state:jitFlush()      -- drop all compiled traces
+```
+
+`state:setHook` manages the engine automatically while a hook is installed, but these methods give you explicit control (e.g. to keep the rest of the state JIT-compiled while tracing one function). `state:jitOff()`/`state:jitOn()` return the state for chaining.
+
 ### `lua.Table:get(key) → value`
 
 Reads a key from the table. Returns primitives as-is, functions as callables, and nested tables as `lua.Table` proxies.
