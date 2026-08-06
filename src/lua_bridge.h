@@ -99,6 +99,7 @@ typedef void (*lua_Hook)(lua_State *L, lua_Debug *ar);
 int   lua_gettop   (lua_State *L);
 void  lua_settop   (lua_State *L, int idx);
 void  lua_pushvalue(lua_State *L, int idx);
+void  lua_insert   (lua_State *L, int idx);
 void  lua_remove   (lua_State *L, int idx);
 void  lua_replace  (lua_State *L, int idx);
 
@@ -125,6 +126,7 @@ void        *lua_touserdata(lua_State *L, int idx);
 
 /* ── Table ── */
 void lua_createtable(lua_State *L, int narr, int nrec);
+int  lua_setmetatable(lua_State *L, int objindex);
 void lua_rawgeti    (lua_State *L, int idx, int n);
 void lua_rawseti    (lua_State *L, int idx, int n);
 void lua_getfield   (lua_State *L, int idx, const char *k);

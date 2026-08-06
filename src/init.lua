@@ -304,6 +304,10 @@ local callGuestSlowRef = bridge.register(callGuestSlow)
 -- which is required to avoid LuaJIT's FFI re-entrancy crash.
 -- See docs/bridge-design.md.
 --
+-- The callable carries a function metatable (attached in C by
+-- bridge.make_callable) providing `fn:pcall(...)`, which runs the guest
+-- call with pcall semantics: `true, ...` on success, `false, err` on error.
+--
 -- When bound_call detects a compound result it calls callGuestSlow directly
 -- from C via upvalue 4, so no Lua wrapper or COMPOUND_TAG check is needed.
 ---@param guestState lua.State
@@ -422,6 +426,38 @@ function Chunk:call(...)
 		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 2)
 	end
 	raw.settop(L, base)
+end
+
+--- Compile and evaluate the chunk with the given arguments, returning
+--- `true, ...` (all results) on success or `false, err` on error instead
+--- of raising on the host side.
+---
+--- Unlike :eval(), a guest error is returned as `false, err`. Compile
+--- (syntax) errors are also caught and returned as `false, err`.
+---@param ... any
+function Chunk:pcall(...)
+	local ok, a, b = pcall(self._compile, self)
+	if not ok then return false, a end
+	local L, fnIndex = a, b
+	local nargs = select("#", ...)
+	local state = self._state
+	for i = 1, nargs do toLua(state, L, (select(i, ...))) end
+	local base = fnIndex - 1
+	local status = raw.pcall(L, nargs, LUA_MULTRET, 0)
+	if status ~= LUA_OK and status ~= LUA_YIELD then
+		local err = raw.tolstring(L, -1)
+		raw.settop(L, base)
+		return false, err
+	end
+	local nresults = raw.gettop(L) - base
+	if nresults == 0 then
+		raw.settop(L, base)
+		return true
+	end
+	local results = {}
+	for i = 1, nresults do results[i] = fromLua(state, L, base + i) end
+	raw.settop(L, base)
+	return true, unpack(results, 1, nresults)
 end
 
 -- ─── State ────────────────────────────────────────────────────────────────

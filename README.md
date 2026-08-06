@@ -105,6 +105,18 @@ Compiles and evaluates the chunk, passing any arguments as `...` inside the gues
 
 Compiles and executes the chunk, discarding any return values. Arguments are passed as `...` inside the guest. Use this for side-effectful scripts where you don't need a result.
 
+#### `chunk:pcall(...) → true, ... | false, err`
+
+Like `:eval()`, but errors are returned instead of raised on the host side. Returns `true` followed by **all** results on success, or `false, err` when the chunk raises a guest error. Compile (syntax) errors are also caught and returned as `false, err`.
+
+```lua
+local ok, a, b = state:load("return ... + 1, ... * 2"):pcall(10)
+-- ok == true, a == 11, b == 20
+
+local ok, err = state:load("error('boom')"):pcall()
+-- ok == false, err == "...boom..."
+```
+
 #### `chunk:setName(name) → lua.Chunk`
 
 Sets the chunk name for debug purposes (visible via `debug.getinfo(1, "S").source`). Prefix with `@` for file paths. Returns self for chaining.
@@ -112,6 +124,24 @@ Sets the chunk name for debug purposes (visible via `debug.getinfo(1, "S").sourc
 #### `chunk(...)`
 
 The `__call` metamethod. Calling a chunk directly is shorthand for `chunk:eval(...)`.
+
+### Guest function callables
+
+Guest functions obtained from the state (e.g. via `state:eval("function(...) ... end")` or `Table:get`) are plain host functions — call them directly with `fn(...)`. Each callable also carries a `pcall` method for protected calls.
+
+#### `fn:pcall(...) → true, ... | false, err`
+
+Calls the guest function with pcall semantics: returns `true` followed by **all** results on success, or `false, err` on error — the guest error is returned instead of being raised on the host side.
+
+```lua
+local fn = state:eval("function(x) return x * 2, x + 1 end")
+local ok, a, b = fn:pcall(21)
+-- ok == true, a == 42, b == 22
+
+local boom = state:eval("function() error('kaboom') end")
+local ok, err = boom:pcall()
+-- ok == false, err == "...kaboom..."
+```
 
 ### `state:globals() → lua.Table`
 

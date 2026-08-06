@@ -36,6 +36,7 @@
     X(int,          lua_gettop,             (lua_State *L)) \
     X(void,         lua_settop,             (lua_State *L, int idx)) \
     X(void,         lua_pushvalue,          (lua_State *L, int idx)) \
+    X(void,         lua_insert,             (lua_State *L, int idx)) \
     X(int,          lua_type,               (lua_State *L, int idx)) \
     X(const char *, lua_typename,           (lua_State *L, int tp)) \
     X(void,         lua_pushnil,            (lua_State *L)) \
@@ -68,6 +69,7 @@
     X(void,         luaL_register,          (lua_State *L, const char *libname, const luaL_Reg *l)) \
     X(void,         lua_rawget,             (lua_State *L, int idx)) \
     X(void,         lua_rawset,             (lua_State *L, int idx)) \
+    X(int,          lua_setmetatable,       (lua_State *L, int objindex)) \
     X(int,          lua_sethook,            (lua_State *L, lua_Hook func, int mask, int count)) \
     X(int,          lua_getinfo,            (lua_State *L, const char *what, lua_Debug *ar))
 
@@ -208,6 +210,38 @@ static int bound_call(lua_State *host) {
     return nresults;
 }
 
+// ── bound_pcall ───────────────────────────────────────────────────────────
+//
+// `fn:pcall(...)` method attached to every bound_call closure via a shared
+// function metatable (built in init_callable_metatable).
+//
+// Runs the same guest call as bound_call but with pcall semantics: returns
+// `true, ...results` on success or `false, err` on error instead of raising a
+// host error. The guest call itself is delegated to the bound_call closure at
+// host stack index 1 (self), so the fast/slow path and compound-result
+// handling are all reused unchanged.
+
+static int bound_pcall(lua_State *host) {
+    /* The method call `fn:pcall(a1, ..., aN)` arrives as [fn, a1..aN] with
+       fn at index 1 — exactly the layout lua_pcall expects (callee at
+       top - nargs). fn is the bound_call closure, so the whole guest call
+       (fast path, slow path, compound results) is reused unchanged. */
+    int nargs = lua_gettop(host) - 1; /* exclude self */
+    int status = lua_pcall(host, nargs, LUA_MULTRET, 0);
+    if (status != LUA_OK) {           /* [err] */
+        lua_pushboolean(host, 0);
+        lua_insert(host, 1);          /* [false, err] */
+        return 2;
+    }
+    int nresults = lua_gettop(host);  /* [r1..rM] */
+    lua_pushboolean(host, 1);
+    lua_insert(host, 1);              /* [true, r1..rM] */
+    return nresults + 1;
+}
+
+// Registry key for the shared callable metatable (built at module open).
+static char callable_mt_key;
+
 static int bridge_make_callable(lua_State *L) {
     // bound_call operates on host_L (it receives L == host_L via the C
     // function convention when called from host_L's Lua code). The closure
@@ -224,8 +258,26 @@ static int bridge_make_callable(lua_State *L) {
     lua_pushvalue(host_L, 2);                     /* upvalue 2: guestRef */
     lua_pushvalue(host_L, 3);                     /* upvalue 3: guestState */
     lua_pushvalue(host_L, 4);                     /* upvalue 4: callGuestSlow ref */
-    lua_pushcclosure(host_L, bound_call, 4);
+    lua_pushcclosure(host_L, bound_call, 4);      /* the callable */
+    lua_pushlightuserdata(host_L, (void *)&callable_mt_key);
+    lua_rawget(host_L, LUA_REGISTRYINDEX);        /* shared fn:pcall() metatable */
+    lua_setmetatable(host_L, -2);
     return 1;
+}
+
+// Build the metatable providing `fn:pcall()` on every bound_call closure and
+// park it in the host registry under a lightuserdata key. Shared by all
+// callables so each closure carries only the metatable reference.
+static void init_callable_metatable(lua_State *L) {
+    lua_createtable(L, 0, 1);         /* mt */
+    lua_createtable(L, 0, 1);         /* methods */
+    lua_pushcclosure(L, bound_pcall, 0);
+    lua_setfield(L, -2, "pcall");     /* methods.pcall = bound_pcall */
+    lua_setfield(L, -2, "__index");   /* mt.__index = methods */
+    lua_pushlightuserdata(L, (void *)&callable_mt_key);
+    lua_pushvalue(L, -2);             /* [mt, key, mt] */
+    lua_rawset(L, LUA_REGISTRYINDEX); /* registry[key] = mt */
+    lua_pop(L, 1);
 }
 
 static int bridge_compound_tag(lua_State *L) {
@@ -493,6 +545,7 @@ int luaopen_lua_sys_bridge(lua_State *L) {
 #endif
     if (!host_L) host_L = L;
     luaL_register(L, "lua-sys.bridge", bridge_funcs);
+    init_callable_metatable(L);
     return 1;
 }
 
