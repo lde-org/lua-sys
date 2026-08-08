@@ -243,6 +243,11 @@ static int bound_pcall(lua_State *host) {
 // Registry key for the shared callable metatable (built at module open).
 static char callable_mt_key;
 
+// Lightuserdata tag prefixing guest table registry refs passed host-side by
+// dispatch_callback's slow path. bridge.compound_tag() returns it so the host
+// can recognise (tag, ref) pairs.
+static char compound_tag_key;
+
 static int bridge_make_callable(lua_State *L) {
     // bound_call operates on host_L (it receives L == host_L via the C
     // function convention when called from host_L's Lua code). The closure
@@ -282,7 +287,7 @@ static void init_callable_metatable(lua_State *L) {
 }
 
 static int bridge_compound_tag(lua_State *L) {
-    lua_pushboolean(L, 0);
+    lua_pushlightuserdata(L, (void *)&compound_tag_key);
     return 1;
 }
 
@@ -290,23 +295,59 @@ static int bridge_compound_tag(lua_State *L) {
 //
 // lua_CFunction installed on the guest state via bridge.push_callback.
 // Upvalue 1: integer — registry ref for the host callback function.
+// Upvalue 2: integer — registry ref for the host slow-path helper
+//            (dispatchCallbackSlow), used when any argument is a table.
 //
 // host_L's stack must be fully restored on every exit path to avoid
 // corrupting nested guest→host→guest→host call chains.
 
 static int dispatch_callback(lua_State *guest) {
-    int fn_ref    = (int)lua_tointeger(guest, lua_upvalueindex(1));
-    int saved_top = lua_gettop(host_L);
-
-    lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
-
-    int nargs = lua_gettop(guest);
+    int fn_ref     = (int)lua_tointeger(guest, lua_upvalueindex(1));
+    int slow_ref   = (int)lua_tointeger(guest, lua_upvalueindex(2));
+    int saved_top  = lua_gettop(host_L);
+    int nargs      = lua_gettop(guest);
     int i;
-    for (i = 1; i <= nargs; i++)
-        push_primitive_or_error(guest, i, host_L);
+
+    /* Fast path: all args are primitives. */
+    int all_primitive = 1;
+    for (i = 1; i <= nargs; i++) {
+        int t = lua_type(guest, i);
+        if (t != LUA_TNIL && t != LUA_TBOOLEAN && t != LUA_TNUMBER && t != LUA_TSTRING) {
+            all_primitive = 0;
+            break;
+        }
+    }
+
+    int n_sent;
+    if (!all_primitive) {
+        /* Slow path: dispatchCallbackSlow(guest, fn, args...) — table args
+         * cross as (TAG, guest_registry_ref) pairs so the Lua side can wrap
+         * them in lua.Table proxies. */
+        lua_rawgeti(host_L, LUA_REGISTRYINDEX, slow_ref);
+        lua_pushlightuserdata(host_L, (void *)guest);
+        lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
+        n_sent = 2;
+        for (i = 1; i <= nargs; i++) {
+            if (lua_type(guest, i) == LUA_TTABLE) {
+                lua_pushvalue(guest, i);
+                int ref = luaL_ref(guest, LUA_REGISTRYINDEX);
+                lua_pushlightuserdata(host_L, (void *)&compound_tag_key);
+                lua_pushinteger(host_L, ref);
+                n_sent += 2;
+            } else {
+                push_primitive_or_error(guest, i, host_L);
+                n_sent += 1;
+            }
+        }
+    } else {
+        lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
+        for (i = 1; i <= nargs; i++)
+            push_primitive_or_error(guest, i, host_L);
+        n_sent = nargs;
+    }
 
     luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
-    int status = lua_pcall(host_L, nargs, LUA_MULTRET, 0);
+    int status = lua_pcall(host_L, n_sent, LUA_MULTRET, 0);
     luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
     if (status != LUA_OK) {
@@ -374,8 +415,10 @@ static int bridge_register(lua_State *L) {
 static int bridge_push_callback(lua_State *L) {
     lua_State *guest = decode_guest_ptr(L, 1);
     int fn_ref       = (int)lua_tointeger(L, 2);
+    int slow_ref     = (int)lua_tointeger(L, 3);
     lua_pushinteger(guest, fn_ref);
-    lua_pushcclosure(guest, dispatch_callback, 1);
+    lua_pushinteger(guest, slow_ref);
+    lua_pushcclosure(guest, dispatch_callback, 2);
     return 0;
 }
 

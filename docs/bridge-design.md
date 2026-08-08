@@ -127,6 +127,10 @@ Instead, compound values are kept in their home state and accessed through `LUA_
 
 The only exception is strings: LuaJIT interns strings, and `lua_tolstring` returns a C `const char*` that remains valid until the string is collected. Since we immediately `lua_pushlstring` into the destination state (which copies the bytes), this is safe.
 
+## Guest → Host Table Arguments
+
+`dispatch_callback` mirrors `bound_call`'s fast/slow split. When all arguments are primitives it copies them directly (fast path). If any argument is a table, it switches to a slow path: each table argument crosses as a `(tag, ref)` pair — a lightuserdata tag (`bridge.compound_tag()`) followed by a `LUA_REGISTRYINDEX` ref taken in the guest. The host-side `dispatchCallbackSlow` helper (registered once, carried in the closure's upvalue 2) converts the pairs back into `lua.Table` proxies — looking up the owning `lua.State` from a lightuserdata-keyed map populated by `lua.new()` — and calls the real callback with the original argument order and nil slots preserved. The proxies are live views: reads/writes go straight to the guest table, and the guest ref is released when the proxy is GC'd. Other compound argument types (functions, userdata, threads) still raise the "cannot pass" error, and host→guest return values remain primitive-only.
+
 ## Performance Notes
 
 All cross-state transitions pay at minimum the cost of `lua_rawgeti` + `lua_pcall` on the destination state (~18 ns on a modern CPU). The C bridge adds per-call overhead for:

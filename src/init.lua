@@ -37,6 +37,15 @@ local TYPE_NAMES        = {
 
 -- forward declarations: fromLua, toLua and makeCallable are mutually recursive
 local fromLua, toLua, makeCallable
+local dispatchCallbackSlowRef
+
+-- Guest lua_State* (as lightuserdata) → lua.State wrapper. dispatch_callback's
+-- slow path uses this to build lua.Table proxies for guest-passed tables.
+local guestStates = {}
+
+-- Lightuserdata tag prefixing (tag, guest_registry_ref) pairs that
+-- dispatch_callback passes host-side for table arguments.
+local COMPOUND_TAG = bridge.compound_tag()
 
 local function isGuestValue(v)
 	if type(v) ~= "table" then return false end
@@ -247,7 +256,7 @@ toLua = function(guestState, L, value)
 			-- triggering LuaJIT's FFI re-entrancy crash (see docs/bridge-design.md).
 			local callbackId = bridge.register(value)
 			table.insert(guestState._callbacks, { id = callbackId, fn = value })
-			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId)
+			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId, dispatchCallbackSlowRef)
 		end
 	elseif valueType == "table" then
 		-- Plain host table → auto-coerce to a guest table via state:table().
@@ -296,6 +305,41 @@ end
 -- Registry ref for callGuestSlow, stored once and baked into every bound_call
 -- closure as upvalue 4. Allows C to invoke the slow path without a Lua wrapper.
 local callGuestSlowRef = bridge.register(callGuestSlow)
+
+-- Slow path for guest → host callback dispatch (dispatch_callback upvalue 2):
+-- converts guest-passed table arguments (received as (tag, ref) pairs) into
+-- lua.Table proxies and calls the real host callback, preserving argument
+-- order and nil slots. Called by C only when at least one argument is a table.
+---@param guestPtr lightuserdata
+---@param fn        function
+local function dispatchCallbackSlow(guestPtr, fn, ...)
+	local guestState = guestStates[guestPtr]
+	if guestState == nil then
+		error("bridge: guest state is closed or unknown", 2)
+	end
+	local n    = select("#", ...)
+	local real = {}
+	local k    = 0
+	local i    = 1
+	while i <= n do
+		local v = select(i, ...)
+		if v == COMPOUND_TAG then
+			k = k + 1
+			real[k] = Table._new(guestState, select(i + 1, ...))
+			i = i + 2
+		else
+			k = k + 1
+			real[k] = v
+			i = i + 1
+		end
+	end
+	-- unpack with explicit bounds preserves nil holes, so nil args are kept
+	return fn(unpack(real, 1, k))
+end
+
+-- Registry ref for dispatchCallbackSlow, baked into every dispatch_callback
+-- closure as upvalue 2 (alongside the callback's own ref).
+dispatchCallbackSlowRef = bridge.register(dispatchCallbackSlow)
 
 -- Returns a host-callable function backed by a guest registry ref.
 --
@@ -468,6 +512,7 @@ end
 ---@field _guest_L_ptr number?
 ---@field _guest_fns   table?
 ---@field _hook_ref    integer?
+---@field _guest_light lightuserdata?
 local State = {}
 State.__index = State
 
@@ -762,6 +807,7 @@ function State:close()
 		end
 		for _, cb in ipairs(self._callbacks) do bridge.unregister(cb.id) end
 		bridge.close_state(tonumber(ffi.cast("intptr_t", self.L)))
+		guestStates[self._guest_light] = nil
 		self.L          = nil
 		self._callbacks = {}
 	end
@@ -782,8 +828,11 @@ function lua.new()
 	-- context — including from within a host callback triggered by guest code —
 	-- because no FFI cdata argument is involved at the call boundary.
 	-- We cast to lua_State* cdata here, on host_L outside any guest execution.
-	local L = ffi.cast("lua_State*", bridge.new_state())
-	return setmetatable({ L = L, _callbacks = {} }, State)
+	local light = bridge.new_state()
+	local L     = ffi.cast("lua_State*", light)
+	local state = setmetatable({ L = L, _callbacks = {}, _guest_light = light }, State)
+	guestStates[light] = state
+	return state
 end
 
 return lua

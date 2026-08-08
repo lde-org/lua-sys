@@ -758,6 +758,111 @@ test.it("host callback NOT returning a table still works fine", function()
 	state:close()
 end)
 
+-- ─── Guest → host table arguments ─────────────────────────────────────────
+
+test.it("host callback receives a guest table as a lua.Table", function()
+	local state = lua.new()
+	local g = state:globals()
+	local received = nil
+
+	g:set("inspect", function(t)
+		received = t
+		return type(t)
+	end)
+
+	local result = state:eval("return inspect({ a = 1, b = 'two' })")
+	test.equal("table", result)          -- host fn sees a table
+	test.equal(1, received.a)            -- lua.Table proxies reads
+	test.equal("two", received.b)
+	test.equal(1, received:get("a"))     -- explicit get() works too
+	test.equal("table", received:type())
+
+	state:close()
+end)
+
+test.it("host can mutate a guest-passed table and the guest sees it", function()
+	local state = lua.new()
+	local g = state:globals()
+
+	g:set("mutate", function(t)
+		t.answer = 42
+		t.n = (t.n or 0) + 1
+	end)
+
+	local result = state:eval([[
+		local t = { n = 10 }
+		mutate(t)
+		return t.answer + t.n
+	]])
+	test.equal(53, result)  -- 42 + (10 + 1)
+
+	state:close()
+end)
+
+test.it("guest tables arrive as live views, not copies", function()
+	local state = lua.new()
+	local g = state:globals()
+	local captured = nil
+
+	g:set("grab", function(t) captured = t end)
+
+	state:eval([[
+		local t = { v = 1 }
+		grab(t)
+		t.v = 2
+	]])
+	test.equal(2, captured.v)
+
+	state:close()
+end)
+
+test.it("mixed primitive and table args arrive in order", function()
+	local state = lua.new()
+	local g = state:globals()
+	local seen = nil
+
+	g:set("mix", function(a, t1, b, t2)
+		seen = { a, t1, b, t2 }
+	end)
+
+	state:eval("mix(1, { x = 2 }, 'three', { y = 4 })")
+
+	test.equal(1, seen[1])
+	test.equal(2, seen[2].x)
+	test.equal("three", seen[3])
+	test.equal(4, seen[4].y)
+
+	state:close()
+end)
+
+test.it("nested guest tables arrive as nested lua.Table values", function()
+	local state = lua.new()
+	local g = state:globals()
+	local received = nil
+
+	g:set("peek", function(t) received = t end)
+
+	state:eval("peek({ inner = { deep = 99 } })")
+
+	test.equal(99, received.inner.deep)
+
+	state:close()
+end)
+
+test.it("host callbacks receive tables repeatedly without corruption", function()
+	local state = lua.new()
+	local g = state:globals()
+	local total = 0
+
+	g:set("add_n", function(t) total = total + (t.n or 0) end)
+
+	state:eval("add_n({ n = 1 }) add_n({ n = 2 }) add_n({ n = 3 })")
+
+	test.equal(6, total)
+
+	state:close()
+end)
+
 -- ─── state:load with chunk name ───────────────────────────────────────────
 --
 -- state:load currently uses luaL_loadstring which does not accept a chunk name.
