@@ -151,6 +151,68 @@ test.it("chunk:pcall catches syntax errors instead of raising", function()
 	state:close()
 end)
 
+test.it("chunk:xpcall returns a stack traceback on guest errors", function()
+	local state = lua.new()
+	local ok, err = state:load("error('chunk boom')"):xpcall()
+	test.equal(false, ok)
+	test.equal("string", type(err))
+	test.includes(err, "chunk boom")
+	test.includes(err, "stack traceback")
+	state:close()
+end)
+
+test.it("chunk:xpcall traceback includes the failing frames", function()
+	local state = lua.new()
+	local ok, err = state:load([[
+		local function inner()
+			error("deep failure")
+		end
+		local function outer()
+			inner()
+		end
+		outer()
+	]]):xpcall()
+	test.equal(false, ok)
+	test.includes(err, "deep failure")
+	-- frame names from the traceback, not the bare message
+	test.includes(err, "inner")
+	test.includes(err, "outer")
+	state:close()
+end)
+
+test.it("chunk:xpcall success behaves like pcall", function()
+	local state = lua.new()
+	local ok, a, b = state:load("return 1, 'two'"):xpcall()
+	test.equal(true, ok)
+	test.equal(1, a)
+	test.equal("two", b)
+	state:close()
+end)
+
+test.it("chunk:xpcall passes arguments and keeps nil slots", function()
+	local state = lua.new()
+	local ok, n = state:load("local a, b = ...; return a, b"):xpcall(7, nil)
+	test.equal(true, ok)
+	test.equal(7, n)
+	state:close()
+end)
+
+test.it("chunk:pcall stays bare while chunk:xpcall adds the traceback", function()
+	local state = lua.new()
+	local chunk = state:load("error('kaboom')")
+
+	local pok, perr = chunk:pcall()
+	test.equal(false, pok)
+	test.equal("kaboom", perr)             -- bare message
+	test.falsy(string.find(perr, "stack traceback", 1, true))
+
+	local xok, xerr = chunk:xpcall()
+	test.equal(false, xok)
+	test.includes(xerr, "kaboom")
+	test.includes(xerr, "stack traceback")
+	state:close()
+end)
+
 test.it("chunk:pcall passes arguments as ... inside the guest", function()
 	local state = lua.new()
 	local ok, sum = state:load("return ..."):pcall(3, 4)

@@ -472,7 +472,7 @@ function Chunk:call(...)
 	raw.settop(L, base)
 end
 
---- Compile and evaluate the chunk with the given arguments, returning
+--- Compile and execute the chunk with the given arguments, returning
 --- `true, ...` (all results) on success or `false, err` on error instead
 --- of raising on the host side.
 ---
@@ -480,27 +480,67 @@ end
 --- (syntax) errors are also caught and returned as `false, err`.
 ---@param ... any
 function Chunk:pcall(...)
-	local ok, a, b = pcall(self._compile, self)
+	return Chunk._pcall(self, false, ...)
+end
+
+--- Like :pcall(), but the error string on failure includes a stack
+--- traceback of the guest stack at the point of failure (the guest
+--- debug.traceback is installed as pcall's error handler, so the frames
+--- are captured before unwinding). Use this when reporting program errors
+--- without wrapping the program in a guest-side xpcall launcher.
+---@param ... any
+function Chunk:xpcall(...)
+	return Chunk._pcall(self, true, ...)
+end
+
+-- Shared implementation of pcall / xpcall.
+---@param chunk          lua.Chunk
+---@param withTraceback  boolean
+function Chunk._pcall(chunk, withTraceback, ...)
+	local ok, a, b = pcall(chunk._compile, chunk)
 	if not ok then return false, a end
 	local L, fnIndex = a, b
-	local nargs = select("#", ...)
-	local state = self._state
-	for i = 1, nargs do toLua(state, L, (select(i, ...))) end
 	local base = fnIndex - 1
-	local status = raw.pcall(L, nargs, LUA_MULTRET, 0)
+
+	-- Install debug.traceback below the function as pcall's error handler so
+	-- the traceback is captured while the guest stack is still intact.
+	-- lua_pcall treats errfunc == 0 as "no handler", so it must point at the
+	-- traceback slot (base + 1 after the insert), never at a zero index.
+	local errfunc   = 0
+	local installed = false
+	if withTraceback then
+		raw.getglobal(L, "debug")
+		raw.getfield(L, -1, "traceback")
+		raw.remove(L, -2)
+		if raw.type(L, -1) == 6 then -- LUA_TFUNCTION
+			raw.insert(L, -2) -- [..base..][traceback][fn]
+			errfunc   = base + 1
+			installed = true
+		else
+			raw.pop(L, 1) -- guest debug library unavailable — bare message
+		end
+	end
+
+	local nargs = select("#", ...)
+	local state = chunk._state
+	for i = 1, nargs do toLua(state, L, (select(i, ...))) end
+
+	local status = raw.pcall(L, nargs, LUA_MULTRET, errfunc)
+	local restore    = base
+	local resultBase = base + (installed and 1 or 0) -- results sit above the traceback
 	if status ~= LUA_OK and status ~= LUA_YIELD then
 		local err = raw.tolstring(L, -1)
-		raw.settop(L, base)
+		raw.settop(L, restore)
 		return false, err
 	end
-	local nresults = raw.gettop(L) - base
+	local nresults = raw.gettop(L) - resultBase
 	if nresults == 0 then
-		raw.settop(L, base)
+		raw.settop(L, restore)
 		return true
 	end
 	local results = {}
-	for i = 1, nresults do results[i] = fromLua(state, L, base + i) end
-	raw.settop(L, base)
+	for i = 1, nresults do results[i] = fromLua(state, L, resultBase + i) end
+	raw.settop(L, restore)
 	return true, unpack(results, 1, nresults)
 end
 
