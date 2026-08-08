@@ -430,7 +430,7 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     lua_pushstring(host_L, hook_event_name(ar->event));
 
     /* Arg 2: info table with the standard debug fields. */
-    lua_createtable(host_L, 0, 10);
+    lua_createtable(host_L, 0, 11);
     lua_pushstring(host_L, hook_event_name(ar->event));
     lua_setfield(host_L, -2, "event");
     if (ar->name)     { lua_pushstring(host_L, ar->name); lua_setfield(host_L, -2, "name"); }
@@ -443,6 +443,14 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     lua_pushinteger(host_L, ar->linedefined); lua_setfield(host_L, -2, "linedefined");
     lua_pushinteger(host_L, ar->lastlinedefined); lua_setfield(host_L, -2, "lastlinedefined");
     lua_pushinteger(host_L, ar->nups); lua_setfield(host_L, -2, "nups");
+
+    /* The thread the hook fired on — the guest main thread, or a coroutine
+     * running inside it. Host code casts it back with
+     * ffi.cast("lua_State*", info.thread) to walk that thread's stack with
+     * lua_getstack / lua_getinfo / lua_getlocal (needed for correct stack
+     * traces and locals when the hook fires inside a coroutine). */
+    lua_pushlightuserdata(host_L, (void *)guest);
+    lua_setfield(host_L, -2, "thread");
 
     lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref); /* callback fn */
     lua_pushvalue(host_L, -3);                      /* event */

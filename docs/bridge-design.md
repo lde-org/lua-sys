@@ -90,10 +90,12 @@ This keeps state creation behind a C boundary regardless of JIT state, matching 
 hook fires (guest interpreter)
   hook_dispatch (C, lua_Hook)
     lua_getinfo(guest, "Sln", ar)     ← fill debug fields on the guest
-    push event name + build info table on host_L
+    push event name + build info table on host_L (info.thread = guest lua_State*)
     lua_pcall(host_L, ...)            ← run host callback (JIT engine off, like dispatch_callback)
     lua_error(guest) on callback error ← aborts guest execution, catchable via pcall
 ```
+
+The hook's `guest` argument is the *thread* the event fired on — the guest main thread, or a coroutine running inside it. `hook_dispatch` exposes it to the host callback as `info.thread` (a lightuserdata of the `lua_State*`). Host code casts it back with `ffi.cast("lua_State*", info.thread)` and can then call `lua_getstack` / `lua_getinfo` / `lua_getlocal` on the triggering thread to build stack traces or read locals — which would be wrong if done on the main thread while a coroutine is running.
 
 LuaJIT only fires hooks from the interpreter — code compiled to traces never dispatches through the hook (a hot `while true do end` becomes a `LOOP` bytecode that is JIT-compiled, after which count hooks silently stop firing). `bridge_set_hook` therefore flushes existing traces and disables the guest JIT engine for as long as the hook is installed; `bridge_remove_hook` re-enables it. `state:jitoff`/`state:jiton`/`state:jitflush` expose the same `luaJIT_setmode` calls directly for explicit control.
 

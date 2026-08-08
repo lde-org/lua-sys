@@ -1424,6 +1424,101 @@ test.it("hook can be installed, removed, and reinstalled", function()
 	state:close()
 end)
 
+test.it("setHook exposes the triggering thread as info.thread", function()
+	local ffi = require("ffi")
+
+	local state = lua.new()
+	local main  = state.L
+	local threads = {}
+	local stackOK = 0
+	local infoOK  = 0
+
+	state:setHook(function(event, info)
+		threads[#threads + 1] = info.thread
+
+		-- Cast the lightuserdata back to lua_State* and walk level 0 of
+		-- the triggering thread's stack from inside the hook.
+		if info.thread ~= nil then
+			local L = ffi.cast("lua_State*", info.thread)
+			local ar = ffi.new("lua_Debug")
+			if ffi.C.lua_getstack(L, 0, ar) ~= 0 then
+				stackOK = stackOK + 1
+				if ffi.C.lua_getinfo(L, "Sln", ar) ~= 0 then
+					infoOK = infoOK + 1
+				end
+			end
+		end
+	end, "line")
+
+	state:eval("local x = 1")
+
+	test.truthy(#threads > 0, "expected at least one line event")
+	for i = 1, #threads do
+		test.equal("userdata", type(threads[i]))
+		local L = ffi.cast("lua_State*", threads[i])
+		test.truthy(L == main, "expected the hook to fire on the guest main thread")
+	end
+	test.equal(#threads, stackOK)
+	test.equal(#threads, infoOK)
+
+	state:close()
+end)
+
+test.it("setHook info.thread lets the host read the coroutine's stack and locals", function()
+	local ffi = require("ffi")
+
+	local state = lua.new()
+	local main  = state.L
+
+	local mainEvents = 0
+	local coroEvents = 0
+	local coroLocals = {}   -- frame locals captured on the coroutine thread
+
+	state:setHook(function(event, info)
+		if info.thread == nil then return end
+
+		local L = ffi.cast("lua_State*", info.thread)
+		if L == main then
+			mainEvents = mainEvents + 1
+			return
+		end
+
+		-- The hook fired inside a coroutine: walk ITS stack (not the main
+		-- thread's) to read the running frame's locals via lua_getlocal.
+		coroEvents = coroEvents + 1
+
+		local ar = ffi.new("lua_Debug")
+		if ffi.C.lua_getstack(L, 0, ar) ~= 0 then
+			ffi.C.lua_getinfo(L, "Sln", ar)
+			for n = 1, 64 do
+				local name = ffi.C.lua_getlocal(L, ar, n)
+				if name == nil then break end
+				local value = ffi.C.lua_tointeger(L, -1)
+				ffi.C.lua_settop(L, -2)   -- pop the pushed local value
+				coroLocals[ffi.string(name)] = value
+			end
+		end
+	end, "line")
+
+	state:eval([[
+		coroutine.wrap(function()
+			local marker = 12345
+			local n = 0
+			for i = 1, 3 do
+				n = n + marker + i
+			end
+			return n
+		end)()
+	]])
+
+	test.truthy(mainEvents > 0, "expected line events on the main thread")
+	test.truthy(coroEvents > 0, "expected line events inside the coroutine")
+	test.equal(12345, coroLocals.marker)
+	test.truthy(coroLocals.n ~= nil, "expected the loop accumulator local as well")
+
+	state:close()
+end)
+
 -- ─── JIT control ─────────────────────────────────────────────────────────
 
 test.it("setHook disables the JIT while installed and re-enables on removal", function()

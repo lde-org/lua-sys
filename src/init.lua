@@ -669,6 +669,12 @@ end
 ---   event, name, namewhat, what, source, short_src, currentline,
 ---   linedefined, lastlinedefined, nups
 ---
+--- `info.thread` additionally holds the lua_State* the hook fired on as a
+--- lightuserdata — the guest main thread, or a coroutine thread running
+--- inside it. Cast it back with ffi.cast("lua_State*", info.thread) to walk
+--- that thread's stack with lua_getstack / lua_getinfo / lua_getlocal
+--- (needed for correct stack traces and locals inside coroutines).
+---
 --- `mask` selects which events fire: a space-separated string of event
 --- names ("line", "call return line", "count", ...) or an integer bitmask
 --- (LUA_MASKCALL=1, LUA_MASKRET=2, LUA_MASKLINE=4, LUA_MASKCOUNT=8).
