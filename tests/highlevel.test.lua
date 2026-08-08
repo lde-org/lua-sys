@@ -1819,6 +1819,249 @@ test.it("hook info fields stay readable but stack() refuses after the callback r
 	state:close()
 end)
 
+-- ─── Frames: locals, upvalues, eval ──────────────────────────────────────
+
+test.it("info:stack() returns lua.Frame objects with methods", function()
+	local state = lua.new()
+	local frames = nil
+
+	state:setHook(function(event, info)
+		if frames == nil then frames = info:stack() end
+	end, "line")
+
+	state:eval("local x = 1")
+
+	test.truthy(frames and #frames >= 1, "expected at least one frame")
+	local f0 = frames[1]
+	test.equal("function", type(f0.locals))
+	test.equal("function", type(f0.getLocal))
+	test.equal("function", type(f0.setLocal))
+	test.equal("function", type(f0.getUpvalue))
+	test.equal("function", type(f0.eval))
+	test.equal(0, f0.level)
+	test.truthy(f0.thread)
+
+	state:close()
+end)
+
+test.it("frame:locals() lists the coroutine frame's locals with values", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local found = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and found == nil then
+			local byName = {}
+			for _, l in ipairs(info:stack()[1]:locals()) do byName[l.name] = l.value end
+			if byName.marker == 12345 and byName.n ~= nil then found = byName end
+		end
+	end, "line")
+
+	state:eval([[
+		coroutine.wrap(function()
+			local marker = 12345
+			local n = 0
+			for i = 1, 3 do
+				n = n + marker + i
+			end
+		end)()
+	]])
+
+	test.truthy(found, "expected a frame with marker/n live")
+	test.equal(12345, found.marker)
+
+	state:close()
+end)
+
+test.it("frame:getLocal / frame:setLocal read and write locals", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local values = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and values == nil then
+			local fr = info:stack()[1]
+			if fr:getLocal("marker") ~= nil then
+				values = {
+					before = fr:getLocal("marker"),
+					set    = fr:setLocal("marker", 777),
+					after  = fr:getLocal("marker"),
+				}
+			end
+		end
+	end, "line")
+
+	local result = state:eval([[
+		coroutine.wrap(function()
+			local marker = 12345
+			local n = marker + 1
+			return marker
+		end)()
+	]])
+
+	test.truthy(values, "expected to find the frame")
+	test.equal(12345, values.before)
+	test.equal(true, values.set)
+	test.equal(777, values.after)
+	test.equal(777, result)  -- the guest returned the modified value
+
+	state:close()
+end)
+
+test.it("frame:upvalues() and getUpvalue/setUpvalue read and write upvalues", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local values = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and values == nil then
+			local fr = info:stack()[1]
+			if fr:getUpvalue("captured") ~= nil then
+				values = {
+					before = fr:getUpvalue("captured"),
+					set    = fr:setUpvalue("captured", 111),
+					after  = fr:getUpvalue("captured"),
+				}
+			end
+		end
+	end, "line")
+
+	local result = state:eval([[
+		local captured = 99
+		local function worker()
+			local x = captured + 1
+		end
+		coroutine.wrap(function()
+			worker()
+		end)()
+		return captured
+	]])
+
+	test.truthy(values, "expected to find the worker frame")
+	test.equal(99, values.before)
+	test.equal(true, values.set)
+	test.equal(111, values.after)
+	test.equal(111, result)  -- the upvalue cell change is visible to the guest
+
+	state:close()
+end)
+
+test.it("frame:eval reads locals and globals in the frame's context", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local results = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and results == nil then
+			local fr = info:stack()[1]
+			if fr:getLocal("marker") ~= nil then
+				results = {
+					arith    = { fr:eval("marker + 1") },
+					global   = { fr:eval("math.abs(-7)") },
+					fallback = { fr:eval("local t = 1; return t") },
+				}
+			end
+		end
+	end, "line")
+
+	state:eval([[
+		coroutine.wrap(function()
+			local marker = 12345
+			local n = marker + 1
+		end)()
+	]])
+
+	test.truthy(results, "expected to find the frame")
+	test.equal(true, results.arith[1])
+	test.equal(12346, results.arith[2])
+	test.equal(true, results.global[1])
+	test.equal(7, results.global[2])
+	test.equal(true, results.fallback[1])
+	test.equal(1, results.fallback[2])
+
+	state:close()
+end)
+
+test.it("frame:eval assignments persist into the running program", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local evaled = false
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and not evaled then
+			local fr = info:stack()[1]
+			if fr:getLocal("marker") ~= nil then
+				fr:eval("marker = 555")
+				evaled = true
+			end
+		end
+	end, "line")
+
+	local result = state:eval([[
+		coroutine.wrap(function()
+			local marker = 12345
+			local n = marker + 1
+			return marker
+		end)()
+	]])
+	test.equal(555, result)
+
+	state:close()
+end)
+
+test.it("frame:eval returns false, err on guest error", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local err = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and err == nil then
+			local fr = info:stack()[1]
+			if fr:getLocal("marker") ~= nil then
+				local ok, e = fr:eval("error('eval boom')")
+				if not ok then err = e end
+			end
+		end
+	end, "line")
+
+	state:eval([[
+		coroutine.wrap(function()
+			local marker = 1
+		end)()
+	]])
+
+	test.truthy(err, "expected the eval to error")
+	test.includes(err, "eval boom")
+
+	state:close()
+end)
+
+test.it("frame methods degrade gracefully after the hook returns", function()
+	local state = lua.new()
+	local stored = nil
+
+	state:setHook(function(event, info)
+		if stored == nil then stored = info:stack()[1] end
+	end, "line")
+
+	state:eval("local x = 1")
+
+	-- The thread has moved on: reads must not crash, just return empty/nil
+	test.equal(0, #stored:locals())
+	test.equal(nil, stored:getLocal("x"))
+	local ok, e = stored:eval("x")
+	test.equal(false, ok)
+	test.includes(e, "no frame")
+
+	state:close()
+end)
+
 -- ─── JIT control ─────────────────────────────────────────────────────────
 
 test.it("setHook disables the JIT while installed and re-enables on removal", function()

@@ -440,6 +440,11 @@ static int bridge_unregister(lua_State *L) {
 static char hook_registry_key;
 static char hook_meta_key;
 
+/* Host-side lua.Frame class, registered via bridge.set_frame_meta; applied as
+ * the metatable of every frame returned by info:stack() so Frame methods
+ * (locals, getLocal, setLocal, eval, ...) resolve through __index. */
+static int frame_meta_ref = LUA_NOREF;
+
 static int hook_info_stack(lua_State *L);
 static int hook_info_index(lua_State *L);
 
@@ -533,9 +538,10 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
 }
 
 // info:stack() — walk the stack of the thread the hook fired on (level 0 =
-// the frame the hook fired in), returning an array of frame tables, each
-// with the same debug fields as the info table. Must be called from within
-// the hook callback while the thread is still paused at the hook.
+// the frame the hook fired in), returning an array of lua.Frame objects,
+// each with the debug fields plus thread/level and the Frame metatable so
+// the host can read/write locals and upvalues and eval in the frame. Must
+// be called from within the hook callback while the thread is paused.
 static int hook_info_stack(lua_State *L) {
     /* Refuse once the hook has returned (thread may have moved on). */
     lua_pushstring(L, "_hook_active");
@@ -560,7 +566,7 @@ static int hook_info_stack(lua_State *L) {
         lua_Debug ar;
         if (!lua_getstack(guest, level, &ar)) break;
         lua_getinfo(guest, "Slnu", &ar);
-        lua_createtable(L, 0, 10);
+        lua_createtable(L, 0, 12);
         if (ar.name)     { lua_pushstring(L, ar.name);     lua_setfield(L, -2, "name"); }
         if (ar.namewhat) { lua_pushstring(L, ar.namewhat); lua_setfield(L, -2, "namewhat"); }
         if (ar.what)     { lua_pushstring(L, ar.what);     lua_setfield(L, -2, "what"); }
@@ -570,6 +576,16 @@ static int hook_info_stack(lua_State *L) {
         lua_pushinteger(L, ar.linedefined);     lua_setfield(L, -2, "linedefined");
         lua_pushinteger(L, ar.lastlinedefined); lua_setfield(L, -2, "lastlinedefined");
         lua_pushinteger(L, ar.nups);            lua_setfield(L, -2, "nups");
+        lua_pushlightuserdata(L, (void *)guest);
+        lua_setfield(L, -2, "thread");
+        lua_pushinteger(L, level);
+        lua_setfield(L, -2, "level");
+        /* Attach the host-side lua.Frame class (registered via
+         * bridge.set_frame_meta) so Frame methods resolve via __index. */
+        if (frame_meta_ref != LUA_NOREF) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, frame_meta_ref);
+            lua_setmetatable(L, -2);
+        }
         lua_rawseti(L, -2, level + 1);
         level++;
     }
@@ -638,6 +654,18 @@ static int bridge_remove_hook(lua_State *L) {
     return 0;
 }
 
+// Stores the host-side lua.Frame class table as the metatable for frames
+// returned by info:stack(), so Frame methods resolve via __index. Called by
+// init.lua at module load, before any hook can fire.
+static int bridge_set_frame_meta(lua_State *L) {
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (frame_meta_ref != LUA_NOREF)
+        luaL_unref(host_L, LUA_REGISTRYINDEX, frame_meta_ref);
+    lua_pushvalue(L, 1);
+    frame_meta_ref = luaL_ref(host_L, LUA_REGISTRYINDEX);
+    return 0;
+}
+
 // Returns the new state as a lightuserdata so no lua_State* cdata crosses
 // the call boundary — safe to call from within a guest callback.
 static int bridge_new_state(lua_State *L) {
@@ -672,6 +700,7 @@ static const luaL_Reg bridge_funcs[] = {
     { "unregister",      bridge_unregister     },
     { "set_hook",        bridge_set_hook       },
     { "remove_hook",     bridge_remove_hook    },
+    { "set_frame_meta",  bridge_set_frame_meta },
     { "new_state",       bridge_new_state      },
     { "close_state",     bridge_close_state    },
     { NULL, NULL }

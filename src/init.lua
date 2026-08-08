@@ -43,6 +43,28 @@ local dispatchCallbackSlowRef
 -- slow path uses this to build lua.Table proxies for guest-passed tables.
 local guestStates = {}
 
+-- id → lua.State, for resolving coroutine threads: the guest registry (keyed
+-- by GUEST_ID_KEY) is shared by all threads of a state, so any thread — main
+-- or coroutine — can be mapped back to its lua.State wrapper.
+local guestById   = {}
+local nextGuestId = 1
+local GUEST_ID_KEY = ffi.new("char[1]")
+
+--- Resolve a guest thread (main or coroutine) to its lua.State wrapper.
+---@param thread lua.raw.State|lightuserdata
+---@return lua.State?
+local function resolveGuestState(thread)
+	local state = guestStates[thread]
+	if state then return state end
+	-- Coroutine thread: fall back to the registry marker, which every thread
+	-- of the same guest state shares.
+	ffi.C.lua_pushlightuserdata(thread, GUEST_ID_KEY)
+	ffi.C.lua_rawget(thread, LUA_REGISTRYINDEX)
+	local id = tonumber(ffi.C.lua_tointeger(thread, -1)) -- int64 cdata → Lua number key
+	ffi.C.lua_settop(thread, -2)
+	return guestById[id]
+end
+
 -- Lightuserdata tag prefixing (tag, guest_registry_ref) pairs that
 -- dispatch_callback passes host-side for table arguments.
 local COMPOUND_TAG = bridge.compound_tag()
@@ -313,7 +335,7 @@ local callGuestSlowRef = bridge.register(callGuestSlow)
 ---@param guestPtr lightuserdata
 ---@param fn        function
 local function dispatchCallbackSlow(guestPtr, fn, ...)
-	local guestState = guestStates[guestPtr]
+	local guestState = resolveGuestState(guestPtr)
 	if guestState == nil then
 		error("bridge: guest state is closed or unknown", 2)
 	end
@@ -553,6 +575,7 @@ end
 ---@field _guest_fns   table?
 ---@field _hook_ref    integer?
 ---@field _guest_light lightuserdata?
+---@field _guest_id    integer?
 local State = {}
 State.__index = State
 
@@ -714,17 +737,28 @@ end
 
 -- ─── Debug hooks ──────────────────────────────────────────────────────────
 
---- A single frame of a hook stack trace (`info:stack()`).
----@class lua.HookFrame
----@field name             string? -- function name, when derivable
----@field namewhat         string? -- "global", "local", "method", ...
----@field what             string? -- "Lua", "main" or "C"
----@field source           string? -- chunk source of the frame
----@field short_src        string  -- shortened source name
----@field currentline      integer -- line at the hook point (-1 when unknown)
----@field linedefined      integer
----@field lastlinedefined  integer
----@field nups             integer
+--- A stack frame (`info:stack()`), usable while the guest thread is paused
+--- at the hook. Locals/upvalues can be read and written, and code can be
+--- evaluated with the frame's locals and upvalues in scope.
+---@class lua.Frame
+---@field thread          lua.raw.State -- lightuserdata of the guest lua_State* at runtime
+---@field level           integer       -- stack level (0 = the hook frame)
+---@field name            string? -- function name, when derivable
+---@field namewhat        string? -- "global", "local", "method", ...
+---@field what            string? -- "Lua", "main" or "C"
+---@field source          string? -- chunk source of the frame
+---@field short_src       string  -- shortened source name
+---@field currentline     integer -- line at the hook point (-1 when unknown)
+---@field linedefined     integer
+---@field lastlinedefined integer
+---@field nups            integer
+---@field locals          fun(self: lua.Frame): { name: string, value: any }[]
+---@field getLocal        fun(self: lua.Frame, name: string): any
+---@field setLocal        fun(self: lua.Frame, name: string, value: any): boolean
+---@field upvalues        fun(self: lua.Frame): { name: string, value: any }[]
+---@field getUpvalue      fun(self: lua.Frame, name: string): any
+---@field setUpvalue      fun(self: lua.Frame, name: string, value: any): boolean
+---@field eval            fun(self: lua.Frame, code: string): boolean, any
 
 --- The `info` argument passed to a state:setHook callback. All fields are
 --- populated eagerly; `stack()` walks the triggering thread while it is
@@ -741,7 +775,7 @@ end
 ---@field linedefined      integer
 ---@field lastlinedefined  integer
 ---@field nups             integer
----@field stack            fun(self: lua.HookInfo): lua.HookFrame[]
+---@field stack            fun(self: lua.HookInfo): lua.Frame[]
 
 local HOOK_MASK_NAMES = {
 	call        = LUA_MASKCALL,
@@ -789,10 +823,12 @@ end
 --- (needed for correct stack traces and locals inside coroutines).
 ---
 --- `info:stack()` returns the stack trace of the triggering thread as an
---- array of lua.HookFrame tables (index 1 = the frame the hook fired in),
---- each with the same debug fields as `info`. It walks the thread while it
---- is paused at the hook, so it must be called from within the callback — a
---- stored info table raises if you call it after the hook returns.
+--- array of lua.Frame objects (index 1 = the frame the hook fired in),
+--- each with the same debug fields as `info` plus methods to read/write
+--- locals and upvalues and evaluate code in the frame. It walks the thread
+--- while it is paused at the hook, so it must be called from within the
+--- callback — a stored info table raises if you call it after the hook
+--- returns.
 ---
 --- `mask` selects which events fire: a space-separated string of event
 --- names ("line", "call return line", "count", ...) or an integer bitmask
@@ -848,10 +884,282 @@ function State:close()
 		for _, cb in ipairs(self._callbacks) do bridge.unregister(cb.id) end
 		bridge.close_state(tonumber(ffi.cast("intptr_t", self.L)))
 		guestStates[self._guest_light] = nil
+		guestById[self._guest_id]      = nil
 		self.L          = nil
 		self._callbacks = {}
 	end
 end
+
+-- ─── Frame ────────────────────────────────────────────────────────────────
+
+---@class lua.Frame
+local Frame = {}
+Frame.__index = Frame
+
+-- Internal: resolve the owning lua.State wrapper for a frame. The frame's
+-- thread (self.thread) is carried as a lightuserdata but typed lua.raw.State
+-- so raw API calls typecheck; LuaJIT converts lightuserdata to pointers.
+---@param frame lua.Frame
+---@return lua.State?
+local function frameGuestState(frame)
+	return resolveGuestState(frame.thread)
+end
+
+--- List this frame's active locals as { name, value } pairs, in order.
+---@return { name: string, value: any }[]
+function Frame:locals()
+	local guestState = frameGuestState(self)
+	if guestState == nil then return {} end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return {} end
+	local out = {}
+	for i = 1, 200 do
+		local name = ffi.C.lua_getlocal(L, ar, i)
+		if name == nil then break end
+		out[i] = { name = ffi.string(name), value = fromLua(guestState, L, -1) }
+		ffi.C.lua_settop(L, -2)
+	end
+	return out
+end
+
+---@param name string
+function Frame:getLocal(name)
+	local guestState = frameGuestState(self)
+	if guestState == nil then return nil end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return nil end
+	for i = 1, 200 do
+		local ln = ffi.C.lua_getlocal(L, ar, i)
+		if ln == nil then return nil end
+		local lname = ffi.string(ln)
+		if lname == name then
+			local value = fromLua(guestState, L, -1)
+			ffi.C.lua_settop(L, -2)
+			return value
+		end
+		ffi.C.lua_settop(L, -2)
+	end
+	return nil
+end
+
+--- Assign to a local of the frame. Only active locals can be written.
+---@param name  string
+---@param value any
+---@return boolean
+function Frame:setLocal(name, value)
+	local guestState = frameGuestState(self)
+	if guestState == nil then return false end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return false end
+	for i = 1, 200 do
+		local ln = ffi.C.lua_getlocal(L, ar, i)
+		if ln == nil then return false end
+		local lname = ffi.string(ln)
+		ffi.C.lua_settop(L, -2) -- pop the read value
+		if lname == name then
+			toLua(guestState, L, value)
+			ffi.C.lua_setlocal(L, ar, i) -- pops the value, assigns the local
+			return true
+		end
+	end
+	return false
+end
+
+--- List this frame's function's upvalues as { name, value } pairs.
+---@return { name: string, value: any }[]
+function Frame:upvalues()
+	local guestState = frameGuestState(self)
+	if guestState == nil then return {} end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return {} end
+	ffi.C.lua_getinfo(L, "f", ar) -- push the frame's function
+	local fnIdx = raw.gettop(L)
+	local out = {}
+	for i = 1, 200 do
+		local name = ffi.C.lua_getupvalue(L, fnIdx, i)
+		if name == nil then break end
+		out[i] = { name = ffi.string(name), value = fromLua(guestState, L, -1) }
+		ffi.C.lua_settop(L, -2)
+	end
+	ffi.C.lua_settop(L, fnIdx - 1) -- pop the function
+	return out
+end
+
+---@param name string
+function Frame:getUpvalue(name)
+	local guestState = frameGuestState(self)
+	if guestState == nil then return nil end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return nil end
+	ffi.C.lua_getinfo(L, "f", ar)
+	local fnIdx = raw.gettop(L)
+	for i = 1, 200 do
+		local un = ffi.C.lua_getupvalue(L, fnIdx, i)
+		if un == nil then break end
+		local uname = ffi.string(un)
+		if uname == name then
+			local value = fromLua(guestState, L, -1)
+			ffi.C.lua_settop(L, -2)
+			ffi.C.lua_settop(L, fnIdx - 1)
+			return value
+		end
+		ffi.C.lua_settop(L, -2)
+	end
+	ffi.C.lua_settop(L, fnIdx - 1)
+	return nil
+end
+
+--- Assign to an upvalue of the frame's function.
+---@param name  string
+---@param value any
+---@return boolean
+function Frame:setUpvalue(name, value)
+	local guestState = frameGuestState(self)
+	if guestState == nil then return false end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return false end
+	ffi.C.lua_getinfo(L, "f", ar)
+	local fnIdx = raw.gettop(L)
+	for i = 1, 200 do
+		local un = ffi.C.lua_getupvalue(L, fnIdx, i)
+		if un == nil then break end
+		local uname = ffi.string(un)
+		ffi.C.lua_settop(L, -2)
+		if uname == name then
+			toLua(guestState, L, value)
+			ffi.C.lua_setupvalue(L, fnIdx, i)
+			ffi.C.lua_settop(L, fnIdx - 1)
+			return true
+		end
+	end
+	ffi.C.lua_settop(L, fnIdx - 1)
+	return false
+end
+
+--- Evaluate `code` with this frame's locals and upvalues in scope.
+---
+--- The chunk runs in a fresh guest environment seeded with the frame's
+--- active locals and upvalues; reads of other names fall through (via
+--- __index) to the frame function's environment, and writes to new names go
+--- there too (via __newindex). On success, assignments to existing locals
+--- and upvalues are written back to the frame, so `frame:eval("x = 42")`
+--- changes the running program. Returns `true, first result` or
+--- `false, err`. Must be called from within the hook callback.
+---@param code string
+---@return boolean, any
+function Frame:eval(code)
+	local guestState = frameGuestState(self)
+	if guestState == nil then
+		return false, "no frame at stack level " .. tostring(self.level)
+	end
+	local L = self.thread
+	local ar = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar) == 0 then
+		return false, "no frame at stack level " .. tostring(self.level)
+	end
+
+	-- Env: a fresh guest table seeded with the frame's active locals.
+	raw.createtable(L, 0, 32)
+	local envIdx = raw.gettop(L)
+	for i = 1, 200 do
+		local ln = ffi.C.lua_getlocal(L, ar, i)
+		if ln == nil then break end
+		local lname = ffi.string(ln)
+		raw.pushstring(L, lname)   -- [env][value][key]
+		raw.pushvalue(L, -2)       -- [env][value][key][value]
+		raw.settable(L, envIdx)    -- [env][value]
+		raw.pop(L, 1)              -- [env]
+	end
+
+	-- ... and the frame function's upvalues.
+	ffi.C.lua_getinfo(L, "f", ar)
+	local fnIdx = raw.gettop(L)
+	for i = 1, 200 do
+		local un = ffi.C.lua_getupvalue(L, fnIdx, i)
+		if un == nil then break end
+		local uname = ffi.string(un)
+		raw.pushstring(L, uname)   -- [fn][value][key]
+		raw.pushvalue(L, -2)       -- [fn][value][key][value]
+		raw.settable(L, envIdx)    -- [fn][value]
+		raw.pop(L, 1)              -- [fn]
+	end
+
+	-- Chain reads/writes of other names to the frame function's environment.
+	ffi.C.lua_getfenv(L, fnIdx)    -- [fn][fenv]
+	raw.createtable(L, 0, 2)       -- [fn][fenv][mt]
+	raw.pushvalue(L, -2)
+	raw.setfield(L, -2, "__index") -- [fn][fenv][mt]
+	raw.pushvalue(L, -2)
+	raw.setfield(L, -2, "__newindex")
+	raw.setmetatable(L, envIdx)
+	ffi.C.lua_settop(L, fnIdx - 1) -- drop [fn][fenv][mt]; env stays at envIdx
+
+	-- Load "return <code>", falling back to plain code (like Chunk)._compile.
+	local wrapped = "return " .. code
+	local status = raw.loadstring(L, wrapped)
+	if status ~= LUA_OK then
+		raw.pop(L, 1)
+		status = raw.loadstring(L, code)
+	end
+	if status ~= LUA_OK then
+		local err = raw.tolstring(L, -1)
+		raw.pop(L, 1)
+		raw.settop(L, envIdx - 1)
+		return false, err
+	end
+
+	raw.pushvalue(L, envIdx)       -- [chunk][env]
+	ffi.C.lua_setfenv(L, -2)       -- [chunk]
+	local pstatus = raw.pcall(L, 0, LUA_MULTRET, 0)
+	if pstatus ~= LUA_OK and pstatus ~= LUA_YIELD then
+		local err = raw.tolstring(L, -1)
+		raw.settop(L, envIdx - 1)
+		return false, err
+	end
+
+	-- Convert the results (they sit at envIdx + 1.. above the env table)
+	-- before any stack churn below.
+	local nresults = raw.gettop(L) - envIdx
+	local results = {}
+	for i = 1, nresults do results[i] = fromLua(guestState, L, envIdx + i) end
+
+	-- Write assignments to existing locals/upvalues back to the frame.
+	local ar2 = ffi.new("lua_Debug")
+	if ffi.C.lua_getstack(L, self.level, ar2) ~= 0 then
+		for i = 1, 200 do
+			local ln = ffi.C.lua_getlocal(L, ar2, i)
+			if ln == nil then break end
+			local lname = ffi.string(ln)
+			ffi.C.lua_settop(L, -2)        -- pop the read value
+			raw.getfield(L, envIdx, lname) -- push env[lname]
+			ffi.C.lua_setlocal(L, ar2, i)  -- pop + assign to the local
+		end
+		ffi.C.lua_getinfo(L, "f", ar2)
+		local fn2 = raw.gettop(L)
+		for i = 1, 200 do
+			local un = ffi.C.lua_getupvalue(L, fn2, i)
+			if un == nil then break end
+			local uname = ffi.string(un)
+			ffi.C.lua_settop(L, -2)
+			raw.getfield(L, envIdx, uname)
+			ffi.C.lua_setupvalue(L, fn2, i)
+		end
+		ffi.C.lua_settop(L, fn2 - 1)
+	end
+
+	raw.settop(L, envIdx - 1)
+	if nresults == 0 then return true end
+	return true, results[1]
+end
+
+-- Frames returned by info:stack() carry this class as their metatable.
+bridge.set_frame_meta(Frame)
 
 -- ─── Module ───────────────────────────────────────────────────────────────
 
@@ -870,8 +1178,18 @@ function lua.new()
 	-- We cast to lua_State* cdata here, on host_L outside any guest execution.
 	local light = bridge.new_state()
 	local L     = ffi.cast("lua_State*", light)
-	local state = setmetatable({ L = L, _callbacks = {}, _guest_light = light }, State)
+	local id    = nextGuestId
+	nextGuestId = nextGuestId + 1
+	local state = setmetatable({
+		L = L, _callbacks = {}, _guest_light = light, _guest_id = id,
+	}, State)
 	guestStates[light] = state
+	guestById[id]      = state
+	-- Registry marker so coroutine threads (which have their own lua_State*)
+	-- can be resolved back to this wrapper via resolveGuestState.
+	ffi.C.lua_pushlightuserdata(L, GUEST_ID_KEY)
+	ffi.C.lua_pushinteger(L, id)
+	ffi.C.lua_rawset(L, LUA_REGISTRYINDEX)
 	return state
 end
 
