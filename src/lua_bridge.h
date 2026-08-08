@@ -137,6 +137,7 @@ void lua_rawset     (lua_State *L, int idx);
 
 /* ── Debug hooks ── */
 int lua_sethook(lua_State *L, lua_Hook func, int mask, int count);
+int lua_getstack(lua_State *L, int level, lua_Debug *ar);
 int lua_getinfo (lua_State *L, const char *what, lua_Debug *ar);
 
 /* ── Call / error ── */

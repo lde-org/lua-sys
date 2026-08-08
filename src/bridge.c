@@ -71,6 +71,7 @@
     X(void,         lua_rawset,             (lua_State *L, int idx)) \
     X(int,          lua_setmetatable,       (lua_State *L, int objindex)) \
     X(int,          lua_sethook,            (lua_State *L, lua_Hook func, int mask, int count)) \
+    X(int,          lua_getstack,           (lua_State *L, int level, lua_Debug *ar)) \
     X(int,          lua_getinfo,            (lua_State *L, const char *what, lua_Debug *ar))
 
 /* Each lua_* name becomes a static function pointer; every call site below
@@ -394,6 +395,10 @@ static int bridge_unregister(lua_State *L) {
 // hook looks up on every event.
 
 static char hook_registry_key;
+static char hook_meta_key;
+
+static int hook_info_stack(lua_State *L);
+static int hook_info_index(lua_State *L);
 
 static const char *hook_event_name(int event) {
     switch (event) {
@@ -408,9 +413,12 @@ static const char *hook_event_name(int event) {
 
 // lua_Hook installed on the guest state by bridge_set_hook.
 //
-// ar is filled in by the VM with the event; lua_getinfo("Sln", ar) then
-// populates the standard debug fields (source, what, currentline, name, ...)
-// which we surface to the host callback as a plain info table.
+// The info table handed to the host callback carries every debug field
+// (name, what, source, short_src, currentline, ...), `event`, `thread`, and
+// a shared metatable providing info:stack(). The `_hook_active` flag is
+// cleared when this function returns so a stored info table's stack() —
+// which needs the guest thread paused at the hook — refuses instead of
+// walking a stale stack.
 static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     int saved_top = lua_gettop(host_L);
 
@@ -424,13 +432,12 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     int fn_ref = (int)lua_tointeger(guest, -1);
     lua_pop(guest, 1);
 
-    lua_getinfo(guest, "Sln", ar);
-
     /* Arg 1: event name. */
     lua_pushstring(host_L, hook_event_name(ar->event));
 
-    /* Arg 2: info table with the standard debug fields. */
-    lua_createtable(host_L, 0, 11);
+    /* Arg 2: info table with all debug fields populated eagerly. */
+    lua_getinfo(guest, "Sln", ar);
+    lua_createtable(host_L, 0, 12);
     lua_pushstring(host_L, hook_event_name(ar->event));
     lua_setfield(host_L, -2, "event");
     if (ar->name)     { lua_pushstring(host_L, ar->name); lua_setfield(host_L, -2, "name"); }
@@ -445,12 +452,17 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     lua_pushinteger(host_L, ar->nups); lua_setfield(host_L, -2, "nups");
 
     /* The thread the hook fired on — the guest main thread, or a coroutine
-     * running inside it. Host code casts it back with
-     * ffi.cast("lua_State*", info.thread) to walk that thread's stack with
-     * lua_getstack / lua_getinfo / lua_getlocal (needed for correct stack
-     * traces and locals when the hook fires inside a coroutine). */
+     * running inside it. */
     lua_pushlightuserdata(host_L, (void *)guest);
     lua_setfield(host_L, -2, "thread");
+    lua_pushboolean(host_L, 1);
+    lua_setfield(host_L, -2, "_hook_active");
+
+    /* Shared metatable providing info:stack(). */
+    lua_pushlightuserdata(host_L, (void *)&hook_meta_key);
+    lua_rawget(host_L, LUA_REGISTRYINDEX);
+    lua_setmetatable(host_L, -2);
+    int info_idx = lua_gettop(host_L); /* info table stays put through pcall */
 
     lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref); /* callback fn */
     lua_pushvalue(host_L, -3);                      /* event */
@@ -459,6 +471,12 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
     int status = lua_pcall(host_L, 2, 0, 0);
     luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+
+    /* The hook's ar is about to go out of scope — invalidate the info table
+     * so a stored info:stack() refuses instead of walking a stale stack. */
+    lua_pushstring(host_L, "_hook_active");
+    lua_pushboolean(host_L, 0);
+    lua_rawset(host_L, info_idx);
 
     if (status != LUA_OK) {
         /* A hook that raises aborts the running guest code with that error. */
@@ -469,6 +487,75 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
         return; /* unreachable: lua_error longjmps */
     }
     lua_settop(host_L, saved_top);
+}
+
+// info:stack() — walk the stack of the thread the hook fired on (level 0 =
+// the frame the hook fired in), returning an array of frame tables, each
+// with the same debug fields as the info table. Must be called from within
+// the hook callback while the thread is still paused at the hook.
+static int hook_info_stack(lua_State *L) {
+    /* Refuse once the hook has returned (thread may have moved on). */
+    lua_pushstring(L, "_hook_active");
+    lua_rawget(L, 1);
+    int active = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (!active) {
+        lua_pushstring(L, "info:stack() must be called from within the hook callback");
+        lua_error(L);
+        return 0;
+    }
+
+    lua_pushstring(L, "thread");
+    lua_rawget(L, 1); /* self.thread — lightuserdata of the guest lua_State */
+    lua_State *guest = (lua_State *)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+
+    lua_createtable(L, 8, 0);
+    if (guest == NULL) return 1; /* defensive: no thread — empty trace */
+    int level = 0;
+    for (;;) {
+        lua_Debug ar;
+        if (!lua_getstack(guest, level, &ar)) break;
+        lua_getinfo(guest, "Slnu", &ar);
+        lua_createtable(L, 0, 10);
+        if (ar.name)     { lua_pushstring(L, ar.name);     lua_setfield(L, -2, "name"); }
+        if (ar.namewhat) { lua_pushstring(L, ar.namewhat); lua_setfield(L, -2, "namewhat"); }
+        if (ar.what)     { lua_pushstring(L, ar.what);     lua_setfield(L, -2, "what"); }
+        if (ar.source)   { lua_pushstring(L, ar.source);   lua_setfield(L, -2, "source"); }
+        lua_pushstring(L, ar.short_src);        lua_setfield(L, -2, "short_src");
+        lua_pushinteger(L, ar.currentline);     lua_setfield(L, -2, "currentline");
+        lua_pushinteger(L, ar.linedefined);     lua_setfield(L, -2, "linedefined");
+        lua_pushinteger(L, ar.lastlinedefined); lua_setfield(L, -2, "lastlinedefined");
+        lua_pushinteger(L, ar.nups);            lua_setfield(L, -2, "nups");
+        lua_rawseti(L, -2, level + 1);
+        level++;
+    }
+    return 1;
+}
+
+// __index for hook info tables: provides info:stack(). All debug fields are
+// populated eagerly, so only the method lookup takes this path.
+static int hook_info_index(lua_State *L) {
+    const char *key = lua_tostring(L, 2);
+    if (key && strcmp(key, "stack") == 0) {
+        lua_pushcclosure(L, hook_info_stack, 0);
+        return 1;
+    }
+    return 0;
+}
+
+// Build the shared metatable providing `info:stack()` on every hook info
+// table and park it in the host registry under a lightuserdata key (same
+// pattern as init_callable_metatable), so hook_dispatch only pays a
+// rawget + setmetatable per event.
+static void init_hook_info_metatable(lua_State *L) {
+    lua_createtable(L, 0, 1);           /* mt */
+    lua_pushcclosure(L, hook_info_index, 0);
+    lua_setfield(L, -2, "__index");     /* mt.__index = hook_info_index */
+    lua_pushlightuserdata(L, (void *)&hook_meta_key);
+    lua_pushvalue(L, -2);               /* [mt, key, mt] */
+    lua_rawset(L, LUA_REGISTRYINDEX);   /* registry[key] = mt */
+    lua_pop(L, 1);
 }
 
 // Stores the host callback ref in the guest registry and installs
@@ -554,6 +641,7 @@ int luaopen_lua_sys_bridge(lua_State *L) {
     if (!host_L) host_L = L;
     luaL_register(L, "lua-sys.bridge", bridge_funcs);
     init_callable_metatable(L);
+    init_hook_info_metatable(L);
     return 1;
 }
 

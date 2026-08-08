@@ -1346,7 +1346,14 @@ test.it("hook info table exposes source, line and what fields", function()
 	local seen = {}
 
 	state:setHook(function(event, info)
-		seen[#seen + 1] = info
+		-- Lazy fields are only valid while the hook is active: snapshot
+		-- them synchronously from inside the callback.
+		seen[#seen + 1] = {
+			event       = info.event,
+			source      = info.source,
+			currentline = info.currentline,
+			what        = info.what,
+		}
 	end, "line")
 
 	state:load("local a = 1"):setName("@hooktest.lua"):call()
@@ -1515,6 +1522,132 @@ test.it("setHook info.thread lets the host read the coroutine's stack and locals
 	test.truthy(coroEvents > 0, "expected line events inside the coroutine")
 	test.equal(12345, coroLocals.marker)
 	test.truthy(coroLocals.n ~= nil, "expected the loop accumulator local as well")
+
+	state:close()
+end)
+
+test.it("setHook info table is populated eagerly", function()
+	local state = lua.new()
+	local keys = nil
+
+	state:setHook(function(event, info)
+		if keys == nil then
+			keys = 0
+			for _ in pairs(info) do keys = keys + 1 end
+		end
+	end, "line")
+
+	state:eval("local x = 1")
+
+	-- All debug fields are present without any lazy access: event, thread,
+	-- _hook_active, source, short_src, what, currentline, linedefined,
+	-- lastlinedefined, nups, and namewhat (empty for the unnamed main chunk;
+	-- name is absent)
+	test.equal(11, keys)
+
+	state:close()
+end)
+
+test.it("setHook info:stack() returns the triggering thread's stack trace", function()
+	local state = lua.new()
+	local frames, frame0, infoSource, infoLine, infoWhat = nil
+
+	state:setHook(function(event, info)
+		if frames == nil then
+			frames = info:stack()
+			frame0 = frames[1]
+			-- Level 0 of the trace is the frame the hook fired in, so the
+			-- lazy fields and the first frame must agree.
+			infoSource = info.source
+			infoLine   = info.currentline
+			infoWhat   = info.what
+		end
+	end, "line")
+
+	state:eval("local a = 1\nlocal b = 2")
+
+	test.truthy(frames, "expected a stack trace")
+	test.truthy(#frames >= 1, "expected at least the frame the hook fired in")
+	test.equal(infoSource, frame0.source)
+	test.equal(infoLine, frame0.currentline)
+	test.equal(infoWhat, frame0.what)
+	test.truthy(frame0.short_src)
+	test.truthy(frame0.currentline >= 1)
+
+	state:close()
+end)
+
+test.it("setHook info:stack() walks the coroutine's stack from inside a coroutine", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+
+	---@type lua.HookFrame?
+	local coroFrame = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and coroFrame == nil then
+			coroFrame = info:stack()[1]
+		end
+	end, "line")
+
+	state:eval([[
+		coroutine.wrap(function()
+			local marker = 12345
+			local n = 0
+			for i = 1, 3 do
+				n = n + marker + i
+			end
+			return n
+		end)()
+	]])
+
+	test.truthy(coroFrame, "expected a stack trace from inside the coroutine")
+	test.equal("Lua", coroFrame.what)
+	test.truthy(coroFrame.currentline >= 1)
+	test.truthy(coroFrame.source)
+
+	state:close()
+end)
+
+test.it("hook info fields read during the callback stay cached afterwards", function()
+	local state = lua.new()
+	local stored = nil
+
+	state:setHook(function(event, info)
+		-- Reading a field while the hook is active caches it in the table
+		stored = { source = info.source, info = info }
+	end, "line")
+
+	state:eval("local x = 1")
+
+	test.truthy(stored.source ~= nil)
+	test.equal(stored.source, stored.info.source)  -- still readable afterwards
+
+	state:close()
+end)
+
+test.it("hook info fields stay readable but stack() refuses after the callback returns", function()
+	local state = lua.new()
+	local stored = nil
+
+	state:setHook(function(event, info)
+		stored = info
+	end, "line")
+
+	state:eval("local x = 1")
+
+	-- Fields are populated eagerly and remain readable after the hook
+	test.equal("line", stored.event)
+	test.truthy(stored.thread)
+	test.truthy(stored.source ~= nil)
+	test.truthy(stored.currentline >= 1)
+
+	-- info:stack() walks the thread while it is paused at the hook, so it
+	-- must be called from within the callback
+	local ok, err = pcall(function() return stored:stack() end)
+	test.falsy(ok)
+	test.includes(err, "hook callback")
 
 	state:close()
 end)

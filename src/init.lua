@@ -158,7 +158,7 @@ end
 function Table:ipairs()
 	local guestState = self._state
 	local L          = guestState.L
-	local i          = 0
+    local i          = 0
 	return function()
 		i = i + 1
 		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
@@ -629,6 +629,35 @@ end
 
 -- ─── Debug hooks ──────────────────────────────────────────────────────────
 
+--- A single frame of a hook stack trace (`info:stack()`).
+---@class lua.HookFrame
+---@field name             string? -- function name, when derivable
+---@field namewhat         string? -- "global", "local", "method", ...
+---@field what             string? -- "Lua", "main" or "C"
+---@field source           string? -- chunk source of the frame
+---@field short_src        string  -- shortened source name
+---@field currentline      integer -- line at the hook point (-1 when unknown)
+---@field linedefined      integer
+---@field lastlinedefined  integer
+---@field nups             integer
+
+--- The `info` argument passed to a state:setHook callback. All fields are
+--- populated eagerly; `stack()` walks the triggering thread while it is
+--- paused at the hook, so it must be called from within the callback.
+---@class lua.HookInfo
+---@field event            "call"|"return"|"line"|"count"|"tailcall"
+---@field thread           lightuserdata -- lua_State* the hook fired on
+---@field name             string?
+---@field namewhat         string?
+---@field what             string?
+---@field source           string?
+---@field short_src        string
+---@field currentline      integer
+---@field linedefined      integer
+---@field lastlinedefined  integer
+---@field nups             integer
+---@field stack            fun(self: lua.HookInfo): lua.HookFrame[]
+
 local HOOK_MASK_NAMES = {
 	call        = LUA_MASKCALL,
 	["return"] = LUA_MASKRET,
@@ -665,15 +694,20 @@ end
 ---
 --- `fn` is a host Lua function called as `fn(event, info)` for every hook
 --- event, where `event` is one of "call", "return", "line", "count" or
---- "tailcall" and `info` is a plain table with the standard debug fields:
----   event, name, namewhat, what, source, short_src, currentline,
----   linedefined, lastlinedefined, nups
+--- "tailcall".
 ---
---- `info.thread` additionally holds the lua_State* the hook fired on as a
---- lightuserdata — the guest main thread, or a coroutine thread running
---- inside it. Cast it back with ffi.cast("lua_State*", info.thread) to walk
---- that thread's stack with lua_getstack / lua_getinfo / lua_getlocal
+--- `info` (a lua.HookInfo) describes the event. All fields are populated
+--- eagerly, including `info.thread` — a lightuserdata holding the lua_State*
+--- the hook fired on: the guest main thread, or a coroutine thread running
+--- inside it. Cast it back with ffi.cast("lua_State*", info.thread) to call
+--- lua_getstack / lua_getinfo / lua_getlocal on the triggering thread
 --- (needed for correct stack traces and locals inside coroutines).
+---
+--- `info:stack()` returns the stack trace of the triggering thread as an
+--- array of lua.HookFrame tables (index 1 = the frame the hook fired in),
+--- each with the same debug fields as `info`. It walks the thread while it
+--- is paused at the hook, so it must be called from within the callback — a
+--- stored info table raises if you call it after the hook returns.
 ---
 --- `mask` selects which events fire: a space-separated string of event
 --- names ("line", "call return line", "count", ...) or an integer bitmask
@@ -691,7 +725,7 @@ end
 --- A hook that errors aborts the running guest code with that error
 --- (catchable with pcall around state:eval / chunk:eval), mirroring what
 --- calling lua_error from a raw hook does.
----@param fn    function|nil
+---@param fn    fun(event: "call"|"return"|"line"|"count"|"tailcall", info: lua.HookInfo)|nil
 ---@param mask  string|integer
 ---@param count integer?
 function State:setHook(fn, mask, count)
