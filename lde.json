@@ -1,5 +1,7 @@
 {
 	"name": "lua-sys",
+	"description": "LuaJIT C api bindings for lde.",
+	"authors": ["David Cruz <david@bycruz.dev>"],
 	"version": "0.1.0",
 	"dependencies": {}
 }
