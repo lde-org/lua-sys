@@ -88,7 +88,20 @@ static void bridge_resolve_symbols(void) {
 }
 #endif /* _WIN32 */
 
-static lua_State *host_L = NULL;
+// ── Per-state ownership ───────────────────────────────────────────────────
+//
+// There is intentionally NO process-global "host state" pointer in this file.
+// Every lua_State that loads lua-sys is self-contained: bridge.register stores
+// callbacks in the calling state's own registry, and cross-state closures
+// (bound_call, dispatch_callback, hook_dispatch) carry the state that owns
+// their registrations explicitly (as an upvalue or a guest-registry entry).
+//
+// This matters because a dlopen'd copy of bridge.so may be shared by many
+// states: on glibc, closing a state dlcloses the library (so each state gets
+// a fresh image with fresh statics), but musl's dlclose is a no-op — a loaded
+// image stays mapped forever, so a process-global static would be claimed by
+// whichever state loaded the copy first and every later state would fail.
+// Per-state ownership makes the design independent of dlopen/dlclose behavior.
 
 // ── Value copying ─────────────────────────────────────────────────────────
 
@@ -243,37 +256,45 @@ static int bound_pcall(lua_State *host) {
 // Registry key for the shared callable metatable (built at module open).
 static char callable_mt_key;
 
+static void init_callable_metatable(lua_State *L);
+
 // Lightuserdata tag prefixing guest table registry refs passed host-side by
 // dispatch_callback's slow path. bridge.compound_tag() returns it so the host
 // can recognise (tag, ref) pairs.
 static char compound_tag_key;
 
 static int bridge_make_callable(lua_State *L) {
-    // bound_call operates on host_L (it receives L == host_L via the C
-    // function convention when called from host_L's Lua code). The closure
-    // must be created on host_L so the upvalues are read from host_L's stack.
-    // When called from a guest state (L != host_L), the guestState upvalue
-    // (a table) cannot be moved across states, so we restrict this to host-only.
-    if (L != host_L) {
-        lua_pushstring(L, "bridge.make_callable must be called from host state");
-        lua_error(L);
-        return 0;
-    }
+    // bound_call operates on the state that created the closure: every state
+    // that loads lua-sys is self-contained (its registrations live in its own
+    // registry), so the callable is built on the calling state L with the
+    // upvalues read from L's stack. There is no process-global host state.
     lua_State *guest = decode_guest_ptr(L, 1);
-    lua_pushlightuserdata(host_L, (void *)guest); /* upvalue 1 */
-    lua_pushvalue(host_L, 2);                     /* upvalue 2: guestRef */
-    lua_pushvalue(host_L, 3);                     /* upvalue 3: guestState */
-    lua_pushvalue(host_L, 4);                     /* upvalue 4: callGuestSlow ref */
-    lua_pushcclosure(host_L, bound_call, 4);      /* the callable */
-    lua_pushlightuserdata(host_L, (void *)&callable_mt_key);
-    lua_rawget(host_L, LUA_REGISTRYINDEX);        /* shared fn:pcall() metatable */
-    lua_setmetatable(host_L, -2);
+    lua_pushlightuserdata(L, (void *)guest);      /* upvalue 1 */
+    lua_pushvalue(L, 2);                          /* upvalue 2: guestRef */
+    lua_pushvalue(L, 3);                          /* upvalue 3: guestState */
+    lua_pushvalue(L, 4);                          /* upvalue 4: callGuestSlow ref */
+    lua_pushcclosure(L, bound_call, 4);           /* the callable */
+    /* Ensure the fn:pcall() metatable exists in THIS state's registry. A
+     * dlopen'd copy of bridge.so may be shared by many states (musl never
+     * unloads libraries), so luaopen — and its init_callable_metatable — only
+     * ran for whichever state opened the copy first. */
+    lua_pushlightuserdata(L, (void *)&callable_mt_key);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        init_callable_metatable(L);
+        lua_pushlightuserdata(L, (void *)&callable_mt_key);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+    }
+    lua_setmetatable(L, -2);
     return 1;
 }
 
 // Build the metatable providing `fn:pcall()` on every bound_call closure and
-// park it in the host registry under a lightuserdata key. Shared by all
-// callables so each closure carries only the metatable reference.
+// park it in a state's registry under a lightuserdata key. Shared by all
+// callables so each closure carries only the metatable reference. Called from
+// luaopen (for the opening state) and lazily from bridge_make_callable (for
+// every other state that shares the same dlopen'd copy).
 static void init_callable_metatable(lua_State *L) {
     lua_createtable(L, 0, 1);         /* mt */
     lua_createtable(L, 0, 1);         /* methods */
@@ -294,18 +315,21 @@ static int bridge_compound_tag(lua_State *L) {
 // ── dispatch_callback ─────────────────────────────────────────────────────
 //
 // lua_CFunction installed on the guest state via bridge.push_callback.
-// Upvalue 1: integer — registry ref for the host callback function.
-// Upvalue 2: integer — registry ref for the host slow-path helper
+// Upvalue 1: integer — registry ref for the callback function.
+// Upvalue 2: integer — registry ref for the slow-path helper
 //            (dispatchCallbackSlow), used when any argument is a table.
+// Upvalue 3: lightuserdata — the owner state whose registry holds the two
+//            refs above (the state that called bridge.push_callback).
 //
-// host_L's stack must be fully restored on every exit path to avoid
+// The owner's stack must be fully restored on every exit path to avoid
 // corrupting nested guest→host→guest→host call chains.
 
 static int dispatch_callback(lua_State *guest) {
-    int fn_ref     = (int)lua_tointeger(guest, lua_upvalueindex(1));
-    int slow_ref   = (int)lua_tointeger(guest, lua_upvalueindex(2));
-    int saved_top  = lua_gettop(host_L);
-    int nargs      = lua_gettop(guest);
+    int fn_ref       = (int)lua_tointeger(guest, lua_upvalueindex(1));
+    int slow_ref     = (int)lua_tointeger(guest, lua_upvalueindex(2));
+    lua_State *owner = (lua_State *)lua_touserdata(guest, lua_upvalueindex(3));
+    int saved_top    = lua_gettop(owner);
+    int nargs        = lua_gettop(guest);
     int i;
 
     /* Fast path: all args are primitives. */
@@ -323,130 +347,126 @@ static int dispatch_callback(lua_State *guest) {
         /* Slow path: dispatchCallbackSlow(guest, fn, args...) — table args
          * cross as (TAG, guest_registry_ref) pairs so the Lua side can wrap
          * them in lua.Table proxies. */
-        lua_rawgeti(host_L, LUA_REGISTRYINDEX, slow_ref);
-        lua_pushlightuserdata(host_L, (void *)guest);
-        lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
+        lua_rawgeti(owner, LUA_REGISTRYINDEX, slow_ref);
+        lua_pushlightuserdata(owner, (void *)guest);
+        lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref);
         n_sent = 2;
         for (i = 1; i <= nargs; i++) {
             if (lua_type(guest, i) == LUA_TTABLE) {
                 lua_pushvalue(guest, i);
                 int ref = luaL_ref(guest, LUA_REGISTRYINDEX);
-                lua_pushlightuserdata(host_L, (void *)&compound_tag_key);
-                lua_pushinteger(host_L, ref);
+                lua_pushlightuserdata(owner, (void *)&compound_tag_key);
+                lua_pushinteger(owner, ref);
                 n_sent += 2;
             } else {
-                push_primitive_or_error(guest, i, host_L);
+                push_primitive_or_error(guest, i, owner);
                 n_sent += 1;
             }
         }
     } else {
-        lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref);
+        lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref);
         for (i = 1; i <= nargs; i++)
-            push_primitive_or_error(guest, i, host_L);
+            push_primitive_or_error(guest, i, owner);
         n_sent = nargs;
     }
 
-    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
-    int status = lua_pcall(host_L, n_sent, LUA_MULTRET, 0);
-    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    int status = lua_pcall(owner, n_sent, LUA_MULTRET, 0);
+    luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
     if (status != LUA_OK) {
-        const char *err = lua_tostring(host_L, -1);
+        const char *err = lua_tostring(owner, -1);
         lua_pushstring(guest, err ? err : "bridge: host error");
-        lua_settop(host_L, saved_top);
+        lua_settop(owner, saved_top);
         lua_error(guest);
         return 0;
     }
 
-    int nresults = lua_gettop(host_L) - saved_top;
-    if (nresults == 0) return 0; /* host stack already at saved_top */
+    int nresults = lua_gettop(owner) - saved_top;
+    if (nresults == 0) return 0; /* owner stack already at saved_top */
 
     for (i = 0; i < nresults; i++) {
-        int t = push_primitive_typed(host_L, saved_top + 1 + i, guest);
+        int t = push_primitive_typed(owner, saved_top + 1 + i, guest);
         if (t < 0) {
-            lua_settop(host_L, saved_top);
+            lua_settop(owner, saved_top);
             lua_settop(guest, 0);
             lua_pushfstring(guest,
                 "bridge: host callback returned a %s; "
                 "only primitives (nil, boolean, number, string) "
                 "can be returned from host to guest",
-                lua_typename(host_L, lua_type(host_L, saved_top + 1 + i)));
+                lua_typename(owner, lua_type(owner, saved_top + 1 + i)));
             lua_error(guest);
             return 0;
         }
     }
 
-    lua_settop(host_L, saved_top);
+    lua_settop(owner, saved_top);
     return nresults;
 }
 
 // ── Exported functions ────────────────────────────────────────────────────
 
-// Stores the host function in the registry, marks it LUAJIT_MODE_FUNC|OFF so
-// the JIT never compiles it (prevents argv2cdata on lua_State* cdata args in
-// FFI calls made by the callback — see docs/bridge-design.md), and returns
-// the ref id. May be called from any state; the function is moved to host_L's
-// registry so dispatch_callback (which operates on host_L) can retrieve it.
+// Stores the function in the CALLING state's registry, marks it
+// LUAJIT_MODE_FUNC|OFF so the JIT never compiles it (prevents argv2cdata on
+// lua_State* cdata args in FFI calls made by the callback — see
+// docs/bridge-design.md), and returns the ref id. Every state is
+// self-contained: the ref lands in L's own registry, and the dispatch
+// closures that consume it carry L (the owner) explicitly.
 static int bridge_register(lua_State *L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
-    if (L == host_L) {
-        lua_pushvalue(host_L, 1);
-    } else {
-        // Called from a guest state — move the function value into host_L's
-        // stack slot so it can be stored in host_L's registry. The function
-        // value on L's stack is a Lua object reference; we push it to host_L
-        // via the slow-path approach: create a temporary guest function that
-        // delegates back, then store the host function as a callback.
-        //
-        // For now, bridge_register must be called from the host. Nested-state
-        // callbacks reach through toLua which always runs on the host side.
-        lua_pushstring(L, "bridge.register must be called from host state");
-        lua_error(L);
-        return 0;
-    }
-    luaJIT_setmode(host_L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
-    int id = luaL_ref(host_L, LUA_REGISTRYINDEX);
+    lua_pushvalue(L, 1);
+    luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
+    int id = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_pushinteger(L, id);
     return 1;
 }
 
 // Pushes a dispatch_callback closure onto the guest state as a real
 // lua_CFunction (not FFI cdata), preventing JIT tracing into the host.
+// L is the OWNER: the state whose registry holds fn_ref/slow_ref. The owner
+// is baked into the closure as upvalue 3 so dispatch_callback can reach the
+// registrations without a process-global state pointer.
 static int bridge_push_callback(lua_State *L) {
     lua_State *guest = decode_guest_ptr(L, 1);
     int fn_ref       = (int)lua_tointeger(L, 2);
     int slow_ref     = (int)lua_tointeger(L, 3);
     lua_pushinteger(guest, fn_ref);
     lua_pushinteger(guest, slow_ref);
-    lua_pushcclosure(guest, dispatch_callback, 2);
+    lua_pushlightuserdata(guest, (void *)L); /* upvalue 3: owner */
+    lua_pushcclosure(guest, dispatch_callback, 3);
     return 0;
 }
 
 static int bridge_unregister(lua_State *L) {
     int fn_ref = (int)lua_tointeger(L, 1);
-    luaL_unref(host_L, LUA_REGISTRYINDEX, fn_ref);
+    luaL_unref(L, LUA_REGISTRYINDEX, fn_ref);
     return 0;
 }
 
 // ── Debug hooks ───────────────────────────────────────────────────────────
 //
 // High-level counterpart to lua_sethook: the hook fires on the guest state
-// while guest code runs, and dispatches to a host function stored in
-// host_L's registry — the same host↔guest pattern as dispatch_callback.
-// A lua_Hook is a plain C function pointer with no upvalues, so the host
-// callback ref is parked in the guest registry under a private key that the
-// hook looks up on every event.
+// while guest code runs, and dispatches to a callback function stored in the
+// OWNER state's registry (the state that installed the hook) — the same
+// owner↔guest pattern as dispatch_callback. A lua_Hook is a plain C function
+// pointer with no upvalues, so the callback ref AND the owner pointer are
+// parked in the guest registry under private keys that the hook looks up on
+// every event.
 
 static char hook_registry_key;
 static char hook_meta_key;
+static char hook_owner_key;
 
 /* Host-side lua.Frame class, registered via bridge.set_frame_meta; applied as
  * the metatable of every frame returned by info:stack() so Frame methods
- * (locals, getLocal, setLocal, eval, ...) resolve through __index. */
-static int frame_meta_ref = LUA_NOREF;
+ * (locals, getLocal, setLocal, eval, ...) resolve through __index. Stored per
+ * state under a lightuserdata registry key — not a process-global ref —
+ * because a dlopen'd copy of bridge.so may be shared by many states. */
+static char frame_meta_key;
 
 static int hook_info_stack(lua_State *L);
 static int hook_info_index(lua_State *L);
+static void init_hook_info_metatable(lua_State *L);
 
 static const char *hook_event_name(int event) {
     switch (event) {
@@ -468,9 +488,7 @@ static const char *hook_event_name(int event) {
 // which needs the guest thread paused at the hook — refuses instead of
 // walking a stale stack.
 static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
-    int saved_top = lua_gettop(host_L);
-
-    /* Locate the host callback ref stored by bridge_set_hook. */
+    /* Locate the callback ref AND the owner state stored by bridge_set_hook. */
     lua_pushlightuserdata(guest, (void *)&hook_registry_key);
     lua_rawget(guest, LUA_REGISTRYINDEX);
     if (lua_isnil(guest, -1)) {
@@ -480,61 +498,79 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     int fn_ref = (int)lua_tointeger(guest, -1);
     lua_pop(guest, 1);
 
+    lua_pushlightuserdata(guest, (void *)&hook_owner_key);
+    lua_rawget(guest, LUA_REGISTRYINDEX);
+    if (lua_type(guest, -1) != LUA_TLIGHTUSERDATA) {
+        lua_pop(guest, 1);
+        return; /* stale hook entry without an owner — no-op */
+    }
+    lua_State *owner = (lua_State *)lua_touserdata(guest, -1);
+    lua_pop(guest, 1);
+
+    int saved_top = lua_gettop(owner);
+
     /* Arg 1: event name. */
-    lua_pushstring(host_L, hook_event_name(ar->event));
+    lua_pushstring(owner, hook_event_name(ar->event));
 
     /* Arg 2: info table with all debug fields populated eagerly. */
     lua_getinfo(guest, "Sln", ar);
-    lua_createtable(host_L, 0, 12);
-    lua_pushstring(host_L, hook_event_name(ar->event));
-    lua_setfield(host_L, -2, "event");
-    if (ar->name)     { lua_pushstring(host_L, ar->name); lua_setfield(host_L, -2, "name"); }
-    if (ar->namewhat) { lua_pushstring(host_L, ar->namewhat); lua_setfield(host_L, -2, "namewhat"); }
-    if (ar->what)     { lua_pushstring(host_L, ar->what); lua_setfield(host_L, -2, "what"); }
-    if (ar->source)   { lua_pushstring(host_L, ar->source); lua_setfield(host_L, -2, "source"); }
-    lua_pushstring(host_L, ar->short_src);
-    lua_setfield(host_L, -2, "short_src");
-    lua_pushinteger(host_L, ar->currentline); lua_setfield(host_L, -2, "currentline");
-    lua_pushinteger(host_L, ar->linedefined); lua_setfield(host_L, -2, "linedefined");
-    lua_pushinteger(host_L, ar->lastlinedefined); lua_setfield(host_L, -2, "lastlinedefined");
-    lua_pushinteger(host_L, ar->nups); lua_setfield(host_L, -2, "nups");
+    lua_createtable(owner, 0, 12);
+    lua_pushstring(owner, hook_event_name(ar->event));
+    lua_setfield(owner, -2, "event");
+    if (ar->name)     { lua_pushstring(owner, ar->name); lua_setfield(owner, -2, "name"); }
+    if (ar->namewhat) { lua_pushstring(owner, ar->namewhat); lua_setfield(owner, -2, "namewhat"); }
+    if (ar->what)     { lua_pushstring(owner, ar->what); lua_setfield(owner, -2, "what"); }
+    if (ar->source)   { lua_pushstring(owner, ar->source); lua_setfield(owner, -2, "source"); }
+    lua_pushstring(owner, ar->short_src);
+    lua_setfield(owner, -2, "short_src");
+    lua_pushinteger(owner, ar->currentline); lua_setfield(owner, -2, "currentline");
+    lua_pushinteger(owner, ar->linedefined); lua_setfield(owner, -2, "linedefined");
+    lua_pushinteger(owner, ar->lastlinedefined); lua_setfield(owner, -2, "lastlinedefined");
+    lua_pushinteger(owner, ar->nups); lua_setfield(owner, -2, "nups");
 
     /* The thread the hook fired on — the guest main thread, or a coroutine
      * running inside it. */
-    lua_pushlightuserdata(host_L, (void *)guest);
-    lua_setfield(host_L, -2, "thread");
-    lua_pushboolean(host_L, 1);
-    lua_setfield(host_L, -2, "_hook_active");
+    lua_pushlightuserdata(owner, (void *)guest);
+    lua_setfield(owner, -2, "thread");
+    lua_pushboolean(owner, 1);
+    lua_setfield(owner, -2, "_hook_active");
 
-    /* Shared metatable providing info:stack(). */
-    lua_pushlightuserdata(host_L, (void *)&hook_meta_key);
-    lua_rawget(host_L, LUA_REGISTRYINDEX);
-    lua_setmetatable(host_L, -2);
-    int info_idx = lua_gettop(host_L); /* info table stays put through pcall */
+    /* Shared metatable providing info:stack() — ensure it exists in the
+     * owner's registry (the .so image may be shared by many states). */
+    lua_pushlightuserdata(owner, (void *)&hook_meta_key);
+    lua_rawget(owner, LUA_REGISTRYINDEX);
+    if (lua_isnil(owner, -1)) {
+        lua_pop(owner, 1);
+        init_hook_info_metatable(owner);
+        lua_pushlightuserdata(owner, (void *)&hook_meta_key);
+        lua_rawget(owner, LUA_REGISTRYINDEX);
+    }
+    lua_setmetatable(owner, -2);
+    int info_idx = lua_gettop(owner); /* info table stays put through pcall */
 
-    lua_rawgeti(host_L, LUA_REGISTRYINDEX, fn_ref); /* callback fn */
-    lua_pushvalue(host_L, -3);                      /* event */
-    lua_pushvalue(host_L, -3);                      /* info table */
+    lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref); /* callback fn */
+    lua_pushvalue(owner, -3);                      /* event */
+    lua_pushvalue(owner, -3);                      /* info table */
 
-    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
-    int status = lua_pcall(host_L, 2, 0, 0);
-    luaJIT_setmode(host_L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    int status = lua_pcall(owner, 2, 0, 0);
+    luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
     /* The hook's ar is about to go out of scope — invalidate the info table
      * so a stored info:stack() refuses instead of walking a stale stack. */
-    lua_pushstring(host_L, "_hook_active");
-    lua_pushboolean(host_L, 0);
-    lua_rawset(host_L, info_idx);
+    lua_pushstring(owner, "_hook_active");
+    lua_pushboolean(owner, 0);
+    lua_rawset(owner, info_idx);
 
     if (status != LUA_OK) {
         /* A hook that raises aborts the running guest code with that error. */
-        const char *err = lua_tostring(host_L, -1);
+        const char *err = lua_tostring(owner, -1);
         lua_pushstring(guest, err ? err : "bridge: hook error");
-        lua_settop(host_L, saved_top);
+        lua_settop(owner, saved_top);
         lua_error(guest);
         return; /* unreachable: lua_error longjmps */
     }
-    lua_settop(host_L, saved_top);
+    lua_settop(owner, saved_top);
 }
 
 // info:stack() — walk the stack of the thread the hook fired on (level 0 =
@@ -581,10 +617,14 @@ static int hook_info_stack(lua_State *L) {
         lua_pushinteger(L, level);
         lua_setfield(L, -2, "level");
         /* Attach the host-side lua.Frame class (registered via
-         * bridge.set_frame_meta) so Frame methods resolve via __index. */
-        if (frame_meta_ref != LUA_NOREF) {
-            lua_rawgeti(L, LUA_REGISTRYINDEX, frame_meta_ref);
+         * bridge.set_frame_meta in this state's registry) so Frame methods
+         * resolve via __index. */
+        lua_pushlightuserdata(L, (void *)&frame_meta_key);
+        lua_rawget(L, LUA_REGISTRYINDEX);
+        if (!lua_isnil(L, -1)) {
             lua_setmetatable(L, -2);
+        } else {
+            lua_pop(L, 1);
         }
         lua_rawseti(L, -2, level + 1);
         level++;
@@ -604,9 +644,11 @@ static int hook_info_index(lua_State *L) {
 }
 
 // Build the shared metatable providing `info:stack()` on every hook info
-// table and park it in the host registry under a lightuserdata key (same
+// table and park it in a state's registry under a lightuserdata key (same
 // pattern as init_callable_metatable), so hook_dispatch only pays a
-// rawget + setmetatable per event.
+// rawget + setmetatable per event. Called from luaopen (for the opening
+// state) and lazily from hook_dispatch (for every other state that shares
+// the same dlopen'd copy).
 static void init_hook_info_metatable(lua_State *L) {
     lua_createtable(L, 0, 1);           /* mt */
     lua_pushcclosure(L, hook_info_index, 0);
@@ -617,8 +659,9 @@ static void init_hook_info_metatable(lua_State *L) {
     lua_pop(L, 1);
 }
 
-// Stores the host callback ref in the guest registry and installs
-// hook_dispatch as the guest's debug hook.
+// Stores the callback ref in the guest registry — together with the OWNER
+// state (L, whose registry holds the actual callback function) — and
+// installs hook_dispatch as the guest's debug hook.
 //
 // LuaJIT only fires debug hooks from the interpreter — code compiled to
 // traces never dispatches through the hook. To make hooks reliable we
@@ -634,18 +677,26 @@ static int bridge_set_hook(lua_State *L) {
     lua_pushinteger(guest, fn_ref);
     lua_rawset(guest, LUA_REGISTRYINDEX);
 
+    lua_pushlightuserdata(guest, (void *)&hook_owner_key);
+    lua_pushlightuserdata(guest, (void *)L);
+    lua_rawset(guest, LUA_REGISTRYINDEX);
+
     lua_sethook(guest, hook_dispatch, mask, count);
     luaJIT_setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_FLUSH); /* unpatch traces */
     luaJIT_setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);   /* stop compilation */
     return 0;
 }
 
-// Removes the debug hook, drops the stored callback ref, and re-enables
-// the JIT engine that bridge_set_hook turned off.
+// Removes the debug hook, drops the stored callback ref and owner, and
+// re-enables the JIT engine that bridge_set_hook turned off.
 static int bridge_remove_hook(lua_State *L) {
     lua_State *guest = decode_guest_ptr(L, 1);
 
     lua_pushlightuserdata(guest, (void *)&hook_registry_key);
+    lua_pushnil(guest);
+    lua_rawset(guest, LUA_REGISTRYINDEX);
+
+    lua_pushlightuserdata(guest, (void *)&hook_owner_key);
     lua_pushnil(guest);
     lua_rawset(guest, LUA_REGISTRYINDEX);
 
@@ -656,13 +707,14 @@ static int bridge_remove_hook(lua_State *L) {
 
 // Stores the host-side lua.Frame class table as the metatable for frames
 // returned by info:stack(), so Frame methods resolve via __index. Called by
-// init.lua at module load, before any hook can fire.
+// init.lua at module load in every state that loads lua-sys; stored in the
+// calling state's own registry (a dlopen'd copy of bridge.so may be shared
+// by many states, so a process-global ref would point at the wrong registry).
 static int bridge_set_frame_meta(lua_State *L) {
     luaL_checktype(L, 1, LUA_TTABLE);
-    if (frame_meta_ref != LUA_NOREF)
-        luaL_unref(host_L, LUA_REGISTRYINDEX, frame_meta_ref);
+    lua_pushlightuserdata(L, (void *)&frame_meta_key);
     lua_pushvalue(L, 1);
-    frame_meta_ref = luaL_ref(host_L, LUA_REGISTRYINDEX);
+    lua_rawset(L, LUA_REGISTRYINDEX);
     return 0;
 }
 
@@ -710,8 +762,10 @@ int luaopen_lua_sys_bridge(lua_State *L) {
 #ifdef _WIN32
     bridge_resolve_symbols();
 #endif
-    if (!host_L) host_L = L;
     luaL_register(L, "lua-sys.bridge", bridge_funcs);
+    /* Seed this state's registry with the shared metatables. Other states
+     * that share the same dlopen'd copy of this .so build them lazily (see
+     * bridge_make_callable / hook_dispatch). */
     init_callable_metatable(L);
     init_hook_info_metatable(L);
     return 1;
