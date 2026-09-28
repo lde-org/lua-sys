@@ -2406,3 +2406,72 @@ test.it("a frame from a coroutine degrades after close()", function()
 	test.equal(0, #frame:locals())
 	test.equal(nil, frame:getLocal("marker"))
 end)
+
+-- ─── Memory accounting ───────────────────────────────────────────────────
+
+test.it("state:memory() reports the bytes of the state", function()
+	local state = lua.new()
+	local base = state:memory()
+	test.equal("number", type(base))
+	test.truthy(base > 0, "a fresh state holds memory")
+
+	local before = state:memory()
+	local big = state:eval([[return string.rep("x", 100000)]])
+	test.truthy(state:memory() > before + 100000, "the usage grows with the string")
+	test.equal(100000, #big)
+
+	big = nil
+	state:eval("collectgarbage('collect')")
+	test.truthy(state:memory() < before + 100000, "the usage drops after a collection")
+	state:close()
+end)
+
+test.it("state:setMemoryLimit stops an allocation that is too large", function()
+	local state = lua.new()
+	state:setMemoryLimit(state:memory() + 200000)
+
+	local ok, err = state:load([[return #string.rep("y", 2000000)]]):pcall()
+	test.falsy(ok)
+	test.includes(err, "not enough memory")
+
+	-- A small allocation still works while the cap is in force.
+	test.equal(4, state:eval([[return #("abcd")]]))
+	state:close()
+end)
+
+test.it("state:setMemoryLimit(0) removes the limit", function()
+	local state = lua.new()
+	state:setMemoryLimit(state:memory() + 10000)
+	test.falsy((state:load([[return #string.rep("z", 100000)]]):pcall()))
+
+	state:setMemoryLimit(0)
+	test.equal(100000, state:eval([[return #string.rep("z", 100000)]]))
+	state:close()
+end)
+
+test.it("a memory limit does not block close()", function()
+	local state = lua.new()
+	state:setMemoryLimit(state:memory() + 1)
+	state:close()
+	test.equal(nil, state.L)
+end)
+
+test.it("state:memory() and state:setMemoryLimit() reject a closed state", function()
+	local state = lua.new()
+	state:close()
+	local ok, err = pcall(function() return state:memory() end)
+	test.falsy(ok)
+	test.includes(err, "state is closed")
+	local ok2, err2 = pcall(function() state:setMemoryLimit(1000) end)
+	test.falsy(ok2)
+	test.includes(err2, "state is closed")
+end)
+
+test.it("memory is counted per state", function()
+	local first = lua.new()
+	local second = lua.new()
+	first:eval([[return string.rep("m", 400000)]])
+	test.truthy(first:memory() > second:memory() + 400000)
+	second:close()
+	first:close()
+end)

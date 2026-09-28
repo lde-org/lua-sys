@@ -5,6 +5,7 @@
 # Guides
 
 - [Passing A Function to Lua](guides/passing.md)
+- [Sandboxing](guides/sandboxing.md)
 
 # Reference
 

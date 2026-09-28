@@ -24,7 +24,7 @@ primitives, or by reference for tables, functions, userdata and threads.
 | Object | Members |
 |---|---|
 | `lua` | [`new()`](#luanew--luastate) |
-| `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`close`](#stateclose), `L` |
+| `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`memory`](#statememory--integer), [`setMemoryLimit`](#statesetmemorylimitbytes), [`close`](#stateclose), `L` |
 | `lua.Chunk` | [`eval`](#chunkeval--value), [`call`](#chunkcall), [`pcall`](#chunkpcall--true---false-err), [`xpcall`](#chunkxpcall--true---false-err), [`setName`](#chunksetnamename--luachunk), [`setMode`](#chunksetmodemode--luachunk), [`getMode`](#chunkgetmode--text--bytecode--both), [`isBytecode`](#chunkisbytecode--boolean) |
 | guest callable | `fn(...)`, [`fn:pcall(...)`](#fnpcall--true---false-err) |
 | `lua.Table` | [`get`](#tablegetkey--value), [`set`](#tablesetkey-value), field syntax, [`pairs`](#tablepairs--iterator), [`ipairs`](#tableipairs--iterator), [`type`](#valuetype--string), [`value`](#valuevalue--any), [`free`](#valuefree) |
@@ -149,6 +149,48 @@ become invalid. Their registry references stop with the state.
 
 Close the state one time only, at the end of its life. Do not use the objects
 of a closed state.
+
+### `state:memory() → integer`
+
+The number of bytes that the guest state holds now. The number comes from the
+allocator of the state, so it is exact. A fresh state starts at about 35 KB,
+because the standard libraries are open.
+
+```lua
+local state = lua.new()
+print(state:memory())            -- about 35960
+
+local big = state:eval([[return string.rep("x", 1000000)]])
+print(state:memory())            -- about 1 MB more
+
+big = nil
+state:eval("collectgarbage('collect')")
+print(state:memory())            -- lower again
+```
+
+The count follows the blocks that the state holds, not the live data. After a
+collection, the state can keep memory for later use, so the value does not
+always fall to the earlier figure.
+
+### `state:setMemoryLimit(bytes)`
+
+Limits the guest state to `bytes`. An allocation that would pass the limit
+fails, and the guest gets the error `not enough memory`. The value `0` removes
+the limit, which is the default. The two limits of a state are separate, and a
+limit does not stop `state:close()`.
+
+```lua
+state:setMemoryLimit(state:memory() + 200000)
+
+local ok, err = state:load([[return string.rep("y", 2000000)]]):pcall()
+-- ok == false, err contains "not enough memory"
+
+state:setMemoryLimit(0)          -- no limit again
+```
+
+The guest can catch the error and continue with less memory, so treat the limit
+as a control on the size of the state, and combine it with a hook for the
+execution time.
 
 ## Evaluating code
 

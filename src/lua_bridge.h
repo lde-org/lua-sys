@@ -145,6 +145,8 @@ int  lua_pcall (lua_State *L, int nargs, int nresults, int errfunc);
 int  lua_error (lua_State *L);
 
 /* ── State ── */
+typedef void *(*lua_Alloc)(void *ud, void *ptr, size_t osize, size_t nsize);
+lua_State *lua_newstate(lua_Alloc f, void *ud);
 lua_State *luaL_newstate(void);
 void       luaL_openlibs(lua_State *L);
 void       lua_close  (lua_State *L);

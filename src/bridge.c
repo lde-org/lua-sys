@@ -59,6 +59,7 @@
     X(int,          lua_pcall,              (lua_State *L, int nargs, int nresults, int errfunc)) \
     X(int,          lua_error,              (lua_State *L)) \
     X(lua_State *,  luaL_newstate,          (void)) \
+    X(lua_State *,  lua_newstate,           (lua_Alloc, void *)) \
     X(void,         luaL_openlibs,          (lua_State *L)) \
     X(void,         lua_close,              (lua_State *L)) \
     X(int,          luaJIT_setmode,         (lua_State *L, int idx, int mode)) \
@@ -781,10 +782,42 @@ static int bridge_set_frame_meta(lua_State *L) {
 
 // Returns the new state as a lightuserdata so no lua_State* cdata crosses
 // the call boundary — safe to call from within a guest callback.
+// ── Memory accounting ─────────────────────────────────────────────────────
+//
+// Every guest state counts its own allocations, so the host can read the usage
+// and set a hard cap. box[0] is the bytes in use, box[1] is the cap (0 = no
+// cap). The box belongs to the lua.State object, which stays alive as long as
+// anything can call into the guest.
+
+typedef struct { int64_t used; int64_t limit; } mem_box;
+
+static void *limited_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+    mem_box *box = (mem_box *)ud;
+    size_t old = (ptr != NULL) ? osize : 0;
+
+    if (nsize == 0) {
+        if (ptr != NULL) {
+            box->used -= (int64_t)old;
+            free(ptr);
+        }
+        return NULL;
+    }
+    if (box->limit > 0 && nsize > old &&
+        box->used + (int64_t)(nsize - old) > box->limit) {
+        return NULL; /* over the cap: the guest gets "not enough memory" */
+    }
+    void *np = realloc(ptr, nsize);
+    if (np != NULL) {
+        box->used += (int64_t)nsize - (int64_t)old;
+    }
+    return np;
+}
+
 static int bridge_new_state(lua_State *L) {
-    lua_State *new_state = luaL_newstate();
+    mem_box *box = (mem_box *)(intptr_t)lua_tointeger(L, 1);
+    lua_State *new_state = lua_newstate(limited_alloc, box);
     if (!new_state) {
-        lua_pushstring(L, "bridge_new_state: luaL_newstate() returned NULL");
+        lua_pushstring(L, "bridge_new_state: lua_newstate() returned NULL");
         lua_error(L);
         return 0;
     }

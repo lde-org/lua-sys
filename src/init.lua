@@ -991,9 +991,28 @@ function State:setHook(fn, mask, count)
 	bridge.set_hook(tonumber(ffi.cast("intptr_t", L)), self._hook_ref, bits, count)
 end
 
+--- The number of bytes that the guest state holds now. The count comes from
+--- the allocator of the state, so it is exact.
+---@return integer
+function State:memory()
+	if self.L == nil then closedError() end
+	return tonumber(self._mem_box[0])
+end
+
+--- Limit the memory of the guest state to `bytes`. An allocation that would
+--- pass the limit fails, and the guest gets the error "not enough memory".
+--- The value 0 removes the limit, which is the default.
+---@param bytes integer
+function State:setMemoryLimit(bytes)
+	if self.L == nil then closedError() end
+	self._mem_box[1] = bytes or 0
+end
+
 function State:close()
 	if self.L then
 		self._closed_flag[0] = 1
+		-- No cap while closing: the state releases its memory block by block.
+		self._mem_box[1] = 0
 		if self._hook_ref then
 			bridge.unregister(self._hook_ref)
 			self._hook_ref = nil
@@ -1297,11 +1316,16 @@ lua.profiler = require("lua-sys.profiler")
 
 ---@return lua.State
 function lua.new()
-	-- bridge.new_state() calls luaL_newstate() and luaL_openlibs() fully in C
-	-- and returns the pointer as lightuserdata. No FFI cdata argument crosses
-	-- the boundary, so a host callback can call this safely. The cast to
-	-- lua_State* cdata happens here, on host_L, outside guest execution.
-	local light = bridge.new_state()
+	-- int64[2] with the bytes in use and the cap (0 = no cap). The allocator of
+	-- the state reads and writes it, and the count never leaves C.
+	local box = ffi.new("int64_t[2]")
+
+	-- bridge.new_state() calls lua_newstate() with the counting allocator and
+	-- then luaL_openlibs(), fully in C, and returns the pointer as
+	-- lightuserdata. No FFI cdata argument crosses the boundary, so a host
+	-- callback can call this safely. The cast to lua_State* cdata happens here,
+	-- on host_L, outside guest execution.
+	local light = bridge.new_state(tonumber(ffi.cast("intptr_t", box)))
 	local L     = ffi.cast("lua_State*", light)
 	local id    = nextGuestId
 	nextGuestId = nextGuestId + 1
@@ -1314,6 +1338,7 @@ function lua.new()
 		-- callback and uses this to keep a nested callback from enabling it
 		-- again while an outer callback still runs.
 		_jit_depth = ffi.new("int[1]"),
+		_mem_box   = box,
 	}, State)
 	guestStates[light] = state
 	guestById[id]      = state
