@@ -24,7 +24,7 @@ primitives, or by reference for tables, functions, userdata and threads.
 | Object | Members |
 |---|---|
 | `lua` | [`new()`](#luanew--luastate) |
-| `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`memory`](#statememory--integer), [`setMemoryLimit`](#statesetmemorylimitbytes), [`close`](#stateclose), `L` |
+| `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`memory`](#statememory--integer), [`setMemoryLimit`](#statesetmemorylimitbytes), [`setChainLimit`](#statesetchainlimitlevels), [`chainDepth`](#statechaindepth--integer), [`close`](#stateclose), `L` |
 | `lua.Chunk` | [`eval`](#chunkeval--value), [`call`](#chunkcall), [`pcall`](#chunkpcall--true---false-err), [`xpcall`](#chunkxpcall--true---false-err), [`setName`](#chunksetnamename--luachunk), [`setMode`](#chunksetmodemode--luachunk), [`getMode`](#chunkgetmode--text--bytecode--both), [`isBytecode`](#chunkisbytecode--boolean) |
 | guest callable | `fn(...)`, [`fn:pcall(...)`](#fnpcall--true---false-err) |
 | `lua.Table` | [`get`](#tablegetkey--value), [`set`](#tablesetkey-value), field syntax, [`pairs`](#tablepairs--iterator), [`ipairs`](#tableipairs--iterator), [`type`](#valuetype--string), [`value`](#valuevalue--any), [`free`](#valuefree) |
@@ -149,6 +149,34 @@ become invalid. Their registry references stop with the state.
 
 Close the state one time only, at the end of its life. Do not use the objects
 of a closed state.
+
+### `state:setChainLimit(levels)`
+
+Limits the depth of a nested host to guest chain. The default is 200 levels,
+and the value `0` removes the limit.
+
+Each level of a chain, for example a host callback that calls a guest function
+that calls a host callback, uses C stack. A chain that is too deep stops the
+process, and a guest can build such a chain on purpose: write the guest handler
+with a tail call, and the guest Lua stack stays flat while the C stack grows.
+
+```lua
+state:setChainLimit(500)
+
+local ok, err = pcall(handler, 5000)
+-- ok == false, err contains "cross-state call chain reached its limit"
+```
+
+The error follows the usual rules. A guest function raises it on the host, and
+`fn:pcall()` returns it. Inside the guest, a `pcall` around the call that
+reaches the limit catches it. The depth is restored on each exit, so the state
+keeps its full budget after the error.
+
+### `state:chainDepth() → integer`
+
+The number of levels of the host to guest chain that are active now. The value
+is `0` outside a chain, and `1` inside a single host callback called from the
+guest. Use it for diagnostics.
 
 ### `state:memory() → integer`
 

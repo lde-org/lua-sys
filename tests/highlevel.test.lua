@@ -2475,3 +2475,90 @@ test.it("memory is counted per state", function()
 	second:close()
 	first:close()
 end)
+
+-- ─── Chain depth limit ───────────────────────────────────────────────────
+
+--- Build a state whose host callback dispatches back into a guest handler.
+--- The handler uses a tail call, so the guest Lua stack stays flat and only
+--- the C stack grows: this is the shape that stops the process without a
+--- limit.
+---@param limit integer?
+local function make_chain_state(limit)
+	local state = lua.new()
+	if limit ~= nil then state:setChainLimit(limit) end
+	local handler
+	state:globals().dispatch = function(n) return handler(n) end
+	handler = state:eval([[
+		return function(n)
+			if n <= 0 then return "end" end
+			return dispatch(n - 1)
+		end
+	]])
+	return state, handler
+end
+
+test.it("a deep chain gives an error instead of stopping the process", function()
+	local state, handler = make_chain_state()
+	local ok, err = pcall(handler, 5000)
+	test.falsy(ok)
+	test.includes(err, "cross-state call chain reached its limit")
+	test.equal(0, state:chainDepth(), "the depth counter returns to zero")
+	test.equal("end", handler(20), "the state works again after the error")
+	state:close()
+end)
+
+test.it("state:chainDepth() reports the depth during a chain", function()
+	local state = lua.new()
+	local inside = nil
+	state:globals().cb = function()
+		inside = state:chainDepth()
+		return 0
+	end
+	local fn = state:eval("return function() return cb() end")
+
+	test.equal(0, state:chainDepth(), "zero outside a call")
+	fn()
+	test.equal(1, inside, "one level inside the callback")
+	test.equal(0, state:chainDepth(), "zero again after the call")
+	state:close()
+end)
+
+test.it("state:setChainLimit(0) removes the limit", function()
+	local state, handler = make_chain_state(0)
+	test.equal("end", handler(500))
+	test.equal(0, state:chainDepth())
+	state:close()
+end)
+
+test.it("an ordinary nesting depth stays below the default limit", function()
+	local state, handler = make_chain_state()
+	test.equal("end", handler(50))
+	test.equal("end", handler(150))
+	test.equal(0, state:chainDepth())
+	state:close()
+end)
+
+test.it("the guest can catch the chain error itself", function()
+	local state, handler = make_chain_state(3)
+	state:globals().dispatch = function(n) return handler(n) end
+	local ok, err = state:load([[
+		local ok, err = pcall(dispatch, 40)
+		return tostring(ok) .. "|" .. tostring(err)
+	]]):pcall()
+	test.truthy(ok)
+	test.includes(err, "false|")
+	test.includes(err, "reached its limit")
+	test.equal(0, state:chainDepth())
+	state:close()
+end)
+
+test.it("state:setChainLimit rejects a closed state", function()
+	local state = lua.new()
+	state:close()
+	local ok, err = pcall(function() state:setChainLimit(10) end)
+	test.falsy(ok)
+	test.includes(err, "state is closed")
+	local ok2, err2 = pcall(function() return state:chainDepth() end)
+	test.falsy(ok2)
+	test.includes(err2, "state is closed")
+end)

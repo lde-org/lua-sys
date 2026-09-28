@@ -379,7 +379,9 @@ static void jit_guard_leave(lua_State *owner, int *depth) {
 // The owner's stack must be fully restored on every exit path to avoid
 // corrupting nested guest→host→guest→host call chains.
 
-static int dispatch_callback(lua_State *guest) {
+// The body returns -1 when the error message is on the guest stack. It never
+// raises, so the chain guard of the caller always restores its counter.
+static int dispatch_callback_body(lua_State *guest) {
     int fn_ref       = (int)lua_tointeger(guest, lua_upvalueindex(1));
     int slow_ref     = (int)lua_tointeger(guest, lua_upvalueindex(2));
     lua_State *owner = (lua_State *)lua_touserdata(guest, lua_upvalueindex(3));
@@ -434,8 +436,7 @@ static int dispatch_callback(lua_State *guest) {
         const char *err = lua_tostring(owner, -1);
         lua_pushstring(guest, err ? err : "bridge: host error");
         lua_settop(owner, saved_top);
-        lua_error(guest);
-        return 0;
+        return -1;
     }
 
     int nresults = lua_gettop(owner) - saved_top;
@@ -451,13 +452,43 @@ static int dispatch_callback(lua_State *guest) {
                 "only primitives (nil, boolean, number, string) "
                 "can be returned from host to guest",
                 lua_typename(owner, lua_type(owner, saved_top + 1 + i)));
-            lua_error(guest);
-            return 0;
+            return -1;
         }
     }
 
     lua_settop(owner, saved_top);
     return nresults;
+}
+
+// Guest -> host dispatch, with the chain guard.
+//
+// Every level of a nested host <-> guest chain passes through this function, so
+// its counter is the depth of the chain. Each level costs C stack, and a chain
+// that is too deep stops the process: deepen it inside a tail call on the guest
+// side and the guest Lua stack stays flat, so only the C stack grows. The
+// counter belongs to the guest state (upvalue 5): box[0] is the current depth
+// and box[1] is the limit (0 = no limit).
+static int dispatch_callback(lua_State *guest) {
+    int *box = (int *)(intptr_t)lua_tointeger(guest, lua_upvalueindex(5));
+    if (box == NULL) {
+        int n = dispatch_callback_body(guest);
+        if (n < 0) lua_error(guest);
+        return n;
+    }
+
+    if (box[1] > 0 && box[0] >= box[1]) {
+        lua_pushfstring(guest,
+            "bridge: the cross-state call chain reached its limit of %d levels "
+            "(state:setChainLimit)", box[1]);
+        lua_error(guest);
+        return 0;
+    }
+
+    box[0]++;
+    int n = dispatch_callback_body(guest);
+    box[0]--;
+    if (n < 0) lua_error(guest);
+    return n;
 }
 
 // ── Exported functions ────────────────────────────────────────────────────
@@ -490,7 +521,8 @@ static int bridge_push_callback(lua_State *L) {
     lua_pushinteger(guest, slow_ref);
     lua_pushlightuserdata(guest, (void *)L); /* upvalue 3: owner */
     lua_pushinteger(guest, lua_tointeger(L, 4)); /* upvalue 4: JIT depth counter */
-    lua_pushcclosure(guest, dispatch_callback, 4);
+    lua_pushinteger(guest, lua_tointeger(L, 5)); /* upvalue 5: chain depth box */
+    lua_pushcclosure(guest, dispatch_callback, 5);
     return 0;
 }
 

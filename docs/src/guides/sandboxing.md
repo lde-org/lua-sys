@@ -53,7 +53,11 @@ Run the code in a state that you prepare, and remove every path out:
    [`state:setMemoryLimit()`](../reference.md#statesetmemorylimitbytes).
 5. Set a deadline with [`state:setHook()`](../reference.md#statesethookfn-mask--count)
    and a count mask, with no `jit` and no `debug` in the guest.
-6. Cap the output that host callbacks give back to the guest, for example the
+6. Know the depth of the call chain. The bridge limits it to 200 levels, and
+   [`state:setChainLimit()`](../reference.md#statesetchainlimitlevels) changes
+   that figure. A guest that recurses inside a tail call keeps its own stack
+   flat, so without this limit it can stop the process through the C stack.
+7. Cap the output that host callbacks give back to the guest, for example the
    bytes of a print function, because the guest controls how often it calls
    them.
 
@@ -64,9 +68,10 @@ security boundary for the LuaJIT virtual machine itself:
 
 - A hostile bytecode chunk can still damage the interpreter, because LuaJIT
   trusts its own bytecode. Refuse bytecode with a text mode.
-- The bridge calls a host callback on the C stack of the guest. A long chain of
-  host to guest to host calls uses C stack space for each step, so a sandbox
-  needs a limit on the depth of the chain.
+- A long chain of host to guest to host calls uses C stack space for each step.
+  The bridge limits the chain to 200 levels by default, which is safe for a
+  thread stack of 1 MB. Refer to
+  [`state:setChainLimit()`](../reference.md#statesetchainlimitlevels).
 - The library gives no limit on execution time by itself. Use a hook, as in
   step 5 above.
 

@@ -75,6 +75,10 @@ local function isGuestValue(v)
 	return mt ~= nil and rawget(mt, "_is_lua_value") == true
 end
 
+-- Default limit of a nested host <-> guest chain. One level needs about 450
+-- bytes of C stack, and a thread stack can be 1 MB, so stay well below that.
+local CHAIN_LIMIT_DEFAULT = 200
+
 -- A method that dereferences state.L must call this first. After close(), L is
 -- nil and a raw call would use a freed lua_State. The level points at the
 -- caller of the public method that runs the check.
@@ -336,7 +340,8 @@ toLua = function(guestState, L, value)
 			local callbackId = bridge.register(value)
 			table.insert(guestState._callbacks, { id = callbackId, fn = value })
 			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId,
-				dispatchCallbackSlowRef, tonumber(ffi.cast("intptr_t", guestState._jit_depth)))
+				dispatchCallbackSlowRef, tonumber(ffi.cast("intptr_t", guestState._jit_depth)),
+				tonumber(ffi.cast("intptr_t", guestState._chain_box)))
 		end
 	elseif valueType == "table" then
 		-- Plain host table → auto-coerce to a guest table via state:table().
@@ -991,6 +996,22 @@ function State:setHook(fn, mask, count)
 	bridge.set_hook(tonumber(ffi.cast("intptr_t", L)), self._hook_ref, bits, count)
 end
 
+--- Limit the depth of a nested host <-> guest call chain. Each level of the
+--- chain uses C stack, so a chain that is too deep stops the process. The
+--- default is 200 levels, and the value 0 removes the limit.
+---@param levels integer
+function State:setChainLimit(levels)
+	if self.L == nil then closedError() end
+	self._chain_box[1] = levels or 0
+end
+
+--- The current depth of the host <-> guest chain, for diagnostics.
+---@return integer
+function State:chainDepth()
+	if self.L == nil then closedError() end
+	return tonumber(self._chain_box[0])
+end
+
 --- The number of bytes that the guest state holds now. The count comes from
 --- the allocator of the state, so it is exact.
 ---@return integer
@@ -1319,6 +1340,9 @@ function lua.new()
 	-- int64[2] with the bytes in use and the cap (0 = no cap). The allocator of
 	-- the state reads and writes it, and the count never leaves C.
 	local box = ffi.new("int64_t[2]")
+	-- int[2] for the chain guard: [0] is the depth, [1] is the limit.
+	local chain = ffi.new("int[2]")
+	chain[1] = CHAIN_LIMIT_DEFAULT
 
 	-- bridge.new_state() calls lua_newstate() with the counting allocator and
 	-- then luaL_openlibs(), fully in C, and returns the pointer as
@@ -1339,6 +1363,10 @@ function lua.new()
 		-- again while an outer callback still runs.
 		_jit_depth = ffi.new("int[1]"),
 		_mem_box   = box,
+		-- int[2]: the depth of the current host <-> guest chain and its limit.
+		-- Each level costs C stack, so a chain that is too deep stops the
+		-- process.
+		_chain_box = chain,
 	}, State)
 	guestStates[light] = state
 	guestById[id]      = state
