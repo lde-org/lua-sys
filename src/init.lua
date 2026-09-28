@@ -275,7 +275,7 @@ toLua = function(guestState, L, value)
 		else
 			-- value is a plain host function; register it as a C closure on the
 			-- guest state. bridge.push_callback does this entirely in C to avoid
-			-- triggering LuaJIT's FFI re-entrancy crash (see docs/bridge-design.md).
+			-- triggering LuaJIT's FFI re-entrancy crash (see docs/src/bridge-design.md).
 			local callbackId = bridge.register(value)
 			table.insert(guestState._callbacks, { id = callbackId, fn = value })
 			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId, dispatchCallbackSlowRef)
@@ -368,7 +368,7 @@ dispatchCallbackSlowRef = bridge.register(dispatchCallbackSlow)
 -- bound_call is returned directly as the callable — no Lua wrapper.
 -- Every host↔guest transition goes through a lua_CFunction boundary,
 -- which is required to avoid LuaJIT's FFI re-entrancy crash.
--- See docs/bridge-design.md.
+-- See docs/src/bridge-design.md.
 --
 -- The callable carries a function metatable (attached in C by
 -- bridge.make_callable) providing `fn:pcall(...)`, which runs the guest

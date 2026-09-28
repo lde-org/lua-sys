@@ -1,0 +1,9 @@
+.content h2,
+.content h3 {
+  margin-block-start: 1.5em;
+}
+
+.content h4,
+.content h5 {
+  margin-block-start: 1.25em;
+}

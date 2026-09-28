@@ -1,0 +1,7 @@
+[book]
+title = "lua-sys Documentation"
+authors = ["David Cruz"]
+language = "en"
+
+[output.html]
+additional-css = ["theme/custom.css"]
