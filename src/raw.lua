@@ -94,7 +94,7 @@ ffi.cdef [[
   int luaL_getmetafield(lua_State *L, int obj, const char *e);
   const char *luaL_gsub(lua_State *L, const char *s, const char *p, const char *r);
   int luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, const char *name);
-  int luaL_loadbufferx(lua_State *L, const char *buff, size_t sz, const char *name);
+  int luaL_loadbufferx(lua_State *L, const char *buff, size_t sz, const char *name, const char *mode);
   int luaL_loadfile(lua_State *L, const char *filename);
   int luaL_loadfilex(lua_State *L, const char *filename, const char *mode);
   int luaL_loadstring(lua_State *L, const char *s);
@@ -250,7 +250,7 @@ ffi.cdef [[
 ---@field luaL_getmetafield fun(L: lua.raw.State, obj: integer, e: string): integer
 ---@field luaL_gsub fun(L: lua.raw.State, s: string, p: string, r: string): string
 ---@field luaL_loadbuffer fun(L: lua.raw.State, buff: string, sz: integer, name: string): integer
----@field luaL_loadbufferx fun(L: lua.raw.State, buff: string, sz: integer, name: string): integer
+---@field luaL_loadbufferx fun(L: lua.raw.State, buff: string, sz: integer, name: string, mode: string): integer
 ---@field luaL_loadfile fun(L: lua.raw.State, filename: string): integer
 ---@field luaL_loadfilex fun(L: lua.raw.State, filename: string, mode: string): integer
 ---@field luaL_loadstring fun(L: lua.raw.State, s: string): integer
