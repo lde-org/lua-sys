@@ -380,9 +380,10 @@ Arguments and results obey the rules above. The bridge copies primitives, and
 it passes tables by reference. An error in the guest raises an error on the
 host.
 
-Each crossing makes a new host closure. Therefore, two references to the same
-guest function are not `==` on the host. The same rule applies to two proxies
-of one guest table. Compare values in the guest if identity is important.
+A guest function has one callable for the life of its state. Two fetches of the
+same guest function therefore give the same host function, and `==` is true. Two
+proxies of one guest table are different objects. Compare values in the guest
+if identity is important.
 
 #### `fn:pcall(...) → true, ... | false, err`
 

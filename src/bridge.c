@@ -152,9 +152,13 @@ static lua_State *decode_guest_ptr(lua_State *L, int stack_pos) {
 // Upvalue 2: integer        — guest registry ref for the function
 // Upvalue 3: table          — guestState (lua.State object)
 // Upvalue 4: integer        — registry ref for callGuestSlow(guestState, guestRef, ...)
+// Upvalue 5: integer        — address of the owner's closed flag
+// Upvalue 6: integer        — registry ref for convertGuestResults
 //
-// All-primitive args/results go through the fast path (direct copy).
-// Any compound arg or result falls back to callGuestSlow on the Lua side.
+// Primitive args and results copy directly. Compound args go through
+// callGuestSlow on the Lua side. A compound result goes through
+// convertGuestResults, which reads the results from the guest stack, so the
+// guest function never runs a second time.
 
 static int bound_call(lua_State *host) {
     /* lua-sys sets this flag before lua_close. Check it FIRST: the guest
@@ -214,25 +218,34 @@ static int bound_call(lua_State *host) {
     int nresults = lua_gettop(guest) - guest_base;
     if (nresults == 0) return 0; /* guest stack already at guest_base */
 
+    int all_primitive_res = 1;
     for (i = 0; i < nresults; i++) {
-        if (push_primitive_typed(guest, guest_base + 1 + i, host) < 0) {
-            // Compound result — fall back to callGuestSlow with original args.
-            lua_settop(host, nargs);
-            lua_settop(guest, guest_base);
-
-            int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(4));
-            lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref);
-            lua_pushvalue(host, lua_upvalueindex(3));
-            lua_pushinteger(host, fn_ref);
-            for (i = 1; i <= nargs; i++)
-                lua_pushvalue(host, i);
-            status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
-            if (status != LUA_OK) lua_error(host);
-            return lua_gettop(host) - nargs;
+        int t = lua_type(guest, guest_base + 1 + i);
+        if (t != LUA_TNIL && t != LUA_TBOOLEAN && t != LUA_TNUMBER && t != LUA_TSTRING) {
+            all_primitive_res = 0;
+            break;
         }
     }
+
+    if (all_primitive_res) {
+        for (i = 0; i < nresults; i++)
+            push_primitive_typed(guest, guest_base + 1 + i, host);
+        lua_settop(guest, guest_base);
+        return nresults;
+    }
+
+    /* A compound result: convert each result on the Lua side, from the guest
+     * stack. Do NOT call the guest function again — its side effects must
+     * happen one time. */
+    int convert_ref = (int)lua_tointeger(host, lua_upvalueindex(6));
+    lua_rawgeti(host, LUA_REGISTRYINDEX, convert_ref);
+    lua_pushvalue(host, lua_upvalueindex(3));   /* guestState */
+    lua_pushinteger(host, guest_base + 1);      /* first result index */
+    lua_pushinteger(host, nresults);
+    status = lua_pcall(host, 3, LUA_MULTRET, 0);
     lua_settop(guest, guest_base);
-    return nresults;
+    if (status != LUA_OK) lua_error(host);
+    return lua_gettop(host) - nargs;
 }
 
 // ── bound_pcall ───────────────────────────────────────────────────────────
@@ -285,7 +298,8 @@ static int bridge_make_callable(lua_State *L) {
     lua_pushvalue(L, 3);                          /* upvalue 3: guestState */
     lua_pushvalue(L, 4);                          /* upvalue 4: callGuestSlow ref */
     lua_pushvalue(L, 5);                          /* upvalue 5: closed flag address */
-    lua_pushcclosure(L, bound_call, 5);           /* the callable */
+    lua_pushvalue(L, 6);                          /* upvalue 6: result converter */
+    lua_pushcclosure(L, bound_call, 6);           /* the callable */
     /* Ensure the fn:pcall() metatable exists in THIS state's registry. A
      * dlopen'd copy of bridge.so may be shared by many states (musl never
      * unloads libraries), so luaopen — and its init_callable_metatable — only

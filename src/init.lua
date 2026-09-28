@@ -228,6 +228,49 @@ Table.__newindex = function(self, key, value)
 	Table.set(self, key, value)
 end
 
+-- Guest registry key for the table that maps a guest function to its
+-- canonical registry ref.
+local FN_REF_KEY = ffi.new("char[1]")
+
+-- The canonical registry ref of the guest function at `stackIndex`. The map
+-- lives in the guest registry and is keyed by the function, so one guest
+-- function always gives one ref. The host callable cache then hits, the guest
+-- registry stays small, and a fetch is cheap.
+---@param L          lua.raw.State
+---@param stackIndex integer
+---@return integer
+local function guestFnRef(L, stackIndex)
+	if stackIndex < 0 then stackIndex = raw.gettop(L) + stackIndex + 1 end
+
+	raw.pushlightuserdata(L, FN_REF_KEY)
+	raw.rawget(L, LUA_REGISTRYINDEX)           -- [map?]
+	if raw.type(L, -1) == 0 then               -- nil: make the map
+		raw.pop(L, 1)
+		raw.createtable(L, 0, 8)
+		raw.pushlightuserdata(L, FN_REF_KEY)
+		raw.pushvalue(L, -2)
+		raw.rawset(L, LUA_REGISTRYINDEX)       -- registry[FN_REF_KEY] = map
+	end
+	raw.pushvalue(L, stackIndex)               -- [map][fn]
+	raw.rawget(L, -2)                          -- [map][ref?]
+	if raw.type(L, -1) == 3 then               -- a number: the ref
+		-- tonumber: lua_tointeger returns an int64 cdata, and a cdata key
+		-- would not match the Lua number that the miss path returns.
+		local ref = tonumber(raw.tointeger(L, -1))
+		raw.pop(L, 2)
+		return ref
+	end
+
+	raw.pop(L, 1)                              -- [map]
+	raw.pushvalue(L, stackIndex)               -- [map][fn]
+	local ref = raw.ref(L, LUA_REGISTRYINDEX)  -- pops [fn]
+	raw.pushvalue(L, stackIndex)               -- [map][fn]
+	raw.pushinteger(L, ref)                    -- [map][fn][ref]
+	raw.rawset(L, -3)                          -- map[fn] = ref
+	raw.pop(L, 1)
+	return ref
+end
+
 -- ─── fromLua / toLua ──────────────────────────────────────────────────────
 
 ---@param guestState lua.State
@@ -242,12 +285,14 @@ fromLua = function(guestState, L, stackIndex)
 	if typename == "number" then return raw.tonumber(L, stackIndex) end
 	if typename == "string" then return raw.tolstring(L, stackIndex) end
 
+	if typename == "function" then
+		return makeCallable(guestState, guestFnRef(L, stackIndex))
+	end
+
 	raw.pushvalue(L, stackIndex)
 	local ref = raw.ref(L, LUA_REGISTRYINDEX)
 
-	if typename == "function" then
-		return makeCallable(guestState, ref)
-	elseif typename == "table" then
+	if typename == "table" then
 		return Table._new(guestState, ref)
 	else
 		return Value._ref_new(guestState, ref, typename)
@@ -341,6 +386,21 @@ end
 -- closure as upvalue 4. Allows C to invoke the slow path without a Lua wrapper.
 local callGuestSlowRef = bridge.register(callGuestSlow)
 
+-- Convert the results of a host -> guest call that sit on the guest stack at
+-- `first .. first + n - 1`. bound_call calls this from C (upvalue 6) when a
+-- result is compound, so the guest function runs one time only.
+---@param guestState lua.State
+---@param first      integer
+---@param n          integer
+local function convertGuestResults(guestState, first, n)
+	local L = guestState.L
+	local out = {}
+	for i = 1, n do out[i] = fromLua(guestState, L, first + i - 1) end
+	return unpack(out, 1, n)
+end
+
+local convertResultsRef = bridge.register(convertGuestResults)
+
 -- Slow path of dispatch_callback (upvalue 2): turn guest table arguments,
 -- which cross as (tag, ref) pairs, into lua.Table proxies, then call the real
 -- host callback with the argument order and the nil slots intact.
@@ -385,10 +445,21 @@ makeCallable = function(guestState, guestRef)
 		guestState._guest_L_ptr = tonumber(ffi.cast("intptr_t", guestState.L))
 	end
 
+	-- One callable per guest function. A new closure at each crossing costs a
+	-- C closure, grows the map, and stops the caller from being compiled.
+	local cache = guestState._guest_fn_by_ref
+	if cache == nil then
+		cache = {}
+		guestState._guest_fn_by_ref = cache
+	end
+	local cached = cache[guestRef]
+	if cached ~= nil then return cached end
+
 	local boundCFn = bridge.make_callable(
 		guestState._guest_L_ptr, guestRef, guestState, callGuestSlowRef,
-		tonumber(ffi.cast("intptr_t", guestState._closed_flag)))
+		tonumber(ffi.cast("intptr_t", guestState._closed_flag)), convertResultsRef)
 
+	cache[guestRef] = boundCFn
 	guestState._guest_fns = guestState._guest_fns or {}
 	guestState._guest_fns[boundCFn] = guestRef
 	return boundCFn
@@ -933,6 +1004,8 @@ function State:close()
 		guestById[self._guest_id]      = nil
 		self.L          = nil
 		self._callbacks = {}
+		self._guest_fns       = nil
+		self._guest_fn_by_ref = nil
 	end
 end
 
