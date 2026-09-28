@@ -44,8 +44,8 @@ local dispatchCallbackSlowRef
 local guestStates = {}
 
 -- id → lua.State, for resolving coroutine threads: the guest registry (keyed
--- by GUEST_ID_KEY) is shared by all threads of a state, so any thread — main
--- or coroutine — can be mapped back to its lua.State wrapper.
+-- by GUEST_ID_KEY) is shared by all threads of a state, so any thread, main
+-- or coroutine, can be mapped back to its lua.State wrapper.
 local guestById   = {}
 local nextGuestId = 1
 local GUEST_ID_KEY = ffi.new("char[1]")
@@ -73,6 +73,13 @@ local function isGuestValue(v)
 	if type(v) ~= "table" then return false end
 	local mt = getmetatable(v)
 	return mt ~= nil and rawget(mt, "_is_lua_value") == true
+end
+
+-- A method that dereferences state.L must call this first. After close(), L is
+-- nil and a raw call would use a freed lua_State. The level points at the
+-- caller of the public method that runs the check.
+local function closedError()
+	error("state is closed", 3)
 end
 
 -- ─── Value ────────────────────────────────────────────────────────────────
@@ -121,7 +128,6 @@ end
 ---@class lua.Table: lua.Value
 local Table      = { _is_lua_value = true }
 for k, v in pairs(Value) do Table[k] = v end
-Table.__index = Table
 Table.__gc    = Value.free
 
 ---@param state lua.State
@@ -134,6 +140,7 @@ end
 function Table:get(key)
 	local guestState = self._state
 	local L          = guestState.L
+	if L == nil then closedError() end
 	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
 	toLua(guestState, L, key)
 	raw.gettable(L, -2)
@@ -146,6 +153,7 @@ end
 function Table:set(key, value)
 	local guestState = self._state
 	local L          = guestState.L
+	if L == nil then closedError() end
 	raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
 	toLua(guestState, L, key)
 	toLua(guestState, L, value)
@@ -157,9 +165,11 @@ end
 -- Usage: for k, v in t:pairs() do ... end
 function Table:pairs()
 	local guestState = self._state
-	local L          = guestState.L
+	if guestState.L == nil then closedError() end
 	local key_ref    = nil                     -- registry ref for the current iteration key
 	return function()
+		local L = guestState.L
+		if L == nil then closedError() end
 		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref) -- push table
 		if key_ref ~= nil then
 			raw.rawgeti(L, LUA_REGISTRYINDEX, key_ref)
@@ -188,13 +198,15 @@ end
 -- Usage: for i, v in t:ipairs() do ... end
 function Table:ipairs()
 	local guestState = self._state
-	local L          = guestState.L
+	if guestState.L == nil then closedError() end
     local i          = 0
 	return function()
+		local L = guestState.L
+		if L == nil then closedError() end
 		i = i + 1
 		raw.rawgeti(L, LUA_REGISTRYINDEX, self._ref)
 		raw.rawgeti(L, -1, i)
-		if raw.type(L, -1) == 0 then -- nil — end of sequence
+		if raw.type(L, -1) == 0 then -- nil: end of sequence
 			raw.pop(L, 2)
 			return nil
 		end
@@ -270,7 +282,7 @@ toLua = function(guestState, L, value)
 		end
 	elseif valueType == "function" then
 		if guestState._guest_fns and guestState._guest_fns[value] then
-			-- value is a makeCallable closure — push its guest ref directly
+			-- value is a makeCallable closure: push its guest ref directly
 			raw.rawgeti(L, LUA_REGISTRYINDEX, guestState._guest_fns[value])
 		else
 			-- value is a plain host function; register it as a C closure on the
@@ -278,7 +290,8 @@ toLua = function(guestState, L, value)
 			-- triggering LuaJIT's FFI re-entrancy crash (see docs/src/bridge-design.md).
 			local callbackId = bridge.register(value)
 			table.insert(guestState._callbacks, { id = callbackId, fn = value })
-			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId, dispatchCallbackSlowRef)
+			bridge.push_callback(tonumber(ffi.cast("intptr_t", L)), callbackId,
+				dispatchCallbackSlowRef, tonumber(ffi.cast("intptr_t", guestState._jit_depth)))
 		end
 	elseif valueType == "table" then
 		-- Plain host table → auto-coerce to a guest table via state:table().
@@ -328,10 +341,9 @@ end
 -- closure as upvalue 4. Allows C to invoke the slow path without a Lua wrapper.
 local callGuestSlowRef = bridge.register(callGuestSlow)
 
--- Slow path for guest → host callback dispatch (dispatch_callback upvalue 2):
--- converts guest-passed table arguments (received as (tag, ref) pairs) into
--- lua.Table proxies and calls the real host callback, preserving argument
--- order and nil slots. Called by C only when at least one argument is a table.
+-- Slow path of dispatch_callback (upvalue 2): turn guest table arguments,
+-- which cross as (tag, ref) pairs, into lua.Table proxies, then call the real
+-- host callback with the argument order and the nil slots intact.
 ---@param guestPtr lightuserdata
 ---@param fn        function
 local function dispatchCallbackSlow(guestPtr, fn, ...)
@@ -359,23 +371,13 @@ local function dispatchCallbackSlow(guestPtr, fn, ...)
 	return fn(unpack(real, 1, k))
 end
 
--- Registry ref for dispatchCallbackSlow, baked into every dispatch_callback
--- closure as upvalue 2 (alongside the callback's own ref).
+-- upvalue 2 of every dispatch_callback closure
 dispatchCallbackSlowRef = bridge.register(dispatchCallbackSlow)
 
--- Returns a host-callable function backed by a guest registry ref.
---
--- bound_call is returned directly as the callable — no Lua wrapper.
--- Every host↔guest transition goes through a lua_CFunction boundary,
--- which is required to avoid LuaJIT's FFI re-entrancy crash.
--- See docs/src/bridge-design.md.
---
--- The callable carries a function metatable (attached in C by
--- bridge.make_callable) providing `fn:pcall(...)`, which runs the guest
--- call with pcall semantics: `true, ...` on success, `false, err` on error.
---
--- When bound_call detects a compound result it calls callGuestSlow directly
--- from C via upvalue 4, so no Lua wrapper or COMPOUND_TAG check is needed.
+-- Host-callable function for a guest registry ref. bound_call is the callable
+-- itself, so the JIT sees a lua_CFunction boundary (docs/src/bridge-design.md).
+-- C adds fn:pcall() through a function metatable, and calls callGuestSlow
+-- (upvalue 4) when a result is compound.
 ---@param guestState lua.State
 ---@param guestRef   integer
 makeCallable = function(guestState, guestRef)
@@ -384,7 +386,8 @@ makeCallable = function(guestState, guestRef)
 	end
 
 	local boundCFn = bridge.make_callable(
-		guestState._guest_L_ptr, guestRef, guestState, callGuestSlowRef)
+		guestState._guest_L_ptr, guestRef, guestState, callGuestSlowRef,
+		tonumber(ffi.cast("intptr_t", guestState._closed_flag)))
 
 	guestState._guest_fns = guestState._guest_fns or {}
 	guestState._guest_fns[boundCFn] = guestRef
@@ -398,6 +401,9 @@ end
 ---@field _code      string
 ---@field _chunkName string?
 ---@field _chunkMode string?  -- "t", "b" or "bt" for luaL_loadbufferx
+---@field _fnRef     integer? -- registry ref of the compiled chunk
+---@field _fnName    string?  -- name the cached function was compiled with
+---@field _fnMode    string?  -- mode the cached function was compiled with
 local Chunk = {}
 Chunk.__index = Chunk
 
@@ -408,8 +414,23 @@ function Chunk._new(state, code, name)
 	return setmetatable({ _state = state, _code = code, _chunkName = name }, Chunk)
 end
 
--- The Lua mode letters of luaL_loadbufferx, and the words that setMode accepts
--- for them.
+-- Drop the compiled function of a chunk, so the next run compiles again. A
+-- file-local function: the chunk methods must not make a closure per call.
+---@param chunk lua.Chunk
+local function dropChunkCache(chunk)
+	local ref = chunk._fnRef
+	if ref ~= nil then
+		local L = chunk._state.L
+		if L ~= nil then raw.unref(L, LUA_REGISTRYINDEX, ref) end
+		chunk._fnRef = nil
+	end
+end
+
+function Chunk.__gc(chunk)
+	dropChunkCache(chunk)
+end
+
+-- setMode words to the luaL_loadbufferx mode letters
 local CHUNK_MODES = {
 	text     = "t",
 	["t"]    = "t",
@@ -426,8 +447,7 @@ local CHUNK_MODE_NAMES = { t = "text", b = "bytecode", bt = "both" }
 -- Lua marks a precompiled chunk with the escape byte (LUA_SIGNATURE[0]).
 local BYTECODE_SIGNATURE = 27
 
--- True when a source string is a precompiled chunk. A file-local function, so
--- callers make no closure of their own.
+-- True when a source is a precompiled chunk. File-local: no closure per call.
 ---@param code string
 ---@return boolean
 local function isBytecodeSource(code)
@@ -435,27 +455,20 @@ local function isBytecodeSource(code)
 	return code:byte(1) == BYTECODE_SIGNATURE
 end
 
---- Set the chunk name (for debug info). Returns self for chaining.
----
---- Prefix with "@" for a file path (e.g. "@/path/to/file.lua") so that
---- debug.getinfo(1,"S").source returns the correct path inside the guest.
+--- Set the chunk name for debug info, and return self for chaining. Prefix
+--- with "@" for a file path so guest debug.getinfo reports the source.
 ---@param name string
 ---@return lua.Chunk
 function Chunk:setName(name)
+	if name ~= self._chunkName then dropChunkCache(self) end
 	self._chunkName = name
 	return self
 end
 
---- Restrict the format that the chunk accepts. Returns self for chaining.
----
---- `mode` is one of:
----   • "text": source text only. The loader refuses bytecode.
----   • "bytecode": precompiled LuaJIT bytecode only. Text is refused.
----   • "both": text or bytecode. This is the default.
----
---- The Lua mode letters "t", "b" and "bt" are also accepted, and "binary" is
---- an alias of "bytecode". A mismatch raises
---- "attempt to load chunk with wrong mode" when the chunk runs.
+--- Restrict the format that the chunk accepts, and return self for chaining.
+--- `mode` is "text", "bytecode" or "both" (the default). The Lua letters "t",
+--- "b" and "bt" are also correct, and "binary" means "bytecode". A mismatch
+--- raises "attempt to load chunk with wrong mode" when the chunk runs.
 ---@param mode "text"|"bytecode"|"both"|"binary"|"t"|"b"|"bt"
 ---@return lua.Chunk
 function Chunk:setMode(mode)
@@ -466,6 +479,7 @@ function Chunk:setMode(mode)
 	if mapped == nil then
 		error('setMode: unknown mode "' .. mode .. '" (expected "text", "bytecode" or "both")', 2)
 	end
+	if mapped ~= self._chunkMode then dropChunkCache(self) end
 	self._chunkMode = mapped
 	return self
 end
@@ -476,10 +490,8 @@ function Chunk:getMode()
 	return CHUNK_MODE_NAMES[self._chunkMode or "bt"]
 end
 
---- True when the source of the chunk starts with the escape byte that marks a
---- precompiled chunk. Use it to refuse untrusted bytecode before the chunk
---- runs. LuaJIT loads bytecode with the signature "\27LJ". Other binary data
---- also starts with the escape byte, and the loader refuses it.
+--- True when the source starts with the escape byte of a precompiled chunk.
+--- Use it to refuse untrusted bytecode. LuaJIT bytecode starts with "\27LJ".
 ---@return boolean
 function Chunk:isBytecode()
 	return isBytecodeSource(self._code)
@@ -495,9 +507,18 @@ function Chunk:_compile()
 	local L    = self._state.L
 	local code = self._code
 	local name = self._chunkName
-	local mode = self._chunkMode or "bt"
+	local mode = self._chunkMode
+
+	-- Run the function that this chunk compiled with the same name and mode
+	-- before. A chunk compiles one time, not at each run.
+	local ref = self._fnRef
+	if ref ~= nil and self._fnName == name and self._fnMode == mode then
+		raw.rawgeti(L, LUA_REGISTRYINDEX, ref)
+		return L, raw.gettop(L)
+	end
 
 	if type(code) ~= "string" then code = tostring(code) end
+	mode = mode or "bt"
 
 	-- Load with luaL_loadbufferx: it takes a length, so bytecode with null
 	-- bytes inside is not cut short, and it applies the mode. Without a name,
@@ -518,7 +539,12 @@ function Chunk:_compile()
 	if status ~= LUA_OK then
 		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 0)
 	end
-	return L, raw.gettop(L)
+	local fnIdx = raw.gettop(L)
+	raw.pushvalue(L, fnIdx)
+	self._fnRef  = raw.ref(L, LUA_REGISTRYINDEX)
+	self._fnName = name
+	self._fnMode = self._chunkMode
+	return L, fnIdx
 end
 
 --- Compile and evaluate the chunk with the given arguments (accessible
@@ -527,6 +553,7 @@ end
 --- If no value is returned by the chunk, returns nil.
 ---@param ... any
 function Chunk:eval(...)
+	if self._state.L == nil then closedError() end
 	local L, fnIndex = self:_compile()
 	local nargs = select("#", ...)
 	local state = self._state
@@ -553,6 +580,7 @@ Chunk.__call = Chunk.eval
 --- any return values.
 ---@param ... any
 function Chunk:call(...)
+	if self._state.L == nil then closedError() end
 	local L, fnIndex = self:_compile()
 	local nargs = select("#", ...)
 	local state = self._state
@@ -565,24 +593,20 @@ function Chunk:call(...)
 	raw.settop(L, base)
 end
 
---- Compile and execute the chunk with the given arguments, returning
---- `true, ...` (all results) on success or `false, err` on error instead
---- of raising on the host side.
----
---- Unlike :eval(), a guest error is returned as `false, err`. Compile
---- (syntax) errors are also caught and returned as `false, err`.
+--- Like :eval(), but return `true, ...` (all results) or `false, err` instead
+--- of raising. A syntax error is caught too.
 ---@param ... any
 function Chunk:pcall(...)
+	if self._state.L == nil then closedError() end
 	return Chunk._pcall(self, false, ...)
 end
 
---- Like :pcall(), but the error string on failure includes a stack
---- traceback of the guest stack at the point of failure (the guest
---- debug.traceback is installed as pcall's error handler, so the frames
---- are captured before unwinding). Use this when reporting program errors
---- without wrapping the program in a guest-side xpcall launcher.
+--- Like :pcall(), but the error string also has a guest stack traceback. The
+--- guest debug.traceback runs as the error handler, so the frames are complete
+--- before the stack unwinds.
 ---@param ... any
 function Chunk:xpcall(...)
+	if self._state.L == nil then closedError() end
 	return Chunk._pcall(self, true, ...)
 end
 
@@ -595,10 +619,8 @@ function Chunk._pcall(chunk, withTraceback, ...)
 	local L, fnIndex = a, b
 	local base = fnIndex - 1
 
-	-- Install debug.traceback below the function as pcall's error handler so
-	-- the traceback is captured while the guest stack is still intact.
-	-- lua_pcall treats errfunc == 0 as "no handler", so it must point at the
-	-- traceback slot (base + 1 after the insert), never at a zero index.
+	-- debug.traceback goes below the function as the error handler, so the
+	-- traceback is complete before unwinding. errfunc 0 means "no handler".
 	local errfunc   = 0
 	local installed = false
 	if withTraceback then
@@ -610,7 +632,7 @@ function Chunk._pcall(chunk, withTraceback, ...)
 			errfunc   = base + 1
 			installed = true
 		else
-			raw.pop(L, 1) -- guest debug library unavailable — bare message
+			raw.pop(L, 1) -- no guest debug library: keep the bare message
 		end
 	end
 
@@ -650,53 +672,39 @@ end
 local State = {}
 State.__index = State
 
---- Load a Lua chunk as a builder that can be configured before
---- execution. Call :eval() or :call() on the returned Chunk to run it.
+--- Load a chunk as a builder. Configure it, then run it with :eval() or
+--- :call().
 ---
 ---@param chunk     string
 ---@param chunkName string?
 ---@return lua.Chunk
 function State:load(chunk, chunkName)
+	if self.L == nil then closedError() end
 	return Chunk._new(self, chunk, chunkName)
 end
 
---- Compile and evaluate a Lua chunk immediately. Equivalent to
---- `state:load(code, chunkName):eval(...)`.
----
---- A bare expression is automatically wrapped in `return` so it
---- produces a value.
----
---- chunkName follows the LuaJIT convention: prefix with "@" for a
---- file path so that debug.getinfo(1,"S").source returns the correct
---- path inside the guest.
+--- Compile and evaluate a chunk now, the same as
+--- `state:load(code, chunkName):eval()`. A bare expression gets a `return`
+--- wrapper. Prefix chunkName with "@" for a file path.
 ---@param code      string
 ---@param chunkName string?
 function State:eval(code, chunkName)
+	if self.L == nil then closedError() end
 	return self:load(code, chunkName):eval()
 end
 
 ---@return lua.Table
 function State:globals()
 	local L = self.L
+	if L == nil then closedError() end
 	raw.pushvalue(L, LUA_GLOBALSINDEX)
 	local globals = fromLua(self, L, -1)
 	raw.pop(L, 1)
 	return globals
 end
 
---- Create a new empty guest table and return it as a lua.Table.
----
---- If `init` is provided it must be a plain host table. Keys and values
---- are set via tbl:set(k, v) which delegates to toLua for conversion:
----   • string / number / boolean  → copied directly
----   • nested plain table         → auto-coerced via state:table()
----   • lua.Value (guest ref)      → stored as-is
----   • function                   → registered as a host callback (CFunction)
----   • anything else              → error
----
 -- Fill a guest table from a plain host table, with cycle detection through the
--- `seen` set. A file-local function, so State:table makes no closure of its
--- own: a closure per call stops the JIT recorder.
+-- `seen` set. File-local: State:table must not make a closure per call.
 ---@param tbl  lua.Table
 ---@param init table
 ---@param seen table  -- host tables on the current path
@@ -716,10 +724,15 @@ local function populateGuestTable(tbl, init, seen)
 	-- (not a back-edge) is correct
 end
 
+--- Create a guest table. `init` is an optional plain host table: primitives
+--- are copied, a nested plain table becomes a guest table, a lua.Value keeps
+--- its reference, and a host function becomes a callback. Refer to the API
+--- Reference for the conversion rules and the errors.
 ---@param init table?
 ---@return lua.Table
 function State:table(init)
 	local L = self.L
+	if L == nil then closedError() end
 	raw.createtable(L, 0, init and 16 or 0)
 	local ref = raw.ref(L, LUA_REGISTRYINDEX)
 	local tbl = Table._new(self, ref)
@@ -728,9 +741,8 @@ function State:table(init)
 		if type(init) ~= "table" then
 			error("state:table() init argument must be a table, got " .. type(init), 2)
 		end
-		-- Cycle detection: the seen set lives on the State so it persists
-		-- across recursive state:table() calls triggered by toLua coercion.
-		-- The top-level call uses pcall to guarantee cleanup on error.
+		-- The seen set lives on the State, so it survives the recursive
+		-- state:table() calls of toLua coercion. pcall cleans it up on error.
 		local seen = self._table_seen
 		local topLevel = (seen == nil)
 		if topLevel then
@@ -763,18 +775,13 @@ local function setFuncJitMode(guestState, guestRef, mode)
 	raw.pop(L, 1)
 end
 
---- Disable the JIT compiler for the guest state, or for a single guest
---- function when `fn` (a callable obtained from this state) is given.
---- Returns self for chaining.
----
---- Debug hooks only fire on interpreted code, so disabling the JIT is
---- required for line/count hooks to fire reliably on hot code (note that
---- state:setHook does this automatically for the whole state while a hook
---- is installed).
+--- Disable the JIT engine of the guest state, or of one guest function when
+--- `fn` is a callable of this state. Returns self for chaining. A hook needs
+--- interpreted code, and setHook does this for the state while installed.
 ---@param fn function?
 function State:jitOff(fn)
 	local L = self.L
-	if L == nil then error("state is closed", 2) end
+	if L == nil then closedError() end
 	if fn == nil then
 		raw.jit_setmode(L, 0, LUAJIT_MODE_ENGINE + LUAJIT_MODE_OFF)
 	else
@@ -787,12 +794,12 @@ function State:jitOff(fn)
 	return self
 end
 
---- Re-enable the JIT compiler for the guest state, or for a single guest
---- function when `fn` is given. Returns self for chaining.
+--- Enable the JIT engine of the guest state, or of one guest function when
+--- `fn` is given. Returns self for chaining.
 ---@param fn function?
 function State:jitOn(fn)
 	local L = self.L
-	if L == nil then error("state is closed", 2) end
+	if L == nil then closedError() end
 	if fn == nil then
 		raw.jit_setmode(L, 0, LUAJIT_MODE_ENGINE + LUAJIT_MODE_ON)
 	else
@@ -805,19 +812,16 @@ function State:jitOn(fn)
 	return self
 end
 
---- Flush all compiled traces from the guest state. Useful after disabling
---- the JIT or before re-enabling it, to drop previously compiled code.
+--- Flush the compiled traces of the guest state.
 function State:jitFlush()
 	local L = self.L
-	if L == nil then error("state is closed", 2) end
+	if L == nil then closedError() end
 	raw.jit_setmode(L, 0, LUAJIT_MODE_ENGINE + LUAJIT_MODE_FLUSH)
 end
 
 -- ─── Debug hooks ──────────────────────────────────────────────────────────
 
---- A stack frame (`info:stack()`), usable while the guest thread is paused
---- at the hook. Locals/upvalues can be read and written, and code can be
---- evaluated with the frame's locals and upvalues in scope.
+--- A stack frame from `info:stack()`, valid while the hook runs.
 ---@class lua.Frame
 ---@field thread          lua.raw.State -- lightuserdata of the guest lua_State* at runtime
 ---@field level           integer       -- stack level (0 = the hook frame)
@@ -838,9 +842,7 @@ end
 ---@field setUpvalue      fun(self: lua.Frame, name: string, value: any): boolean
 ---@field eval            fun(self: lua.Frame, code: string): boolean, any
 
---- The `info` argument passed to a state:setHook callback. All fields are
---- populated eagerly; `stack()` walks the triggering thread while it is
---- paused at the hook, so it must be called from within the callback.
+--- The `info` argument of a setHook callback. Call `stack()` inside the hook.
 ---@class lua.HookInfo
 ---@field event            "call"|"return"|"line"|"count"|"tailcall"
 ---@field thread           lightuserdata -- lua_State* the hook fired on
@@ -863,9 +865,8 @@ local HOOK_MASK_NAMES = {
 	count       = LUA_MASKCOUNT,
 }
 
---- Parse a hook mask into LuaJIT's LUA_MASK* bitmask: a space-separated
---- string of event names ("line", "call return", "count", ...) or a raw
---- integer bitmask.
+--- Turn a hook mask into a LUA_MASK* bitmask: event names with spaces, for
+--- example "line" or "call return", or an integer bitmask.
 ---@param mask string|integer
 ---@return integer
 local function parseHookMask(mask)
@@ -885,53 +886,19 @@ local function parseHookMask(mask)
 	return bits
 end
 
---- Install or remove a debug hook on the guest state. This is the
---- high-level counterpart to the raw lua_sethook API — no FFI casting or
---- raw callback plumbing required.
----
---- `fn` is a host Lua function called as `fn(event, info)` for every hook
---- event, where `event` is one of "call", "return", "line", "count" or
---- "tailcall".
----
---- `info` (a lua.HookInfo) describes the event. All fields are populated
---- eagerly, including `info.thread` — a lightuserdata holding the lua_State*
---- the hook fired on: the guest main thread, or a coroutine thread running
---- inside it. Cast it back with ffi.cast("lua_State*", info.thread) to call
---- lua_getstack / lua_getinfo / lua_getlocal on the triggering thread
---- (needed for correct stack traces and locals inside coroutines).
----
---- `info:stack()` returns the stack trace of the triggering thread as an
---- array of lua.Frame objects (index 1 = the frame the hook fired in),
---- each with the same debug fields as `info` plus methods to read/write
---- locals and upvalues and evaluate code in the frame. It walks the thread
---- while it is paused at the hook, so it must be called from within the
---- callback — a stored info table raises if you call it after the hook
---- returns.
----
---- `mask` selects which events fire: a space-separated string of event
---- names ("line", "call return line", "count", ...) or an integer bitmask
---- (LUA_MASKCALL=1, LUA_MASKRET=2, LUA_MASKLINE=4, LUA_MASKCOUNT=8).
----
---- `count` is the instruction interval for the "count" event (default 1).
----
---- LuaJIT only fires hooks on interpreted code, so while a hook is installed
---- the guest JIT engine is disabled (and existing traces flushed); removing
---- the hook re-enables it. Use state:jitOff / state:jitOn for explicit
---- control.
----
---- Passing nil removes the hook: `state:setHook(nil)`.
----
---- A hook that errors aborts the running guest code with that error
---- (catchable with pcall around state:eval / chunk:eval), mirroring what
---- calling lua_error from a raw hook does.
+--- Install or remove a debug hook, the high-level form of lua_sethook. The
+--- bridge calls `fn(event, info)` at each event with a lua.HookInfo. `mask`
+--- takes event names or an integer bitmask, and `count` sets the "count"
+--- interval (default 1). setHook(nil) removes the hook. A hook needs
+--- interpreted code, so it disables the guest JIT engine until removal.
 ---@param fn    fun(event: "call"|"return"|"line"|"count"|"tailcall", info: lua.HookInfo)|nil
 ---@param mask  string|integer
 ---@param count integer?
 function State:setHook(fn, mask, count)
 	local L = self.L
-	if L == nil then error("state is closed", 2) end
+	if L == nil then closedError() end
 
-	-- Drop the previous hook callback (if any) before installing a new one.
+	-- Drop the previous hook callback before a new one goes in.
 	if self._hook_ref then
 		bridge.unregister(self._hook_ref)
 		self._hook_ref = nil
@@ -955,6 +922,7 @@ end
 
 function State:close()
 	if self.L then
+		self._closed_flag[0] = 1
 		if self._hook_ref then
 			bridge.unregister(self._hook_ref)
 			self._hook_ref = nil
@@ -980,17 +948,40 @@ Frame.__index = Frame
 ---@param frame lua.Frame
 ---@return lua.State?
 local function frameGuestState(frame)
+	-- A frame is valid only while the hook callback runs. The frame holds its
+	-- info table, and that table clears _hook_active when the hook returns, so
+	-- a stale frame (or a frame of a closed state) stops here and never
+	-- touches the thread pointer.
+	local info = frame._info
+	if info == nil or rawget(info, "_hook_active") ~= true then return nil end
 	return resolveGuestState(frame.thread)
+end
+
+-- One lua_Debug buffer for the frame methods. Each of them runs alone and
+-- none of them runs guest code, so the buffer cannot be clobbered in between.
+local frameDebug = ffi.new("lua_Debug")
+
+-- Resolve a frame for a method call: the owner state and the thread, with
+-- frameDebug positioned at the frame. Returns nil for a stale frame, which is
+-- a frame outside its hook callback or of a closed state. File-local: the
+-- methods make no closure per call.
+---@param frame lua.Frame
+---@return lua.State? guestState
+---@return lua.raw.State? L
+local function frameContext(frame)
+	local guestState = frameGuestState(frame)
+	if guestState == nil then return nil end
+	local L = frame.thread
+	if ffi.C.lua_getstack(L, frame.level, frameDebug) == 0 then return nil end
+	return guestState, L
 end
 
 --- List this frame's active locals as { name, value } pairs, in order.
 ---@return { name: string, value: any }[]
 function Frame:locals()
-	local guestState = frameGuestState(self)
+	local guestState, L = frameContext(self)
 	if guestState == nil then return {} end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return {} end
+	local ar = frameDebug
 	local out = {}
 	for i = 1, 200 do
 		local name = ffi.C.lua_getlocal(L, ar, i)
@@ -1003,11 +994,9 @@ end
 
 ---@param name string
 function Frame:getLocal(name)
-	local guestState = frameGuestState(self)
+	local guestState, L = frameContext(self)
 	if guestState == nil then return nil end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return nil end
+	local ar = frameDebug
 	for i = 1, 200 do
 		local ln = ffi.C.lua_getlocal(L, ar, i)
 		if ln == nil then return nil end
@@ -1027,11 +1016,9 @@ end
 ---@param value any
 ---@return boolean
 function Frame:setLocal(name, value)
-	local guestState = frameGuestState(self)
+	local guestState, L = frameContext(self)
 	if guestState == nil then return false end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return false end
+	local ar = frameDebug
 	for i = 1, 200 do
 		local ln = ffi.C.lua_getlocal(L, ar, i)
 		if ln == nil then return false end
@@ -1049,11 +1036,9 @@ end
 --- List this frame's function's upvalues as { name, value } pairs.
 ---@return { name: string, value: any }[]
 function Frame:upvalues()
-	local guestState = frameGuestState(self)
+	local guestState, L = frameContext(self)
 	if guestState == nil then return {} end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return {} end
+	local ar = frameDebug
 	ffi.C.lua_getinfo(L, "f", ar) -- push the frame's function
 	local fnIdx = raw.gettop(L)
 	local out = {}
@@ -1069,11 +1054,9 @@ end
 
 ---@param name string
 function Frame:getUpvalue(name)
-	local guestState = frameGuestState(self)
+	local guestState, L = frameContext(self)
 	if guestState == nil then return nil end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return nil end
+	local ar = frameDebug
 	ffi.C.lua_getinfo(L, "f", ar)
 	local fnIdx = raw.gettop(L)
 	for i = 1, 200 do
@@ -1097,11 +1080,9 @@ end
 ---@param value any
 ---@return boolean
 function Frame:setUpvalue(name, value)
-	local guestState = frameGuestState(self)
+	local guestState, L = frameContext(self)
 	if guestState == nil then return false end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then return false end
+	local ar = frameDebug
 	ffi.C.lua_getinfo(L, "f", ar)
 	local fnIdx = raw.gettop(L)
 	for i = 1, 200 do
@@ -1120,27 +1101,21 @@ function Frame:setUpvalue(name, value)
 	return false
 end
 
---- Evaluate `code` with this frame's locals and upvalues in scope.
----
---- The chunk runs in a fresh guest environment seeded with the frame's
---- active locals and upvalues; reads of other names fall through (via
---- __index) to the frame function's environment, and writes to new names go
---- there too (via __newindex). On success, assignments to existing locals
---- and upvalues are written back to the frame, so `frame:eval("x = 42")`
---- changes the running program. Returns `true, first result` or
---- `false, err`. Must be called from within the hook callback.
+--- Evaluate `code` with the locals and upvalues of the frame in scope. The
+--- environment chains to the function environment through __index and
+--- __newindex, and assignments to existing locals and upvalues go back into
+--- the frame, so `frame:eval("x = 42")` changes the running program. Returns
+--- `true, firstResult` or `false, err`. Call it inside the hook callback.
 ---@param code string
 ---@return boolean, any
 function Frame:eval(code)
-	local guestState = frameGuestState(self)
+	-- frameDebug is safe here: eval reads the frame only before the pcall, and
+	-- a hook that the pcall triggers gets its own resolution.
+	local guestState, L = frameContext(self)
 	if guestState == nil then
 		return false, "no frame at stack level " .. tostring(self.level)
 	end
-	local L = self.thread
-	local ar = ffi.new("lua_Debug")
-	if ffi.C.lua_getstack(L, self.level, ar) == 0 then
-		return false, "no frame at stack level " .. tostring(self.level)
-	end
+	local ar = frameDebug
 
 	-- Env: a fresh guest table seeded with the frame's active locals.
 	raw.createtable(L, 0, 32)
@@ -1249,17 +1224,23 @@ lua.profiler = require("lua-sys.profiler")
 
 ---@return lua.State
 function lua.new()
-	-- bridge.new_state() calls luaL_newstate() + luaL_openlibs() entirely in C,
-	-- returning the pointer as lightuserdata. This is safe to call from any
-	-- context — including from within a host callback triggered by guest code —
-	-- because no FFI cdata argument is involved at the call boundary.
-	-- We cast to lua_State* cdata here, on host_L outside any guest execution.
+	-- bridge.new_state() calls luaL_newstate() and luaL_openlibs() fully in C
+	-- and returns the pointer as lightuserdata. No FFI cdata argument crosses
+	-- the boundary, so a host callback can call this safely. The cast to
+	-- lua_State* cdata happens here, on host_L, outside guest execution.
 	local light = bridge.new_state()
 	local L     = ffi.cast("lua_State*", light)
 	local id    = nextGuestId
 	nextGuestId = nextGuestId + 1
 	local state = setmetatable({
 		L = L, _callbacks = {}, _guest_light = light, _guest_id = id,
+		-- int[1] flag: the C callable reads it, so a call after close()
+		-- gives "state is closed" instead of using the freed pointer.
+		_closed_flag = ffi.new("int[1]"),
+		-- int[1] counter: the bridge disables the JIT engine around a host
+		-- callback and uses this to keep a nested callback from enabling it
+		-- again while an outer callback still runs.
+		_jit_depth = ffi.new("int[1]"),
 	}, State)
 	guestStates[light] = state
 	guestById[id]      = state

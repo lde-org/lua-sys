@@ -634,8 +634,9 @@ end)
 -- ─── Edge case: state:close() called while callback is pending on stack ──
 
 test.it("closing a state while a bound_call is alive does not crash", function()
-	-- bound_call has upvalue 1 (guest ptr). If the state is closed, the
-	-- pointer is dangling but the closure should not be called again.
+	-- bound_call has upvalue 1 (guest ptr) and upvalue 5 (the owner's closed
+	-- flag). After close the pointer dangles, so the call must report an error
+	-- before it touches the guest state.
 	local state = lua.new()
 	local fn = state:eval("function(x) return x + 1 end")
 
@@ -643,9 +644,14 @@ test.it("closing a state while a bound_call is alive does not crash", function()
 
 	state:close()
 
-	-- fn is now a bound_call with a dangling guest ptr. Calling it
-	-- would crash. Don't call it — just check that letting it get GC'd
-	-- doesn't crash.
+	local ok, err = pcall(fn, 10)
+	test.falsy(ok)
+	test.includes(err, "state is closed")
+
+	local pok, perr = fn:pcall(10)
+	test.falsy(pok)
+	test.includes(perr, "state is closed")
+
 	collectgarbage()
 	test.truthy(true)
 end)

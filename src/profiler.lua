@@ -6,13 +6,15 @@ local raw    = require("lua-sys.raw")
 
 local profiler = {}
 
-local _active  = {}
+-- lua.State → entry, with weak keys. The state object is the key and not its
+-- address: a closed state releases its address, and lua.new() reuses it, so an
+-- address key would refuse the next state. The entry also goes away with the
+-- state object.
+local _active = setmetatable({}, { __mode = "k" })
 
 -- ── POSIX path ────────────────────────────────────────────────────────────
 
 local function start_posix(state, mode, cb)
-	local key = tostring(state.L)
-
 	local entry
 	if cb then
 		entry = { custom = true }
@@ -37,14 +39,13 @@ local function start_posix(state, mode, cb)
 		end, nil)
 	end
 
-	_active[key] = entry
+	_active[state] = entry
 end
 
 local function stop_posix(state)
-	local key = tostring(state.L)
 	raw.jit_profile_stop(state.L)
-	local entry = _active[key]
-	_active[key] = nil
+	local entry = _active[state]
+	_active[state] = nil
 
 	if entry.custom then return nil end
 
@@ -65,13 +66,22 @@ end
 
 -- ── Public API ────────────────────────────────────────────────────────────
 
+-- The profiler needs a live guest state. A closed state has L == nil, and the
+-- raw profile calls on a freed lua_State would crash.
+---@param state lua.State
+---@param what  string
+local function checkOpenState(state, what)
+	if type(state) ~= "table" or state.L == nil then
+		error(what .. ": expected an open lua.State", 3)
+	end
+end
+
 ---@param state lua.State
 ---@param mode  string?
 ---@param cb    fun(stack: string, samples: integer, vmstate: string)?
 function profiler.start(state, mode, cb)
-	assert(state and state.L, "profiler.start: expected a lua.State")
-	local key = tostring(state.L)
-	assert(not _active[key], "profiler already running for this state")
+	checkOpenState(state, "profiler.start")
+	assert(not _active[state], "profiler already running for this state")
 	mode = mode or "fi1"
 
 	start_posix(state, mode, cb)
@@ -80,9 +90,8 @@ end
 ---@param state lua.State
 ---@return { stack: string, vmstate: string, count: integer, percent: number }[]|nil
 function profiler.stop(state)
-	assert(state and state.L, "profiler.stop: expected a lua.State")
-	local key = tostring(state.L)
-	assert(_active[key], "profiler not running for this state")
+	checkOpenState(state, "profiler.stop")
+	assert(_active[state], "profiler not running for this state")
 
 	return stop_posix(state)
 end

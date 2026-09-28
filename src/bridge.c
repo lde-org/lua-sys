@@ -157,10 +157,21 @@ static lua_State *decode_guest_ptr(lua_State *L, int stack_pos) {
 // Any compound arg or result falls back to callGuestSlow on the Lua side.
 
 static int bound_call(lua_State *host) {
-    lua_State *guest = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
-    int fn_ref       = (int)lua_tointeger(host, lua_upvalueindex(2));
-    int nargs        = lua_gettop(host);
-    int guest_base   = lua_gettop(guest);
+    /* lua-sys sets this flag before lua_close. Check it FIRST: the guest
+     * pointer below dangles once the state is closed, so nothing may touch it
+     * before this test. NULL means the closure carries no flag. */
+    int *closed = (int *)(intptr_t)lua_tointeger(host, lua_upvalueindex(5));
+    lua_State *guest;
+    int fn_ref, nargs, guest_base;
+
+    if (closed != NULL && *closed) {
+        return luaL_error(host, "state is closed");
+    }
+
+    guest      = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
+    fn_ref     = (int)lua_tointeger(host, lua_upvalueindex(2));
+    nargs      = lua_gettop(host);
+    guest_base = lua_gettop(guest);
 
     /* Fast path: all args are primitives. */
     int i;
@@ -273,7 +284,8 @@ static int bridge_make_callable(lua_State *L) {
     lua_pushvalue(L, 2);                          /* upvalue 2: guestRef */
     lua_pushvalue(L, 3);                          /* upvalue 3: guestState */
     lua_pushvalue(L, 4);                          /* upvalue 4: callGuestSlow ref */
-    lua_pushcclosure(L, bound_call, 4);           /* the callable */
+    lua_pushvalue(L, 5);                          /* upvalue 5: closed flag address */
+    lua_pushcclosure(L, bound_call, 5);           /* the callable */
     /* Ensure the fn:pcall() metatable exists in THIS state's registry. A
      * dlopen'd copy of bridge.so may be shared by many states (musl never
      * unloads libraries), so luaopen — and its init_callable_metatable — only
@@ -310,6 +322,34 @@ static void init_callable_metatable(lua_State *L) {
 static int bridge_compound_tag(lua_State *L) {
     lua_pushlightuserdata(L, (void *)&compound_tag_key);
     return 1;
+}
+
+// ── JIT engine guard ──────────────────────────────────────────────────────
+//
+// A host callback runs with the JIT engine off: a trace recorded inside it can
+// attempt argv2cdata on a lua_State* FFI argument (docs/src/bridge-design.md).
+// The counter is per owner state, so a nested callback (host -> guest -> host)
+// does not enable the engine again while an outer callback still runs. A NULL
+// counter keeps the plain behavior.
+
+static void jit_guard_enter(lua_State *owner, int *depth) {
+    if (depth == NULL) {
+        luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+        return;
+    }
+    if (++(*depth) == 1) {
+        luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    }
+}
+
+static void jit_guard_leave(lua_State *owner, int *depth) {
+    if (depth == NULL) {
+        luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+        return;
+    }
+    if (--(*depth) == 0) {
+        luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    }
 }
 
 // ── dispatch_callback ─────────────────────────────────────────────────────
@@ -370,9 +410,10 @@ static int dispatch_callback(lua_State *guest) {
         n_sent = nargs;
     }
 
-    luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    int *depth = (int *)(intptr_t)lua_tointeger(guest, lua_upvalueindex(4));
+    jit_guard_enter(owner, depth);
     int status = lua_pcall(owner, n_sent, LUA_MULTRET, 0);
-    luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    jit_guard_leave(owner, depth);
 
     if (status != LUA_OK) {
         const char *err = lua_tostring(owner, -1);
@@ -433,7 +474,8 @@ static int bridge_push_callback(lua_State *L) {
     lua_pushinteger(guest, fn_ref);
     lua_pushinteger(guest, slow_ref);
     lua_pushlightuserdata(guest, (void *)L); /* upvalue 3: owner */
-    lua_pushcclosure(guest, dispatch_callback, 3);
+    lua_pushinteger(guest, lua_tointeger(L, 4)); /* upvalue 4: JIT depth counter */
+    lua_pushcclosure(guest, dispatch_callback, 4);
     return 0;
 }
 
@@ -616,6 +658,11 @@ static int hook_info_stack(lua_State *L) {
         lua_setfield(L, -2, "thread");
         lua_pushinteger(L, level);
         lua_setfield(L, -2, "level");
+        /* Keep the info table on the frame: it clears _hook_active when the
+         * hook returns, so a stale frame can refuse before it touches the
+         * guest thread. */
+        lua_pushvalue(L, 1);
+        lua_setfield(L, -2, "_info");
         /* Attach the host-side lua.Frame class (registered via
          * bridge.set_frame_meta in this state's registry) so Frame methods
          * resolve via __index. */

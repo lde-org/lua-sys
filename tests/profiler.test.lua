@@ -167,3 +167,41 @@ end)
 test.it("lua.profiler is the same module as lua-sys.profiler", function()
 	test.equal(profiler, lua.profiler)
 end)
+
+-- ─── State lifetime ───────────────────────────────────────────────────────
+
+test.it("a state closed without stop does not block the next state", function()
+	-- The profiler keys states by the object, not by the address string: a
+	-- closed state frees its address, and lua.new() hands the same address to
+	-- the next state.
+	local first = lua.new()
+	profiler.start(first)
+	first:close()                       -- deliberately no profiler.stop
+
+	local second = lua.new()
+	local ok, err = pcall(function() profiler.start(second) end)
+	test.truthy(ok, tostring(err))
+
+	local report = profiler.stop(second)
+	test.truthy(report)
+	second:close()
+end)
+
+test.it("start and stop reject a closed state", function()
+	local state = lua.new()
+	state:close()
+
+	local ok, err = pcall(function() profiler.start(state) end)
+	test.falsy(ok)
+	test.includes(err, "expected an open lua.State")
+
+	local ok2, err2 = pcall(function() profiler.stop(state) end)
+	test.falsy(ok2)
+	test.includes(err2, "expected an open lua.State")
+end)
+
+test.it("start and stop reject a plain table", function()
+	local ok, err = pcall(function() profiler.start({}) end)
+	test.falsy(ok)
+	test.includes(err, "expected an open lua.State")
+end)

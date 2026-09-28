@@ -139,12 +139,16 @@ references and all host callbacks of the state. A second call is safe.
 All `lua.Table` objects, `lua.Value` objects and guest callables of the state
 become invalid. Their registry references stop with the state.
 
-> [!WARNING]
-> Only `state:jitOff`, `state:jitOn`, `state:jitFlush` and `state:setHook`
-> examine a closed state. These four methods give the error `state is closed`.
-> All other operations, such as the evaluation of code, table access and calls
-> to guest functions, dereference the freed `lua_State` and stop the process.
-> Do not use a state after `close()`. Close the state one time only.
+> [!NOTE]
+> Each operation on a closed state gives the error `state is closed`. This rule
+> covers `state:eval`, `state:load`, `state:globals`, `state:table`, the
+> `lua.Chunk` methods, the `lua.Table` methods and calls to a guest callable.
+> A call with `fn:pcall()` gives `false, "state is closed"`. A stored
+> [frame](#luaframe) gives neutral results, as it does after the hook returns.
+> The process does not stop.
+
+Close the state one time only, at the end of its life. Do not use the objects
+of a closed state.
 
 ## Evaluating code
 
@@ -193,9 +197,12 @@ local ok, err = pcall(function() return state:eval("error('boom')") end)
 ### `lua.Chunk`
 
 The builder from `state:load()`. It holds the source code, an optional chunk
-name, an optional [mode](#chunksetmodemode--luachunk) and the owner state. It
-compiles the source at each run. You can run the same chunk again with
-different arguments.
+name, an optional [mode](#chunksetmodemode--luachunk) and the owner state.
+
+The chunk compiles one time, at its first run, and keeps the result. Later runs
+use the compiled function again, so a run costs about the same as a call to a
+guest function. A chunk that returns a function still creates a new closure at
+each run. A change of the name or of the mode compiles the chunk again.
 
 A chunk accepts source text and LuaJIT bytecode by default. Use
 [`chunk:setMode()`](#chunksetmodemode--luachunk) to refuse one format, and
@@ -265,7 +272,7 @@ when the message alone is sufficient.
 #### `chunk:setName(name) → lua.Chunk`
 
 Sets the chunk name for the debug information. The method returns the chunk, so
-you can add more calls. This method is the same as the argument `chunkName` of
+you can add more calls. A new name makes the next run compile again. This method is the same as the argument `chunkName` of
 `state:load()`.
 
 ```lua
@@ -278,7 +285,7 @@ print(src)  -- @myscript.lua
 #### `chunk:setMode(mode) → lua.Chunk`
 
 Sets the format that the chunk accepts. The method returns the chunk, so you
-can add more calls.
+can add more calls. A new mode makes the next run compile again.
 
 | Mode | Meaning |
 |---|---|
@@ -759,7 +766,8 @@ callback only.
 #### Frames after the hook returns
 
 A frame is valid only while the thread is paused at the hook. After the hook
-returns, the methods give neutral results and do not stop the process:
+returns, and after the [close](#stateclose) of its state, the methods give
+neutral results and do not stop the process:
 
 | Call | Result |
 |---|---|
@@ -809,12 +817,15 @@ A sampling profiler for guest states. It uses the profiler hooks of LuaJIT.
 
 ### `profiler.start(state [, mode] [, callback])`
 
-Starts the sampling of `state`, which must be a live `lua.State`. The method
-gives `profiler.start: expected a lua.State` if the argument has no guest state
-pointer to sample. The argument `nil`, a plain table and an already
-[closed](#stateclose) state give this error. The method gives
+Starts the sampling of `state`, which must be an open `lua.State`. The method
+gives `profiler.start: expected an open lua.State` for `nil`, a plain table or
+an already [closed](#stateclose) state. It gives
 `profiler already running for this state` if the state is in the sampling mode
 already.
+
+The profiler keys its bookkeeping by the state object and not by its address.
+A state that you close without `profiler.stop` therefore does not block the
+next state.
 
 - `mode` is a LuaJIT profiler mode string. The default is `"fi1"`. Use `f` for
   function-level stacks, `l` for line-level stacks, and `i<ms>` for the

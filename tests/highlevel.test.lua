@@ -2294,3 +2294,115 @@ test.it("text chunks keep the chunk name in errors", function()
 		state:load("return debug.getinfo(1,'S').source"):setName("@s.lua"):eval())
 	state:close()
 end)
+
+-- ─── Use after close() ───────────────────────────────────────────────────
+
+test.it("every state operation raises after close()", function()
+	local state = lua.new()
+	local tbl   = state:table({ a = 1 })
+	local chunk = state:load("return 1")
+	local fn    = state:eval("return function() return 1 end")
+	state:close()
+
+	local calls = {
+		["state:eval"]    = function() return state:eval("return 1") end,
+		["state:load"]    = function() return state:load("return 1") end,
+		["state:globals"] = function() return state:globals() end,
+		["state:table"]   = function() return state:table() end,
+		["chunk:eval"]    = function() return chunk:eval() end,
+		["chunk:call"]    = function() chunk:call() end,
+		["chunk:pcall"]   = function() return chunk:pcall() end,
+		["chunk:xpcall"]  = function() return chunk:xpcall() end,
+		["Table:get"]     = function() return tbl:get("a") end,
+		["Table:set"]     = function() tbl:set("b", 2) end,
+		["Table field"]   = function() return tbl.a end,
+		["Table:pairs"]   = function() for _ in tbl:pairs() do end end,
+		["Table:ipairs"]  = function() for _ in tbl:ipairs() do end end,
+		["callable"]      = function() return fn() end,
+		["jitOff"]        = function() return state:jitOff() end,
+		["jitOn"]         = function() return state:jitOn() end,
+		["jitFlush"]      = function() return state:jitFlush() end,
+		["setHook"]       = function() return state:setHook(nil) end,
+	}
+
+	for name, call in pairs(calls) do
+		local ok, err = pcall(call)
+		test.falsy(ok, name .. " must raise after close()")
+		test.includes(err, "state is closed", name)
+	end
+end)
+
+test.it("a callable reports a closed state through pcall", function()
+	local state = lua.new()
+	local fn = state:eval("return function() return 1 end")
+	state:close()
+
+	local ok, err = fn:pcall()
+	test.falsy(ok)
+	test.includes(err, "state is closed")
+end)
+
+test.it("close() is safe to repeat and the state stays closed", function()
+	local state = lua.new()
+	state:close()
+	local ok = pcall(function() state:close() end)
+	test.truthy(ok)
+	local ok2, err = pcall(function() return state:eval("return 1") end)
+	test.falsy(ok2)
+	test.includes(err, "state is closed")
+end)
+
+test.it("a table from a closed state does not corrupt later states", function()
+	local first = lua.new()
+	local tbl = first:table({ a = 1 })
+	first:close()
+
+	local second = lua.new()
+	test.equal(2, second:eval("return 1 + 1"))
+	local ok, err = pcall(function() return tbl:get("a") end)
+	test.falsy(ok)
+	test.includes(err, "state is closed")
+	second:close()
+end)
+
+test.it("a stored frame degrades after close()", function()
+	local state = lua.new()
+	local frame = nil
+	state:setHook(function(event, info)
+		if frame == nil then frame = info:stack()[1] end
+	end, "line")
+	state:eval("local x = 1")
+	state:setHook(nil)
+	state:close()
+
+	test.equal(0, #frame:locals())
+	test.equal(nil, frame:getLocal("x"))
+	test.equal(false, frame:setLocal("x", 2))
+	test.equal(0, #frame:upvalues())
+	test.equal(nil, frame:getUpvalue("x"))
+	test.equal(false, frame:setUpvalue("x", 2))
+	local ok, err = frame:eval("x")
+	test.falsy(ok)
+	test.includes(err, "no frame")
+end)
+
+test.it("a frame from a coroutine degrades after close()", function()
+	local ffi = require("ffi")
+	local state = lua.new()
+	local main = state.L
+	local frame = nil
+
+	state:setHook(function(event, info)
+		if ffi.cast("lua_State*", info.thread) ~= main and frame == nil then
+			frame = info:stack()[1]
+		end
+	end, "line")
+
+	state:eval("coroutine.wrap(function()\nlocal marker = 1\nfor i = 1, 2 do end\nend)()")
+	state:setHook(nil)
+	test.truthy(frame)
+
+	state:close()
+	test.equal(0, #frame:locals())
+	test.equal(nil, frame:getLocal("marker"))
+end)
