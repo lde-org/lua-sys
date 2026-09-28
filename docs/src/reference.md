@@ -25,7 +25,7 @@ primitives, or by reference for tables, functions, userdata and threads.
 |---|---|
 | `lua` | [`new()`](#luanew--luastate) |
 | `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`close`](#stateclose), `L` |
-| `lua.Chunk` | [`eval`](#chunkeval--value), [`call`](#chunkcall), [`pcall`](#chunkpcall--true---false-err), [`xpcall`](#chunkxpcall--true---false-err), [`setName`](#chunksetnamename--luachunk) |
+| `lua.Chunk` | [`eval`](#chunkeval--value), [`call`](#chunkcall), [`pcall`](#chunkpcall--true---false-err), [`xpcall`](#chunkxpcall--true---false-err), [`setName`](#chunksetnamename--luachunk), [`setMode`](#chunksetmodemode--luachunk), [`getMode`](#chunkgetmode--text--bytecode--both), [`isBytecode`](#chunkisbytecode--boolean) |
 | guest callable | `fn(...)`, [`fn:pcall(...)`](#fnpcall--true---false-err) |
 | `lua.Table` | [`get`](#tablegetkey--value), [`set`](#tablesetkey-value), field syntax, [`pairs`](#tablepairs--iterator), [`ipairs`](#tableipairs--iterator), [`type`](#valuetype--string), [`value`](#valuevalue--any), [`free`](#valuefree) |
 | `lua.Value` | [`type`](#valuetype--string), [`value`](#valuevalue--any), [`free`](#valuefree) |
@@ -158,6 +158,11 @@ at the call that runs the chunk, not at `state:load()`.
 name as `debug.getinfo(1, "S").source`. Use the prefix `@` for a file path, for
 example `"@/path/to/file.lua"`.
 
+The argument `code` can be source text or LuaJIT bytecode. A chunk accepts both
+by default. Refer to [`chunk:setMode()`](#chunksetmodemode--luachunk) to refuse
+one format, and to
+[`chunk:isBytecode()`](#chunkisbytecode--boolean) to examine the source.
+
 ### `state:eval(code [, chunkName]) → value`
 
 Compiles and runs `code` immediately. The method returns the first result. It
@@ -188,8 +193,14 @@ local ok, err = pcall(function() return state:eval("error('boom')") end)
 ### `lua.Chunk`
 
 The builder from `state:load()`. It holds the source code, an optional chunk
-name and the owner state. It compiles the source at each run. You can run the
-same chunk again with different arguments.
+name, an optional [mode](#chunksetmodemode--luachunk) and the owner state. It
+compiles the source at each run. You can run the same chunk again with
+different arguments.
+
+A chunk accepts source text and LuaJIT bytecode by default. Use
+[`chunk:setMode()`](#chunksetmodemode--luachunk) to refuse one format, and
+[`chunk:isBytecode()`](#chunkisbytecode--boolean) to examine the source before
+the chunk runs.
 
 #### `chunk:eval(...) → value`
 
@@ -263,6 +274,75 @@ local src = state:load("return debug.getinfo(1, 'S').source")
     :eval()
 print(src)  -- @myscript.lua
 ```
+
+#### `chunk:setMode(mode) → lua.Chunk`
+
+Sets the format that the chunk accepts. The method returns the chunk, so you
+can add more calls.
+
+| Mode | Meaning |
+|---|---|
+| `"text"` | Source text only. The loader refuses bytecode. |
+| `"bytecode"` | LuaJIT bytecode only. The loader refuses source text. |
+| `"both"` | Source text or bytecode. This is the default. |
+
+The Lua mode letters `"t"`, `"b"` and `"bt"` are also correct, and `"binary"`
+is an alias of `"bytecode"`. The value is not case sensitive.
+
+A mismatch shows at the call that runs the chunk. The error is
+`attempt to load chunk with wrong mode`:
+
+```lua
+local bytecode = state:eval("return string.dump(function() return 7 end)")
+
+state:load(bytecode):eval()                     -- 7, the mode is "both"
+state:load(bytecode):setMode("text"):eval()     -- raises "wrong mode"
+state:load(bytecode):setMode("bytecode"):eval() -- 7
+state:load("return 1"):setMode("bytecode"):eval() -- raises "wrong mode"
+```
+
+The method `chunk:pcall()` returns the error instead of raising it:
+
+```lua
+local ok, err = state:load(bytecode):setMode("text"):pcall()
+-- ok == false, err == "attempt to load chunk with wrong mode"
+```
+
+An unknown mode gives `setMode: unknown mode "<mode>" (expected "text",
+"bytecode" or "both")`. A value that is not a string gives `setMode: mode must
+be "text", "bytecode" or "both", got <type>`.
+
+#### `chunk:getMode() → "text" | "bytecode" | "both"`
+
+The format that the chunk accepts. The value is `"both"` until you call
+`setMode()`.
+
+```lua
+print(state:load("return 1"):getMode())                    -- both
+print(state:load("return 1"):setMode("text"):getMode())    -- text
+```
+
+#### `chunk:isBytecode() → boolean`
+
+`true` when the source of the chunk starts with the escape byte that marks a
+precompiled chunk. Use this method to examine data from a source that you do
+not trust, before the chunk runs.
+
+LuaJIT loads bytecode with the signature `\27LJ`. Other binary data also starts
+with the escape byte. The loader refuses such data with `cannot load
+incompatible bytecode` or `cannot load malformed bytecode`.
+
+```lua
+local chunk = state:load(source)
+
+if chunk:isBytecode() then
+    error("bytecode is not permitted")
+end
+
+chunk:setMode("text"):call()
+```
+
+The mode does not change the result of `isBytecode()`.
 
 #### `chunk(...)`
 
@@ -873,8 +953,10 @@ you need a function below the high-level API.
   return the first result. `chunk:call` returns no result. Use `chunk:pcall` or
   `fn:pcall` to get all results.
 - **Errors are strings.** An error in the guest becomes a plain string error on
-  the host. The string can contain the guest prefix `[string "..."]:line:` and
-  the file and line of the host wrapper that raised it. Use `pcall`,
+  the host. The string is the guest message, and it can contain the guest
+  position `[string "..."]:line:`. The library adds no position of its own to a
+  guest error. An error that the library reports, such as an incorrect
+  argument, contains the host position of the caller. Use `pcall`,
   `chunk:pcall` or `fn:pcall` to examine the error. Use `chunk:xpcall` when you
   need a guest traceback.
 - **Host callbacks exchange primitives and guest tables.** An argument can be a
@@ -886,3 +968,7 @@ you need a function below the high-level API.
 - **Set the debug names.** Give `chunkName` to `state:load()`, or use
   `chunk:setName`. Use the prefix `@` for a file path. Then a guest stack trace
   and `debug.getinfo` give a usable name.
+- **Bytecode is code.** A chunk accepts bytecode by default, and bytecode runs
+  with the full power of the guest. Examine data from a source that you do not
+  trust with `chunk:isBytecode()`, or refuse it with
+  `chunk:setMode("text")`.

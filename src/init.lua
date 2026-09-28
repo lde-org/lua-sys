@@ -288,7 +288,7 @@ toLua = function(guestState, L, value)
 		local t = guestState:table(value)
 		raw.rawgeti(L, LUA_REGISTRYINDEX, t._ref)
 	else
-		error("cannot push value of type '" .. valueType .. "' onto guest stack", 2)
+		error("cannot push value of type '" .. valueType .. "' onto guest stack", 0)
 	end
 end
 
@@ -397,6 +397,7 @@ end
 ---@field _state     lua.State
 ---@field _code      string
 ---@field _chunkName string?
+---@field _chunkMode string?  -- "t", "b" or "bt" for luaL_loadbufferx
 local Chunk = {}
 Chunk.__index = Chunk
 
@@ -405,6 +406,33 @@ Chunk.__index = Chunk
 ---@param name  string?
 function Chunk._new(state, code, name)
 	return setmetatable({ _state = state, _code = code, _chunkName = name }, Chunk)
+end
+
+-- The Lua mode letters of luaL_loadbufferx, and the words that setMode accepts
+-- for them.
+local CHUNK_MODES = {
+	text     = "t",
+	["t"]    = "t",
+	bytecode = "b",
+	binary   = "b",
+	["b"]    = "b",
+	both     = "bt",
+	["bt"]   = "bt",
+	["tb"]   = "bt",
+}
+
+local CHUNK_MODE_NAMES = { t = "text", b = "bytecode", bt = "both" }
+
+-- Lua marks a precompiled chunk with the escape byte (LUA_SIGNATURE[0]).
+local BYTECODE_SIGNATURE = 27
+
+-- True when a source string is a precompiled chunk. A file-local function, so
+-- callers make no closure of their own.
+---@param code string
+---@return boolean
+local function isBytecodeSource(code)
+	if type(code) ~= "string" then code = tostring(code) end
+	return code:byte(1) == BYTECODE_SIGNATURE
 end
 
 --- Set the chunk name (for debug info). Returns self for chaining.
@@ -418,6 +446,45 @@ function Chunk:setName(name)
 	return self
 end
 
+--- Restrict the format that the chunk accepts. Returns self for chaining.
+---
+--- `mode` is one of:
+---   • "text": source text only. The loader refuses bytecode.
+---   • "bytecode": precompiled LuaJIT bytecode only. Text is refused.
+---   • "both": text or bytecode. This is the default.
+---
+--- The Lua mode letters "t", "b" and "bt" are also accepted, and "binary" is
+--- an alias of "bytecode". A mismatch raises
+--- "attempt to load chunk with wrong mode" when the chunk runs.
+---@param mode "text"|"bytecode"|"both"|"binary"|"t"|"b"|"bt"
+---@return lua.Chunk
+function Chunk:setMode(mode)
+	if type(mode) ~= "string" then
+		error('setMode: mode must be "text", "bytecode" or "both", got ' .. type(mode), 2)
+	end
+	local mapped = CHUNK_MODES[mode:lower()]
+	if mapped == nil then
+		error('setMode: unknown mode "' .. mode .. '" (expected "text", "bytecode" or "both")', 2)
+	end
+	self._chunkMode = mapped
+	return self
+end
+
+--- The format that this chunk accepts: "text", "bytecode" or "both".
+---@return "text"|"bytecode"|"both"
+function Chunk:getMode()
+	return CHUNK_MODE_NAMES[self._chunkMode or "bt"]
+end
+
+--- True when the source of the chunk starts with the escape byte that marks a
+--- precompiled chunk. Use it to refuse untrusted bytecode before the chunk
+--- runs. LuaJIT loads bytecode with the signature "\27LJ". Other binary data
+--- also starts with the escape byte, and the loader refuses it.
+---@return boolean
+function Chunk:isBytecode()
+	return isBytecodeSource(self._code)
+end
+
 -- Internal: compile the chunk and push the function onto the guest stack.
 -- Leaves the compiled function at the top of the guest stack on success.
 -- Returns the stack base (the index of the function) so the caller can
@@ -425,27 +492,31 @@ end
 ---@return lua.raw.State L
 ---@return integer       fnIndex
 function Chunk:_compile()
-	local L        = self._state.L
-	local code     = self._code
-	local name     = self._chunkName
-	local retChunk = "return " .. code
+	local L    = self._state.L
+	local code = self._code
+	local name = self._chunkName
+	local mode = self._chunkMode or "bt"
 
-	local status
-	if name then
-		status = raw.loadbuffer(L, retChunk, #retChunk, name)
+	if type(code) ~= "string" then code = tostring(code) end
+
+	-- Load with luaL_loadbufferx: it takes a length, so bytecode with null
+	-- bytes inside is not cut short, and it applies the mode. Without a name,
+	-- the source is also the chunk name, which is what luaL_loadstring does.
+	local status, wrapped
+	if isBytecodeSource(code) then
+		-- Do not put "return " before bytecode: that wrapper is text that
+		-- contains binary data, and the guest must load the bytecode itself.
+		status = raw.loadbufferx(L, code, #code, name or code, mode)
 	else
-		status = raw.loadstring(L, retChunk)
-	end
-	if status ~= LUA_OK then
-		raw.pop(L, 1)
-		if name then
-			status = raw.loadbuffer(L, code, #code, name)
-		else
-			status = raw.loadstring(L, code)
+		wrapped = "return " .. code
+		status = raw.loadbufferx(L, wrapped, #wrapped, name or wrapped, mode)
+		if status ~= LUA_OK then
+			raw.pop(L, 1)
+			status = raw.loadbufferx(L, code, #code, name or code, mode)
 		end
 	end
 	if status ~= LUA_OK then
-		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 2)
+		local err = raw.tolstring(L, -1); raw.pop(L, 1); error(err, 0)
 	end
 	return L, raw.gettop(L)
 end
@@ -463,7 +534,7 @@ function Chunk:eval(...)
 	local base = fnIndex - 1
 	local status = raw.pcall(L, nargs, LUA_MULTRET, 0)
 	if status ~= LUA_OK and status ~= LUA_YIELD then
-		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 2)
+		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 0)
 	end
 	local nresults = raw.gettop(L) - base
 	if nresults == 0 then
@@ -489,7 +560,7 @@ function Chunk:call(...)
 	local base = fnIndex - 1
 	local status = raw.pcall(L, nargs, 0, 0)
 	if status ~= LUA_OK and status ~= LUA_YIELD then
-		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 2)
+		local err = raw.tolstring(L, -1); raw.settop(L, base); error(err, 0)
 	end
 	raw.settop(L, base)
 end
@@ -623,6 +694,28 @@ end
 ---   • function                   → registered as a host callback (CFunction)
 ---   • anything else              → error
 ---
+-- Fill a guest table from a plain host table, with cycle detection through the
+-- `seen` set. A file-local function, so State:table makes no closure of its
+-- own: a closure per call stops the JIT recorder.
+---@param tbl  lua.Table
+---@param init table
+---@param seen table  -- host tables on the current path
+local function populateGuestTable(tbl, init, seen)
+	if seen[init] then
+		error("state:table(): cycle detected in init table", 0)
+	end
+	seen[init] = true
+	for k, v in pairs(init) do
+		local kt = type(k)
+		if kt ~= "string" and kt ~= "number" and kt ~= "boolean" then
+			error("state:table(): unsupported key type '" .. kt .. "'", 0)
+		end
+		tbl:set(k, v)
+	end
+	seen[init] = nil -- done with this table; the same table as a sibling value
+	-- (not a back-edge) is correct
+end
+
 ---@param init table?
 ---@return lua.Table
 function State:table(init)
@@ -637,34 +730,19 @@ function State:table(init)
 		end
 		-- Cycle detection: the seen set lives on the State so it persists
 		-- across recursive state:table() calls triggered by toLua coercion.
-		-- The top-level call wraps v in pcall to guarantee cleanup on error.
+		-- The top-level call uses pcall to guarantee cleanup on error.
 		local seen = self._table_seen
 		local topLevel = (seen == nil)
 		if topLevel then
-			self._table_seen = {}
-			seen = self._table_seen
-		end
-		local function populate()
-			if seen[init] then
-				error("state:table(): cycle detected in init table", 0)
-			end
-			seen[init] = true
-			for k, v in pairs(init) do
-				local kt = type(k)
-				if kt ~= "string" and kt ~= "number" and kt ~= "boolean" then
-					error("state:table(): unsupported key type '" .. kt .. "'", 0)
-				end
-				tbl:set(k, v)
-			end
-			seen[init] = nil -- done with this table; same table appearing as
-			-- a sibling value (not a back-edge) is fine
+			seen = {}
+			self._table_seen = seen
 		end
 		if topLevel then
-			local ok, err = pcall(populate)
+			local ok, err = pcall(populateGuestTable, tbl, init, seen)
 			self._table_seen = nil
 			if not ok then error(err, 2) end
 		else
-			populate()
+			populateGuestTable(tbl, init, seen)
 		end
 	end
 
