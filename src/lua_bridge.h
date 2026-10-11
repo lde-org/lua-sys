@@ -154,6 +154,8 @@ lua_State *lua_newstate(lua_Alloc f, void *ud);
 lua_State *luaL_newstate(void);
 void       luaL_openlibs(lua_State *L);
 void       lua_close  (lua_State *L);
+lua_Alloc  lua_getallocf(lua_State *L, void **ud);
+void       lua_setallocf(lua_State *L, lua_Alloc f, void *ud);
 
 #endif /* !_WIN32 */
 

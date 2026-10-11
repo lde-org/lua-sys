@@ -160,10 +160,12 @@ agrees with the design rule that all cross-state operations go through
 The box lives in C, and the state stores it in its own registry as a
 lightuserdata; `memory_used` and `set_memory_limit` read it back. Nothing about
 the allocator crosses the Lua boundary as a number: a pointer carried through a
-Lua number is rounded to a double above 2^53, and the allocator must also keep
-every block inside LuaJIT's 47-bit GC64 pointer space — a `malloc()` that lands
-outside it (Linux/arm64 with a large VA) makes `lua_newstate()` refuse the
-state. Blocks outside the space are served from a probed `mmap` instead.
+Lua number is rounded to a double above 2^53. The counting allocator itself is
+a thin wrapper around the allocator LuaJIT installs for the state
+(`lua_getallocf` / `lua_setallocf`): blocks keep coming from LuaJIT's own
+allocator — which already satisfies its rules, notably the 47-bit GC64 pointer
+space that `lua_newstate()` refuses to leave — and the wrapper only counts
+bytes and enforces the cap.
 
 ## Debug Hooks
 
