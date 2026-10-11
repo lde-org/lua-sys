@@ -19,6 +19,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
 /* ── Windows symbol resolution ────────────────────────────────────────────
  *
  * PE DLLs cannot leave symbols unresolved for the loader to bind against the
@@ -817,20 +821,129 @@ static int bridge_set_frame_meta(lua_State *L) {
 // ── Memory accounting ─────────────────────────────────────────────────────
 //
 // Every guest state counts its own allocations, so the host can read the usage
-// and set a hard cap. box[0] is the bytes in use, box[1] is the cap (0 = no
-// cap). The box belongs to the lua.State object, which stays alive as long as
-// anything can call into the guest.
+// and set a hard cap. box->used is the bytes in use, box->limit is the cap
+// (0 = no cap).
+//
+// The box is allocated here, in C, and passed to lua_newstate as the allocator
+// context. It is stashed in the guest's registry as a lightuserdata, so no
+// pointer ever crosses the Lua boundary as a number: a pointer carried through
+// a Lua number is rounded to a double above 2^53 and comes back corrupted,
+// which made lua_newstate read a garbage limit (and return NULL) on some
+// targets. The box lives exactly as long as the guest state — it is freed by
+// bridge_close_state.
 
 typedef struct { int64_t used; int64_t limit; } mem_box;
+
+/* Registry key under which the guest state's mem_box is stored. */
+static const char mem_box_key = 0;
+
+/* 64-bit targets only: GC64 LuaJIT keeps every Lua object inside a 47-bit
+ * pointer space (the top 17 bits of a pointer are the TValue tag), so every
+ * block handed to it must live below 2^47. lua_newstate() enforces this for
+ * the state block itself (checkptrGC) and LuaJIT's own allocator probes its
+ * mappings into the space. malloc() promises nothing of the sort: on
+ * Linux/arm64 with a larger VA the mmap base sits above 2^47, and glibc
+ * serves medium blocks from those mappings once its dynamic mmap threshold
+ * adapts. A block from up there made lua_newstate() return NULL (the ARM64 CI
+ * crash). Blocks are therefore checked and, when malloc lands outside the
+ * space, served from an mmap probed below it instead. */
+#if UINTPTR_MAX > 0xFFFFFFFFu
+#define LDE_PTR_SPACE_64	1
+#define LDE_PTR_SPACE		((uintptr_t)1 << 47)
+#define LDE_MMAP_FLOOR		((uintptr_t)0x1000000000)	/* 64 GB: well above the heap */
+#define LDE_MMAP_CEIL		((uintptr_t)0x400000000000)	/* 64 TB: well below the limit */
+#else
+#define LDE_PTR_SPACE_64	0
+#endif
+
+typedef struct { size_t size; uint32_t mapped; uint32_t pad; } lde_block;
+
+#if LDE_PTR_SPACE_64 && !defined(_WIN32)
+static uintptr_t mmap_hint_addr = 0;
+static uint64_t mmap_probe_seed = 0x243f6a8885a308d3ull;
+
+/* An anonymous mapping of `size` bytes fully inside the 47-bit space, or
+ * MAP_FAILED. Mirrors the probe loop of LuaJIT's own allocator: hint first,
+ * then random spots inside the space. */
+static void *low_mmap(size_t size) {
+    int retry;
+    for (retry = 0; retry < 32; retry++) {
+        void *p;
+        uintptr_t addr;
+        if (mmap_hint_addr < LDE_MMAP_FLOOR || mmap_hint_addr + size > LDE_MMAP_CEIL) {
+            mmap_probe_seed = mmap_probe_seed * 6364136223846793005ull + 1442695040888963407ull;
+            mmap_hint_addr = LDE_MMAP_FLOOR
+                + (((uintptr_t)(mmap_probe_seed >> 16) % (LDE_MMAP_CEIL - LDE_MMAP_FLOOR - size))
+                    & ~(uintptr_t)0xffff);
+        }
+        p = mmap((void *)mmap_hint_addr, size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            mmap_hint_addr += 0x100000;
+            continue;
+        }
+        addr = (uintptr_t)p;
+        if (addr >= 0x10000 && addr < LDE_PTR_SPACE && addr + size < LDE_PTR_SPACE) {
+            mmap_hint_addr = addr + size;
+            return p;
+        }
+        /* The kernel ignored the hint and placed it outside the space. */
+        munmap(p, size);
+        mmap_hint_addr += 0x100000;
+    }
+    return MAP_FAILED;
+}
+#endif
+
+/* Release a block created by block_new. */
+static void block_free(lde_block *blk) {
+    if (blk->mapped) {
+#if LDE_PTR_SPACE_64 && !defined(_WIN32)
+        munmap(blk, sizeof(lde_block) + blk->size);
+#endif
+    } else {
+        free(blk);
+    }
+}
+
+/* A block of `nsize` usable bytes inside the 47-bit space, or NULL. */
+static void *block_new(size_t nsize) {
+    size_t total = sizeof(lde_block) + nsize;
+    lde_block *blk = (lde_block *)malloc(total);
+#if LDE_PTR_SPACE_64
+    if (blk != NULL
+        && ((uintptr_t)blk >= LDE_PTR_SPACE || (uintptr_t)blk + total >= LDE_PTR_SPACE)) {
+        /* malloc() landed outside the pointer space: it cannot be handed to
+         * LuaJIT, so take one from below the limit instead. */
+        free(blk);
+        blk = NULL;
+    }
+#endif
+    if (blk != NULL) {
+        blk->size = nsize;
+        blk->mapped = 0;
+        return (void *)(blk + 1);
+    }
+#if LDE_PTR_SPACE_64 && !defined(_WIN32)
+    blk = (lde_block *)low_mmap(total);
+    if (blk != MAP_FAILED) {
+        blk->size = nsize;
+        blk->mapped = 1;
+        return (void *)(blk + 1);
+    }
+#endif
+    return NULL;
+}
 
 static void *limited_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
     mem_box *box = (mem_box *)ud;
     size_t old = (ptr != NULL) ? osize : 0;
+    void *np;
 
     if (nsize == 0) {
         if (ptr != NULL) {
             box->used -= (int64_t)old;
-            free(ptr);
+            block_free((lde_block *)ptr - 1);
         }
         return NULL;
     }
@@ -838,24 +951,75 @@ static void *limited_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
         box->used + (int64_t)(nsize - old) > box->limit) {
         return NULL; /* over the cap: the guest gets "not enough memory" */
     }
-    void *np = realloc(ptr, nsize);
-    if (np != NULL) {
-        box->used += (int64_t)nsize - (int64_t)old;
+
+    /* Grow/shrink: move to a fresh block and copy. The old block is released
+     * only once the new one exists, so a failed move leaves it intact. */
+    np = block_new(nsize);
+    if (np == NULL) return NULL;
+    if (ptr != NULL) {
+        memcpy(np, ptr, old < nsize ? old : nsize);
+        limited_alloc(ud, ptr, old, 0);
     }
+    box->used += (int64_t)nsize;
     return np;
 }
 
+/* The mem_box of a guest state, or NULL when it has none (not created by
+ * bridge_new_state, or already closed). */
+static mem_box *guest_mem_box(lua_State *guest) {
+    mem_box *box;
+    lua_pushlightuserdata(guest, (void *)&mem_box_key);
+    lua_rawget(guest, LUA_REGISTRYINDEX);
+    box = (mem_box *)lua_touserdata(guest, -1);
+    lua_pop(guest, 1);
+    return box;
+}
+
 static int bridge_new_state(lua_State *L) {
-    mem_box *box = (mem_box *)(intptr_t)lua_tointeger(L, 1);
-    lua_State *new_state = lua_newstate(limited_alloc, box);
+    /* The box is allocated and owned here, never in Lua: its pointer must not
+     * travel through a Lua number. */
+    mem_box *box = (mem_box *)malloc(sizeof(mem_box));
+    lua_State *new_state;
+    if (box == NULL) {
+        lua_pushstring(L, "bridge_new_state: out of memory");
+        lua_error(L);
+        return 0;
+    }
+    box->used = 0;
+    box->limit = 0;
+
+    new_state = lua_newstate(limited_alloc, box);
     if (!new_state) {
+        free(box);
         lua_pushstring(L, "bridge_new_state: lua_newstate() returned NULL");
         lua_error(L);
         return 0;
     }
+    /* Hand the box to the guest state itself: the memory accessors and close
+     * find it through the registry, so it stays a plain pointer end to end. */
+    lua_pushlightuserdata(new_state, (void *)&mem_box_key);
+    lua_pushlightuserdata(new_state, (void *)box);
+    lua_rawset(new_state, LUA_REGISTRYINDEX);
+
     luaL_openlibs(new_state);
     lua_pushlightuserdata(L, (void *)new_state);
     return 1;
+}
+
+/* Bytes the guest state holds right now. */
+static int bridge_memory_used(lua_State *L) {
+    lua_State *guest = decode_guest_ptr(L, 1);
+    mem_box *box = guest_mem_box(guest);
+    lua_pushinteger(L, (lua_Integer)(box ? box->used : 0));
+    return 1;
+}
+
+/* Set the guest state's memory cap; 0 removes it. */
+static int bridge_set_memory_limit(lua_State *L) {
+    lua_State *guest = decode_guest_ptr(L, 1);
+    mem_box *box = guest_mem_box(guest);
+    if (box) box->limit = (int64_t)lua_tointeger(L, 2);
+    return 0;
 }
 
 // Close a guest Lua state created by bridge_new_state.
@@ -866,7 +1030,11 @@ static int bridge_new_state(lua_State *L) {
 // corrupts the heap.
 static int bridge_close_state(lua_State *L) {
     lua_State *guest = decode_guest_ptr(L, 1);
+    /* Recover the allocator box before the state (and its registry) is gone,
+     * then release both. The box is C memory, so it outlives lua_close. */
+    mem_box *box = guest_mem_box(guest);
     lua_close(guest);
+    free(box);
     return 0;
 }
 
@@ -881,6 +1049,8 @@ static const luaL_Reg bridge_funcs[] = {
     { "set_frame_meta",  bridge_set_frame_meta },
     { "new_state",       bridge_new_state      },
     { "close_state",     bridge_close_state    },
+    { "memory_used",     bridge_memory_used    },
+    { "set_memory_limit", bridge_set_memory_limit },
     { NULL, NULL }
 };
 

@@ -143,8 +143,9 @@ Therefore, the cost is small.
 The function `lua.new()` used `raw.lnewstate()` (FFI) and then
 `raw.openlibs()` (FFI). Both functions use a `lua_State*` cdata. The JIT-off
 correction makes this sequence safe from a callback. In addition, the bridge
-has `bridge_new_state`. This C function calls `luaL_newstate()` and
-`luaL_openlibs()` fully in C. It returns the pointer as a lightuserdata, not as
+has `bridge_new_state`. This C function allocates the state's
+memory-accounting box, calls `lua_newstate()` with the counting allocator and
+`luaL_openlibs()`, fully in C. It returns the pointer as a lightuserdata, not as
 cdata. The function `lua.new()` calls it and casts the result to `lua_State*`
 cdata on the host side:
 
@@ -155,6 +156,14 @@ local L = ffi.cast("lua_State*", bridge.new_state())
 Thus state creation occurs behind a C boundary at each JIT state. This sequence
 agrees with the design rule that all cross-state operations go through
 `lua_CFunction` boundaries.
+
+The box lives in C, and the state stores it in its own registry as a
+lightuserdata; `memory_used` and `set_memory_limit` read it back. Nothing about
+the allocator crosses the Lua boundary as a number: a pointer carried through a
+Lua number is rounded to a double above 2^53, and the allocator must also keep
+every block inside LuaJIT's 47-bit GC64 pointer space — a `malloc()` that lands
+outside it (Linux/arm64 with a large VA) makes `lua_newstate()` refuse the
+state. Blocks outside the space are served from a probed `mmap` instead.
 
 ## Debug Hooks
 

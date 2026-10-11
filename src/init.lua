@@ -1017,7 +1017,7 @@ end
 ---@return integer
 function State:memory()
 	if self.L == nil then closedError() end
-	return tonumber(self._mem_box[0])
+	return tonumber(bridge.memory_used(self._guest_light))
 end
 
 --- Limit the memory of the guest state to `bytes`. An allocation that would
@@ -1026,20 +1026,20 @@ end
 ---@param bytes integer
 function State:setMemoryLimit(bytes)
 	if self.L == nil then closedError() end
-	self._mem_box[1] = bytes or 0
+	bridge.set_memory_limit(self._guest_light, bytes or 0)
 end
 
 function State:close()
 	if self.L then
 		self._closed_flag[0] = 1
 		-- No cap while closing: the state releases its memory block by block.
-		self._mem_box[1] = 0
+		bridge.set_memory_limit(self._guest_light, 0)
 		if self._hook_ref then
 			bridge.unregister(self._hook_ref)
 			self._hook_ref = nil
 		end
 		for _, cb in ipairs(self._callbacks) do bridge.unregister(cb.id) end
-		bridge.close_state(tonumber(ffi.cast("intptr_t", self.L)))
+		bridge.close_state(self._guest_light)
 		guestStates[self._guest_light] = nil
 		guestById[self._guest_id]      = nil
 		self.L          = nil
@@ -1337,19 +1337,18 @@ lua.profiler = require("lua-sys.profiler")
 
 ---@return lua.State
 function lua.new()
-	-- int64[2] with the bytes in use and the cap (0 = no cap). The allocator of
-	-- the state reads and writes it, and the count never leaves C.
-	local box = ffi.new("int64_t[2]")
 	-- int[2] for the chain guard: [0] is the depth, [1] is the limit.
 	local chain = ffi.new("int[2]")
 	chain[1] = CHAIN_LIMIT_DEFAULT
 
-	-- bridge.new_state() calls lua_newstate() with the counting allocator and
-	-- then luaL_openlibs(), fully in C, and returns the pointer as
-	-- lightuserdata. No FFI cdata argument crosses the boundary, so a host
-	-- callback can call this safely. The cast to lua_State* cdata happens here,
-	-- on host_L, outside guest execution.
-	local light = bridge.new_state(tonumber(ffi.cast("intptr_t", box)))
+	-- bridge.new_state() allocates the state and its memory-accounting box in
+	-- C, calls lua_newstate() with the counting allocator and luaL_openlibs(),
+	-- fully in C, and returns the pointer as lightuserdata. The box stays in C
+	-- (the memory accessors read it through the bridge), so no pointer crosses
+	-- the boundary as a Lua number. No FFI cdata argument crosses the
+	-- boundary either, so a host callback can call this safely. The cast to
+	-- lua_State* cdata happens here, on host_L, outside guest execution.
+	local light = bridge.new_state()
 	local L     = ffi.cast("lua_State*", light)
 	local id    = nextGuestId
 	nextGuestId = nextGuestId + 1
@@ -1362,7 +1361,6 @@ function lua.new()
 		-- callback and uses this to keep a nested callback from enabling it
 		-- again while an outer callback still runs.
 		_jit_depth = ffi.new("int[1]"),
-		_mem_box   = box,
 		-- int[2]: the depth of the current host <-> guest chain and its limit.
 		-- Each level costs C stack, so a chain that is too deep stops the
 		-- process.

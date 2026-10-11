@@ -1009,9 +1009,9 @@ More examples of the `raw.lX` form: `luaL_error` → `raw.lerror`,
 ## `lua-sys.bridge`
 
 An internal compiled module (`bridge.so`, `.dylib` or `.dll`). Its functions
-support the high-level API: `new_state`, `close_state`, `make_callable`,
-`push_callback`, `register`, `unregister`, `set_hook`, `remove_hook`,
-`compound_tag` and `set_frame_meta`.
+support the high-level API: `new_state`, `close_state`, `memory_used`,
+`set_memory_limit`, `make_callable`, `push_callback`, `register`, `unregister`,
+`set_hook`, `remove_hook`, `compound_tag` and `set_frame_meta`.
 
 These functions are not a public interface. Their signatures and their
 operation can change without notice. Do not call them. Use `lua-sys.raw` when
