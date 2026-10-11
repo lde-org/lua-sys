@@ -81,6 +81,11 @@ typedef struct lua_Debug {
 
 typedef void (*lua_Hook)(lua_State *L, lua_Debug *ar);
 
+/* The allocator callback type: shared by both builds. The Windows symbol
+ * table in bridge.c names it in the lua_newstate signature, and the POSIX
+ * prototypes below use it too. */
+typedef void *(*lua_Alloc)(void *ud, void *ptr, size_t osize, size_t nsize);
+
 /* Convenience macros (matching LuaJIT / Lua 5.1 definitions) */
 #define lua_upvalueindex(i)  (LUA_GLOBALSINDEX - (i))
 #define lua_newtable(L)      lua_createtable(L, 0, 0)
@@ -145,7 +150,6 @@ int  lua_pcall (lua_State *L, int nargs, int nresults, int errfunc);
 int  lua_error (lua_State *L);
 
 /* ── State ── */
-typedef void *(*lua_Alloc)(void *ud, void *ptr, size_t osize, size_t nsize);
 lua_State *lua_newstate(lua_Alloc f, void *ud);
 lua_State *luaL_newstate(void);
 void       luaL_openlibs(lua_State *L);
