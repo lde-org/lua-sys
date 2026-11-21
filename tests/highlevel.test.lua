@@ -1,4 +1,4 @@
-local lua  = require("lua-sys")
+local lua = require("lua-sys")
 local test = require("lde-test")
 
 -- ─── State ────────────────────────────────────────────────────────────────
@@ -14,7 +14,7 @@ end)
 
 test.it("state:load returns a callable function", function()
 	local state = lua.new()
-	local fn = state:eval("return function(a, b) return a + b end")
+	local fn = state:eval("return function(a, b) return a + b end") --[[@as lua.Callable]]
 	test.truthy(fn)
 	test.equal("function", type(fn))
 	state:close()
@@ -46,7 +46,7 @@ end)
 
 test.it("calling a guest function returns plain values", function()
 	local state = lua.new()
-	local fn = state:eval("function(a, b) return a + b end")
+	local fn = state:eval("function(a, b) return a + b end") --[[@as lua.Callable]]
 	local result = fn(3, 4)
 	test.equal(7, result)
 	state:close()
@@ -54,7 +54,7 @@ end)
 
 test.it("guest function passes string arguments", function()
 	local state = lua.new()
-	local fn = state:eval("function(s) return s .. '!' end")
+	local fn = state:eval("function(s) return s .. '!' end") --[[@as lua.Callable]]
 	local result = fn("hello")
 	test.equal("hello!", result)
 	state:close()
@@ -62,7 +62,7 @@ end)
 
 test.it("guest function passes boolean arguments", function()
 	local state = lua.new()
-	local fn = state:eval("function(b) return not b end")
+	local fn = state:eval("function(b) return not b end") --[[@as lua.Callable]]
 	local result = fn(true)
 	test.equal(false, result)
 	state:close()
@@ -70,7 +70,7 @@ end)
 
 test.it("guest function returns multiple results", function()
 	local state = lua.new()
-	local fn = state:eval("function(a, b) return a, b, a + b end")
+	local fn = state:eval("function(a, b) return a, b, a + b end") --[[@as lua.Callable]]
 	local r1, r2, r3 = fn(10, 20)
 	test.equal(10, r1)
 	test.equal(20, r2)
@@ -80,7 +80,7 @@ end)
 
 test.it("pcall on guest function returns true and results on success", function()
 	local state = lua.new()
-	local fn = state:eval("function(x) return x * 2 end")
+	local fn = state:eval("function(x) return x * 2 end") --[[@as lua.Callable]]
 	local ok, result = pcall(fn, 21)
 	test.equal(true, ok)
 	test.equal(42, result)
@@ -89,11 +89,11 @@ end)
 
 test.it("pcall on guest function returns false and error on failure", function()
 	local state = lua.new()
-	local fn = state:eval("function() error('boom') end")
+	local fn = state:eval("function() error('boom') end") --[[@as lua.Callable]]
 	local ok, err = pcall(fn)
 	test.equal(false, ok)
 	test.equal("string", type(err))
-	test.includes(err, "boom")
+	test.includes(err --[[@as string]],  "boom" )
 	state:close()
 end)
 
@@ -139,7 +139,7 @@ test.it("chunk:pcall returns false and error on guest error", function()
 	local ok, err = state:load("error('chunk boom')"):pcall()
 	test.equal(false, ok)
 	test.equal("string", type(err))
-	test.includes(err, "chunk boom")
+	test.includes(err --[[@as string]],  "chunk boom" )
 	state:close()
 end)
 
@@ -156,8 +156,8 @@ test.it("chunk:xpcall returns a stack traceback on guest errors", function()
 	local ok, err = state:load("error('chunk boom')"):xpcall()
 	test.equal(false, ok)
 	test.equal("string", type(err))
-	test.includes(err, "chunk boom")
-	test.includes(err, "stack traceback")
+	test.includes(err --[[@as string]],  "chunk boom" )
+	test.includes(err --[[@as string]],  "stack traceback" )
 	state:close()
 end)
 
@@ -173,10 +173,10 @@ test.it("chunk:xpcall traceback includes the failing frames", function()
 		outer()
 	]]):xpcall()
 	test.equal(false, ok)
-	test.includes(err, "deep failure")
+	test.includes(err --[[@as string]],  "deep failure" )
 	-- frame names from the traceback, not the bare message
-	test.includes(err, "inner")
-	test.includes(err, "outer")
+	test.includes(err --[[@as string]],  "inner" )
+	test.includes(err --[[@as string]],  "outer" )
 	state:close()
 end)
 
@@ -203,13 +203,13 @@ test.it("chunk:pcall stays bare while chunk:xpcall adds the traceback", function
 
 	local pok, perr = chunk:pcall()
 	test.equal(false, pok)
-	test.equal("kaboom", perr)             -- bare message
-	test.falsy(string.find(perr, "stack traceback", 1, true))
+	test.equal("kaboom", perr) -- bare message
+	test.falsy(string.find(perr --[[@as string]],  "stack traceback",  1,  true ))
 
 	local xok, xerr = chunk:xpcall()
 	test.equal(false, xok)
-	test.includes(xerr, "kaboom")
-	test.includes(xerr, "stack traceback")
+	test.includes(xerr --[[@as string]],  "kaboom" )
+	test.includes(xerr --[[@as string]],  "stack traceback" )
 	state:close()
 end)
 
@@ -223,7 +223,7 @@ end)
 
 test.it("fn:pcall returns true and results on success", function()
 	local state = lua.new()
-	local fn = state:eval("function(x) return x * 2, x + 1 end")
+	local fn = state:eval("function(x) return x * 2, x + 1 end") --[[@as lua.Callable]]
 	local ok, a, b = fn:pcall(21)
 	test.equal(true, ok)
 	test.equal(42, a)
@@ -233,7 +233,7 @@ end)
 
 test.it("fn:pcall returns true when function returns nothing", function()
 	local state = lua.new()
-	local fn = state:eval("function() end")
+	local fn = state:eval("function() end") --[[@as lua.Callable]]
 	local ok = fn:pcall()
 	test.equal(true, ok)
 	state:close()
@@ -241,17 +241,17 @@ end)
 
 test.it("fn:pcall returns false and error on failure", function()
 	local state = lua.new()
-	local fn = state:eval("function() error('fn boom') end")
+	local fn = state:eval("function() error('fn boom') end") --[[@as lua.Callable]]
 	local ok, err = fn:pcall()
 	test.equal(false, ok)
 	test.equal("string", type(err))
-	test.includes(err, "fn boom")
+	test.includes(err --[[@as string]],  "fn boom" )
 	state:close()
 end)
 
 test.it("fn:pcall works with table arguments (slow path)", function()
 	local state = lua.new()
-	local fn = state:eval("function(t) return t.x + 1 end")
+	local fn = state:eval("function(t) return t.x + 1 end") --[[@as lua.Callable]]
 	local ok, v = fn:pcall(state:table({ x = 41 }))
 	test.equal(true, ok)
 	test.equal(42, v)
@@ -260,7 +260,7 @@ end)
 
 test.it("fn:pcall returns table results as lua.Table", function()
 	local state = lua.new()
-	local fn = state:eval("function() return { answer = 42 } end")
+	local fn = state:eval("function() return { answer = 42 } end") --[[@as lua.Callable]]
 	local ok, t = fn:pcall()
 	test.equal(true, ok)
 	test.equal("table", t:type())
@@ -270,23 +270,23 @@ end)
 
 test.it("fn:pcall catches errors on the slow path too", function()
 	local state = lua.new()
-	local fn = state:eval("function(t) error('slow boom') end")
+	local fn = state:eval("function(t) error('slow boom') end") --[[@as lua.Callable]]
 	local ok, err = fn:pcall(state:table({}))
 	test.equal(false, ok)
 	test.equal("string", type(err))
-	test.includes(err, "slow boom")
+	test.includes(err --[[@as string]],  "slow boom" )
 	state:close()
 end)
 
 test.it("fn:pcall leaves the host stack balanced", function()
 	local state = lua.new()
-	local L    = state.L
-	local raw  = lua.raw
+	local L = state.L
+	local raw = lua.raw
 	local base = raw.gettop(L)
-	local fn   = state:eval("function(x) return x end")
-	local bad  = state:eval("function() error('stack boom') end")
-	local ok   = fn:pcall(1)
-	local ok2, err = bad:pcall() -- error path
+	local fn = state:eval("function(x) return x end") --[[@as lua.Callable]]
+	local bad = state:eval("function() error('stack boom') end")
+	local ok = fn:pcall(1)
+	local ok2 = bad:pcall() -- error path
 	test.equal(true, ok)
 	test.equal(false, ok2)
 	test.equal(base, raw.gettop(L))
@@ -361,8 +361,8 @@ end)
 
 test.it("globals:set accepts a guest function and it stays callable", function()
 	local state = lua.new()
-	local fn    = state:eval("function(x) return x + 1 end")
-	local g     = state:globals()
+	local fn = state:eval("function(x) return x + 1 end") --[[@as lua.Callable]]
+	local g = state:globals()
 	g:set("increment", fn)
 	-- verify it's visible from within Lua
 	local runner = state:eval("function() return increment(9) end")
@@ -377,9 +377,7 @@ test.it("globals:set accepts a plain Lua function (wrapped as CFunction)", funct
 	local state = lua.new()
 	local g = state:globals()
 
-	g:set("add", function(a, b)
-		return a + b
-	end)
+	g:set("add", |a, b| -> a + b)
 
 	local v = state:eval("return add(3, 4)")
 	test.equal(7, v)
@@ -394,7 +392,7 @@ test.it("wrapped Lua function can return multiple values", function()
 		return b, a
 	end)
 
-	local fn = state:eval("function() return swap(1, 2) end")
+	local fn = state:eval("function() return swap(1, 2) end") --[[@as lua.Callable]]
 	local r1, r2 = fn()
 	test.equal(2, r1)
 	test.equal(1, r2)
@@ -410,7 +408,7 @@ test.it("wrapped Lua function returning nil produces no results", function()
 		called = true
 	end)
 
-	local fn = state:eval("function() noop(); return 'done' end")
+	local fn = state:eval("function() noop(); return 'done' end") --[[@as lua.Callable]]
 	local v = fn()
 	test.equal(true, called)
 	test.equal("done", v)
@@ -438,12 +436,12 @@ end)
 
 test.it("stack is balanced after every operation", function()
 	local state = lua.new()
-	local L     = state.L
-	local raw   = lua.raw
-	local base  = raw.gettop(L)
+	local L = state.L
+	local raw = lua.raw
+	local base = raw.gettop(L)
 
-	local fn    = state:eval("function(x) return x end")
-	local g     = state:globals()
+	local fn = state:eval("function(x) return x end") --[[@as lua.Callable]]
+	local g = state:globals()
 	g:set("x", 10)
 	local v = g:get("x")
 	fn(v)
@@ -456,10 +454,8 @@ end)
 test.it("pcall succeeds when function calls wrapped Lua function", function()
 	local state = lua.new()
 	local g = state:globals()
-	g:set("double", function(x)
-		return x * 2
-	end)
-	local fn = state:eval("function(x) return double(x) end")
+	g:set("double", x -> x * 2)
+	local fn = state:eval("function(x) return double(x) end") --[[@as lua.Callable]]
 	local ok, result = pcall(fn, 5)
 	test.equal(true, ok)
 	test.equal(10, result)
@@ -470,21 +466,19 @@ test.it("pcall catches errors that occur after wrapped calls", function()
 	local state = lua.new()
 	local g = state:globals()
 	g:set("noop", function() end)
-	local fn = state:eval("function() noop(); error('kaboom') end")
+	local fn = state:eval("function() noop(); error('kaboom') end") --[[@as lua.Callable]]
 	local ok, err = pcall(fn)
 	test.equal(false, ok)
 	test.equal("string", type(err))
-	test.includes(err, "kaboom")
+	test.includes(err --[[@as string]],  "kaboom" )
 	state:close()
 end)
 
 test.it("pcall returns results from wrapped function calls", function()
 	local state = lua.new()
 	local g = state:globals()
-	g:set("add", function(a, b)
-		return a + b
-	end)
-	local fn = state:eval("function(a, b) return add(a, b) end")
+	g:set("add", |a, b| -> a + b)
+	local fn = state:eval("function(a, b) return add(a, b) end") --[[@as lua.Callable]]
 	local ok, result = pcall(fn, 10, 20)
 	test.equal(true, ok)
 	test.equal(30, result)
@@ -546,7 +540,9 @@ test.it("pairs() iterates all key/value pairs", function()
 	test.equal(2, got.b)
 	test.equal(3, got.c)
 	test.equal(3, (function()
-		local n = 0; for _ in pairs(got) do n = n + 1 end; return n
+		local n = 0
+		for _ in pairs(got) do n = n + 1 end
+		return n
 	end)())
 	state:close()
 end)
@@ -595,9 +591,12 @@ test.it("ipairs() iterates sequential integer keys", function()
 		vals[#vals + 1] = v
 	end
 	test.equal(3, #keys)
-	test.equal(1, keys[1]); test.equal(10, vals[1])
-	test.equal(2, keys[2]); test.equal(20, vals[2])
-	test.equal(3, keys[3]); test.equal(30, vals[3])
+	test.equal(1, keys[1])
+	test.equal(10, vals[1])
+	test.equal(2, keys[2])
+	test.equal(20, vals[2])
+	test.equal(3, keys[3])
+	test.equal(30, vals[3])
 	state:close()
 end)
 
@@ -629,8 +628,6 @@ test.it("ipairs() returns string values correctly", function()
 	test.equal("c", vals[3])
 	state:close()
 end)
-
-
 
 test.it("strings with embedded nulls survive guest fn roundtrip", function()
 	local state = lua.new()
@@ -673,9 +670,7 @@ test.it("host callback can call back into guest (Host → Guest → Host)", func
 
 	local guest_inc = state:eval("function(x) return inc(x) end")
 
-	g:set("inc", function(x)
-		return x + 1
-	end)
+	g:set("inc", x -> x + 1)
 
 	g:set("nested_test", function(x)
 		local r = guest_inc(x)
@@ -688,13 +683,13 @@ test.it("host callback can call back into guest (Host → Guest → Host)", func
 end)
 
 test.it("deeper nesting: guest → host_A → guest → host_B → guest", function()
-	local state     = lua.new()
-	local g         = state:globals()
+	local state = lua.new()
+	local g = state:globals()
 
-	local inc_fn    = state:eval("function(x) return inc(x) end")
+	local inc_fn = state:eval("function(x) return inc(x) end")
 	local double_fn = state:eval("function(x) return double(x) end")
 
-	g:set("inc", function(x) return x + 1 end)
+	g:set("inc", x -> x + 1)
 	g:set("double", function(x)
 		local r = inc_fn(x)
 		return r * 2
@@ -704,7 +699,7 @@ test.it("deeper nesting: guest → host_A → guest → host_B → guest", funct
 		return r * 3
 	end)
 
-	local fn = state:eval("function(x) return triple(x) end")
+	local fn = state:eval("function(x) return triple(x) end") --[[@as lua.Callable]]
 	local result = fn(5)
 	test.equal(36, result)
 	state:close()
@@ -718,13 +713,13 @@ test.it("guest stack is balanced after nested cross-boundary calls", function()
 
 	local guest_fn = state:eval("function() return inner() end")
 
-	g:set("inner", function() return 1 end)
+	g:set("inner", || -> 1)
 	g:set("outer", function()
 		local r = guest_fn()
 		return r + 2
 	end)
 
-	local fn = state:eval("function() return outer() end")
+	local fn = state:eval("function() return outer() end") --[[@as lua.Callable]]
 
 	for _ = 1, 100 do
 		local v = fn()
@@ -741,14 +736,14 @@ test.it("many iterations of nested calls do not corrupt state", function()
 
 	local guest_add = state:eval("function(a, b) return add(a, b) end")
 
-	g:set("add", function(a, b) return a + b end)
+	g:set("add", |a, b| -> a + b)
 	g:set("multiply_add", function(a, b, c)
 		local r1 = guest_add(a, b)
 		local r2 = guest_add(r1, c)
 		return r2
 	end)
 
-	local fn = state:eval("function(a, b, c) return multiply_add(a, b, c) end")
+	local fn = state:eval("function(a, b, c) return multiply_add(a, b, c) end") --[[@as lua.Callable]]
 
 	for _ = 1, 1000 do
 		local result = fn(2, 3, 4)
@@ -772,9 +767,7 @@ test.it("host callback returning a table raises a clear guest error (not a crash
 	-- Host function returns a compound value (table). The bridge cannot copy
 	-- tables across independent states; it must raise a clear guest-side error
 	-- rather than crashing or calling lua_error on the host outside a pcall.
-	g:set("get_obj", function()
-		return { value = 42 }
-	end)
+	g:set("get_obj", || -> { value = 42 })
 
 	local ok, err = pcall(state.eval, state, [[
 		local obj = get_obj()
@@ -782,7 +775,7 @@ test.it("host callback returning a table raises a clear guest error (not a crash
 	-- Must fail with a bridge error message, not a process crash
 	test.falsy(ok)
 	test.truthy(type(err) == "string", "expected string error, got " .. type(err))
-	test.includes(err, "bridge:")
+	test.includes(err --[[@as string]],  "bridge:" )
 	state:close()
 end)
 
@@ -790,9 +783,7 @@ test.it("host callback returning a table error is catchable with guest pcall", f
 	local state = lua.new()
 	local g = state:globals()
 
-	g:set("get_obj", function()
-		return { value = 42 }
-	end)
+	g:set("get_obj", || -> { value = 42 })
 
 	-- Guest-side pcall should catch the bridge error cleanly
 	local ok, err = pcall(state.eval, state, [[
@@ -808,9 +799,7 @@ test.it("host callback NOT returning a table still works fine", function()
 	local state = lua.new()
 	local g = state:globals()
 
-	g:set("get_num", function()
-		return 42
-	end)
+	g:set("get_num", || -> 42)
 
 	local ok, err = pcall(state.eval, state, [[
 		local n = get_num()
@@ -825,18 +814,20 @@ end)
 test.it("host callback receives a guest table as a lua.Table", function()
 	local state = lua.new()
 	local g = state:globals()
+	---@type lua.Table?
 	local received = nil
 
 	g:set("inspect", function(t)
+		---@cast t lua.Table
 		received = t
 		return type(t)
 	end)
 
 	local result = state:eval("return inspect({ a = 1, b = 'two' })")
-	test.equal("table", result)          -- host fn sees a table
-	test.equal(1, received.a)            -- lua.Table proxies reads
+	test.equal("table", result) -- host fn sees a table
+	test.equal(1, received.a) -- lua.Table proxies reads
 	test.equal("two", received.b)
-	test.equal(1, received:get("a"))     -- explicit get() works too
+	test.equal(1, received:get("a")) -- explicit get() works too
 	test.equal("table", received:type())
 
 	state:close()
@@ -847,6 +838,7 @@ test.it("host can mutate a guest-passed table and the guest sees it", function()
 	local g = state:globals()
 
 	g:set("mutate", function(t)
+		---@cast t lua.Table
 		t.answer = 42
 		t.n = (t.n or 0) + 1
 	end)
@@ -856,7 +848,7 @@ test.it("host can mutate a guest-passed table and the guest sees it", function()
 		mutate(t)
 		return t.answer + t.n
 	]])
-	test.equal(53, result)  -- 42 + (10 + 1)
+	test.equal(53, result) -- 42 + (10 + 1)
 
 	state:close()
 end)
@@ -864,9 +856,13 @@ end)
 test.it("guest tables arrive as live views, not copies", function()
 	local state = lua.new()
 	local g = state:globals()
+	---@type lua.Table?
 	local captured = nil
 
-	g:set("grab", function(t) captured = t end)
+	g:set("grab", function(t)
+		---@cast t lua.Table
+		captured = t
+	end)
 
 	state:eval([[
 		local t = { v = 1 }
@@ -890,9 +886,9 @@ test.it("mixed primitive and table args arrive in order", function()
 	state:eval("mix(1, { x = 2 }, 'three', { y = 4 })")
 
 	test.equal(1, seen[1])
-	test.equal(2, seen[2].x)
+	test.equal(2, (seen[2]) --[[@as lua.Table]] .x)
 	test.equal("three", seen[3])
-	test.equal(4, seen[4].y)
+	test.equal(4, (seen[4]) --[[@as lua.Table]] .y)
 
 	state:close()
 end)
@@ -900,13 +896,17 @@ end)
 test.it("nested guest tables arrive as nested lua.Table values", function()
 	local state = lua.new()
 	local g = state:globals()
+	---@type lua.Table?
 	local received = nil
 
-	g:set("peek", function(t) received = t end)
+	g:set("peek", function(t)
+		---@cast t lua.Table
+		received = t
+	end)
 
 	state:eval("peek({ inner = { deep = 99 } })")
 
-	test.equal(99, received.inner.deep)
+	test.equal(99, (received.inner) --[[@as lua.Table]] .deep)
 
 	state:close()
 end)
@@ -916,7 +916,10 @@ test.it("host callbacks receive tables repeatedly without corruption", function(
 	local g = state:globals()
 	local total = 0
 
-	g:set("add_n", function(t) total = total + (t.n or 0) end)
+	g:set("add_n", function(t)
+		---@cast t lua.Table
+		total = total + (t.n or 0)
+	end)
 
 	state:eval("add_n({ n = 1 }) add_n({ n = 2 }) add_n({ n = 3 })")
 
@@ -1024,7 +1027,7 @@ end)
 
 test.it("Chunk:eval returns a callable function", function()
 	local state = lua.new()
-	local fn = state:load("return function(a, b) return a + b end"):eval()
+	local fn = state:load("return function(a, b) return a + b end"):eval() --[[@as lua.Callable]]
 	test.truthy(fn)
 	test.equal("function", type(fn))
 	test.equal(7, fn(3, 4))
@@ -1099,7 +1102,7 @@ test.it("Chunk:eval raises on runtime error", function()
 	local ok, err = pcall(function() chunk:eval() end)
 	test.falsy(ok)
 	test.truthy(err)
-	test.includes(err, "boom from chunk")
+	test.includes(err --[[@as string]],  "boom from chunk" )
 	state:close()
 end)
 
@@ -1109,7 +1112,7 @@ test.it("Chunk:call raises on runtime error", function()
 	local ok, err = pcall(function() chunk:call() end)
 	test.falsy(ok)
 	test.truthy(err)
-	test.includes(err, "call boom")
+	test.includes(err --[[@as string]],  "call boom" )
 	state:close()
 end)
 
@@ -1242,7 +1245,7 @@ test.it("state:table() errors on non-table init", function()
 	local state = lua.new()
 	local ok, err = pcall(function() state:table("oops") end)
 	test.falsy(ok)
-	test.includes(err, "init argument must be a table")
+	test.includes(err --[[@as string]],  "init argument must be a table" )
 	state:close()
 end)
 
@@ -1252,14 +1255,14 @@ test.it("state:table() errors on unsupported key type", function()
 		state:table({ [{}] = "bad" })
 	end)
 	test.falsy(ok)
-	test.includes(err, "unsupported key type")
+	test.includes(err --[[@as string]],  "unsupported key type" )
 	state:close()
 end)
 
 test.it("state:table() result can be passed to a guest function and read back", function()
 	local state = lua.new()
 	local t = state:table({ value = 7 })
-	local fn = state:eval("function(tbl) return tbl.value * 6 end")
+	local fn = state:eval("function(tbl) return tbl.value * 6 end") --[[@as lua.Callable]]
 	local result = fn(t)
 	test.equal(42, result)
 	state:close()
@@ -1323,7 +1326,7 @@ end)
 
 test.it("coerced table can be passed as argument to guest function", function()
 	local state = lua.new()
-	local fn = state:eval("function(t) return t.a + t.b end")
+	local fn = state:eval("function(t) return t.a + t.b end") --[[@as lua.Callable]]
 	local result = fn({ a = 10, b = 32 })
 	test.equal(42, result)
 	state:close()
@@ -1332,7 +1335,7 @@ end)
 test.it("coerced table with nested functions works in guest code", function()
 	local state = lua.new()
 	local g = state:globals()
-	g.api = { greet = function(n) return "hi " .. n end }
+	g.api = { greet = n -> "hi " .. n }
 	local result = state:eval("return api.greet('world')")
 	test.equal("hi world", result)
 	state:close()
@@ -1390,7 +1393,7 @@ test.it("self-referencing table raises a cycle error", function()
 		state:table(t)
 	end)
 	test.falsy(ok)
-	test.includes(err, "cycle detected")
+	test.includes(err --[[@as string]],  "cycle detected" )
 	-- State should still be usable after the error
 	local g = state:globals()
 	g.x = 42
@@ -1407,7 +1410,7 @@ test.it("mutually-referencing tables raise a cycle error", function()
 		state:table(a)
 	end)
 	test.falsy(ok)
-	test.includes(err, "cycle detected")
+	test.includes(err --[[@as string]],  "cycle detected" )
 	state:close()
 end)
 
@@ -1420,7 +1423,7 @@ test.it("table coercion via __newindex also detects cycles", function()
 		g.bad = t
 	end)
 	test.falsy(ok)
-	test.includes(err, "cycle detected")
+	test.includes(err --[[@as string]],  "cycle detected" )
 	state:close()
 end)
 
@@ -1456,7 +1459,7 @@ test.it("setHook with count mask aborts an infinite loop", function()
 		state:eval("while true do end")
 	end)
 	test.falsy(ok)
-	test.includes(err, "infinite loop")
+	test.includes(err --[[@as string]],  "infinite loop" )
 
 	state:close()
 end)
@@ -1494,7 +1497,7 @@ test.it("setHook with call/return mask reports function calls", function()
 		log[#log + 1] = event
 	end, "call return")
 
-	local fn = state:eval("function() return math.abs(-5) end")
+	local fn = state:eval("function() return math.abs(-5) end") --[[@as lua.Callable]]
 	test.equal(5, fn())
 
 	local sawCall, sawReturn = false, false
@@ -1515,12 +1518,7 @@ test.it("hook info table exposes source, line and what fields", function()
 	state:setHook(function(event, info)
 		-- Lazy fields are only valid while the hook is active: snapshot
 		-- them synchronously from inside the callback.
-		seen[#seen + 1] = {
-			event       = info.event,
-			source      = info.source,
-			currentline = info.currentline,
-			what        = info.what,
-		}
+		seen[#seen + 1] = { event = info.event, source = info.source, currentline = info.currentline, what = info.what }
 	end, "line")
 
 	state:load("local a = 1"):setName("@hooktest.lua"):call()
@@ -1602,10 +1600,10 @@ test.it("setHook exposes the triggering thread as info.thread", function()
 	local ffi = require("ffi")
 
 	local state = lua.new()
-	local main  = state.L
+	local main = state.L
 	local threads = {}
 	local stackOK = 0
-	local infoOK  = 0
+	local infoOK = 0
 
 	state:setHook(function(event, info)
 		threads[#threads + 1] = info.thread
@@ -1642,11 +1640,11 @@ test.it("setHook info.thread lets the host read the coroutine's stack and locals
 	local ffi = require("ffi")
 
 	local state = lua.new()
-	local main  = state.L
+	local main = state.L
 
 	local mainEvents = 0
 	local coroEvents = 0
-	local coroLocals = {}   -- frame locals captured on the coroutine thread
+	local coroLocals = {} -- frame locals captured on the coroutine thread
 
 	state:setHook(function(event, info)
 		if info.thread == nil then return end
@@ -1662,13 +1660,13 @@ test.it("setHook info.thread lets the host read the coroutine's stack and locals
 		coroEvents = coroEvents + 1
 
 		local ar = ffi.new("lua_Debug")
-		if ffi.C.lua_getstack(L, 0, ar) ~= 0 then
-			ffi.C.lua_getinfo(L, "Sln", ar)
+		if lua.raw.getstack(L, 0, ar) ~= 0 then
+			lua.raw.getinfo(L, "Sln", ar)
 			for n = 1, 64 do
-				local name = ffi.C.lua_getlocal(L, ar, n)
+				local name = lua.raw.getlocal(L, ar, n)
 				if name == nil then break end
-				local value = ffi.C.lua_tointeger(L, -1)
-				ffi.C.lua_settop(L, -2)   -- pop the pushed local value
+				local value = lua.raw.tointeger(L, -1)
+				lua.raw.settop(L, -2) -- pop the pushed local value
 				coroLocals[ffi.string(name)] = value
 			end
 		end
@@ -1695,6 +1693,7 @@ end)
 
 test.it("setHook info table is populated eagerly", function()
 	local state = lua.new()
+	---@type integer?
 	local keys = nil
 
 	state:setHook(function(event, info)
@@ -1726,8 +1725,8 @@ test.it("setHook info:stack() returns the triggering thread's stack trace", func
 			-- Level 0 of the trace is the frame the hook fired in, so the
 			-- lazy fields and the first frame must agree.
 			infoSource = info.source
-			infoLine   = info.currentline
-			infoWhat   = info.what
+			infoLine = info.currentline
+			infoWhat = info.what
 		end
 	end, "line")
 
@@ -1749,7 +1748,7 @@ test.it("setHook info:stack() walks the coroutine's stack from inside a coroutin
 	local state = lua.new()
 	local main = state.L
 
-	---@type lua.HookFrame?
+	---@type lua.Frame?
 	local coroFrame = nil
 
 	state:setHook(function(event, info)
@@ -1789,7 +1788,7 @@ test.it("hook info fields read during the callback stay cached afterwards", func
 	state:eval("local x = 1")
 
 	test.truthy(stored.source ~= nil)
-	test.equal(stored.source, stored.info.source)  -- still readable afterwards
+	test.equal(stored.source, stored.info.source) -- still readable afterwards
 
 	state:close()
 end)
@@ -1812,9 +1811,9 @@ test.it("hook info fields stay readable but stack() refuses after the callback r
 
 	-- info:stack() walks the thread while it is paused at the hook, so it
 	-- must be called from within the callback
-	local ok, err = pcall(function() return stored:stack() end)
+	local ok, err = pcall(|| -> stored:stack())
 	test.falsy(ok)
-	test.includes(err, "hook callback")
+	test.includes(err --[[@as string]],  "hook callback" )
 
 	state:close()
 end)
@@ -1884,11 +1883,7 @@ test.it("frame:getLocal / frame:setLocal read and write locals", function()
 		if ffi.cast("lua_State*", info.thread) ~= main and values == nil then
 			local fr = info:stack()[1]
 			if fr:getLocal("marker") ~= nil then
-				values = {
-					before = fr:getLocal("marker"),
-					set    = fr:setLocal("marker", 777),
-					after  = fr:getLocal("marker"),
-				}
+				values = { before = fr:getLocal("marker"), set = fr:setLocal("marker", 777), after = fr:getLocal("marker") }
 			end
 		end
 	end, "line")
@@ -1905,7 +1900,7 @@ test.it("frame:getLocal / frame:setLocal read and write locals", function()
 	test.equal(12345, values.before)
 	test.equal(true, values.set)
 	test.equal(777, values.after)
-	test.equal(777, result)  -- the guest returned the modified value
+	test.equal(777, result) -- the guest returned the modified value
 
 	state:close()
 end)
@@ -1922,8 +1917,8 @@ test.it("frame:upvalues() and getUpvalue/setUpvalue read and write upvalues", fu
 			if fr:getUpvalue("captured") ~= nil then
 				values = {
 					before = fr:getUpvalue("captured"),
-					set    = fr:setUpvalue("captured", 111),
-					after  = fr:getUpvalue("captured"),
+					set = fr:setUpvalue("captured", 111),
+					after = fr:getUpvalue("captured")
 				}
 			end
 		end
@@ -1944,7 +1939,7 @@ test.it("frame:upvalues() and getUpvalue/setUpvalue read and write upvalues", fu
 	test.equal(99, values.before)
 	test.equal(true, values.set)
 	test.equal(111, values.after)
-	test.equal(111, result)  -- the upvalue cell change is visible to the guest
+	test.equal(111, result) -- the upvalue cell change is visible to the guest
 
 	state:close()
 end)
@@ -1960,9 +1955,9 @@ test.it("frame:eval reads locals and globals in the frame's context", function()
 			local fr = info:stack()[1]
 			if fr:getLocal("marker") ~= nil then
 				results = {
-					arith    = { fr:eval("marker + 1") },
-					global   = { fr:eval("math.abs(-7)") },
-					fallback = { fr:eval("local t = 1; return t") },
+					arith = { fr:eval("marker + 1") },
+					global = { fr:eval("math.abs(-7)") },
+					fallback = { fr:eval("local t = 1; return t") }
 				}
 			end
 		end
@@ -2037,7 +2032,7 @@ test.it("frame:eval returns false, err on guest error", function()
 	]])
 
 	test.truthy(err, "expected the eval to error")
-	test.includes(err, "eval boom")
+	test.includes(err --[[@as string]],  "eval boom" )
 
 	state:close()
 end)
@@ -2057,7 +2052,7 @@ test.it("frame methods degrade gracefully after the hook returns", function()
 	test.equal(nil, stored:getLocal("x"))
 	local ok, e = stored:eval("x")
 	test.equal(false, ok)
-	test.includes(e, "no frame")
+	test.includes(e --[[@as string]],  "no frame" )
 
 	state:close()
 end)
@@ -2098,7 +2093,7 @@ end)
 
 test.it("state:jitOff(fn) / state:jitOn(fn) target a single guest function", function()
 	local state = lua.new()
-	local fn = state:eval("function(x) return x * 2 end")
+	local fn = state:eval("function(x) return x * 2 end") --[[@as lua.Callable]]
 
 	-- Per-function mode leaves the engine status untouched (unlike
 	-- state:jitOff(), which turns the whole engine off)
@@ -2120,14 +2115,14 @@ test.it("state:jitOff rejects functions that are not guest callables", function(
 		state:jitOff(function() end)
 	end)
 	test.falsy(ok)
-	test.includes(err, "guest callable")
+	test.includes(err --[[@as string]],  "guest callable" )
 
 	state:close()
 end)
 
 test.it("state:jitFlush() drops compiled traces without crashing", function()
 	local state = lua.new()
-	local fn = state:eval("function(x) return x + 1 end")
+	local fn = state:eval("function(x) return x + 1 end") --[[@as lua.Callable]]
 
 	-- Compile the function a few times so traces exist, then flush them
 	for _ = 1, 100 do fn(1) end
@@ -2141,7 +2136,7 @@ end)
 
 ---@param state lua.State
 local function dumped_bytecode(state)
-	return state:eval("return string.dump(function() return 7 end)")
+	return state:eval("return string.dump(function() return 7 end)") --[[@as string]]
 end
 
 test.it("chunk:getMode() is both by default", function()
@@ -2168,19 +2163,23 @@ test.it("chunk:setMode accepts the Lua mode letters and the word binary", functi
 	test.equal("bytecode", state:load("x"):setMode("binary"):getMode())
 	test.equal("both", state:load("x"):setMode("bt"):getMode())
 	test.equal("both", state:load("x"):setMode("tb"):getMode())
+	---@diagnostic disable-next-line: type
 	test.equal("text", state:load("x"):setMode("TEXT"):getMode())
+	---@diagnostic disable-next-line: type
 	test.equal(7, state:load(bytecode):setMode("B"):eval())
 	state:close()
 end)
 
 test.it("chunk:setMode rejects an unknown mode", function()
 	local state = lua.new()
+	---@diagnostic disable-next-line: type
 	local ok, err = pcall(function() state:load("return 1"):setMode("nope") end)
 	test.falsy(ok)
-	test.includes(err, [[unknown mode "nope"]])
+	test.includes(err --[[@as string]],  [[unknown mode "nope"]] )
+	---@diagnostic disable-next-line: type
 	local ok2, err2 = pcall(function() state:load("return 1"):setMode(42) end)
 	test.falsy(ok2)
-	test.includes(err2, "mode must be")
+	test.includes(err2 --[[@as string]],  "mode must be" )
 	state:close()
 end)
 
@@ -2194,7 +2193,7 @@ test.it("mode text refuses bytecode", function()
 	local state = lua.new()
 	local ok, err = state:load(dumped_bytecode(state)):setMode("text"):pcall()
 	test.falsy(ok)
-	test.includes(err, "wrong mode")
+	test.includes(err --[[@as string]],  "wrong mode" )
 	state:close()
 end)
 
@@ -2208,7 +2207,7 @@ test.it("mode bytecode refuses text", function()
 	local state = lua.new()
 	local ok, err = state:load("return 1"):setMode("bytecode"):pcall()
 	test.falsy(ok)
-	test.includes(err, "wrong mode")
+	test.includes(err --[[@as string]],  "wrong mode" )
 	state:close()
 end)
 
@@ -2222,23 +2221,19 @@ test.it("a mode error raises from eval and call", function()
 	local state = lua.new()
 	local bytecode = dumped_bytecode(state)
 
-	local ok, err = pcall(function()
-		return state:load(bytecode):setMode("text"):eval()
-	end)
+	local ok, err = pcall(|| -> state:load(bytecode):setMode("text"):eval())
 	test.falsy(ok)
-	test.includes(err, "wrong mode")
+	test.includes(err --[[@as string]],  "wrong mode" )
 
 	local ok2, err2 = pcall(function()
 		state:load(bytecode):setMode("text"):call()
 	end)
 	test.falsy(ok2)
-	test.includes(err2, "wrong mode")
+	test.includes(err2 --[[@as string]],  "wrong mode" )
 
-	local ok3, err3 = pcall(function()
-		return state:load("return 1"):setMode("bytecode")()
-	end)
+	local ok3, err3 = pcall(|| -> state:load("return 1"):setMode("bytecode")())
 	test.falsy(ok3)
-	test.includes(err3, "wrong mode")
+	test.includes(err3 --[[@as string]],  "wrong mode" )
 
 	state:close()
 end)
@@ -2247,12 +2242,9 @@ test.it("mode applies to a chunk with a name", function()
 	local state = lua.new()
 	test.equal(9, state:load("return 9"):setName("@f.lua"):setMode("text"):eval())
 
-	local ok, err = state:load(dumped_bytecode(state))
-		:setName("@f.lua")
-		:setMode("text")
-		:pcall()
+	local ok, err = state:load(dumped_bytecode(state)):setName("@f.lua"):setMode("text"):pcall()
 	test.falsy(ok)
-	test.includes(err, "wrong mode")
+	test.includes(err --[[@as string]],  "wrong mode" )
 	state:close()
 end)
 
@@ -2261,6 +2253,7 @@ test.it("chunk:isBytecode detects bytecode and text", function()
 	test.equal(false, state:load("return 1"):isBytecode())
 	test.equal(true, state:load(dumped_bytecode(state)):isBytecode())
 	test.equal(true, state:load("\27Lua" .. string.rep("\0", 4)):isBytecode())
+	---@diagnostic disable-next-line: type
 	test.equal(false, state:load(42):isBytecode())
 	state:close()
 end)
@@ -2287,11 +2280,9 @@ test.it("text chunks keep the chunk name in errors", function()
 	local state = lua.new()
 	local ok, err = state:load("1 +"):pcall()
 	test.falsy(ok)
-	test.includes(err, "unexpected symbol")
-	test.equal("return debug.getinfo(1,'S').source",
-		state:load("return debug.getinfo(1,'S').source"):eval())
-	test.equal("@s.lua",
-		state:load("return debug.getinfo(1,'S').source"):setName("@s.lua"):eval())
+	test.includes(err --[[@as string]],  "unexpected symbol" )
+	test.equal("return debug.getinfo(1,'S').source", state:load("return debug.getinfo(1,'S').source"):eval())
+	test.equal("@s.lua", state:load("return debug.getinfo(1,'S').source"):setName("@s.lua"):eval())
 	state:close()
 end)
 
@@ -2299,47 +2290,47 @@ end)
 
 test.it("every state operation raises after close()", function()
 	local state = lua.new()
-	local tbl   = state:table({ a = 1 })
+	local tbl = state:table({ a = 1 })
 	local chunk = state:load("return 1")
-	local fn    = state:eval("return function() return 1 end")
+	local fn = state:eval("return function() return 1 end") --[[@as lua.Callable]]
 	state:close()
 
 	local calls = {
-		["state:eval"]    = function() return state:eval("return 1") end,
-		["state:load"]    = function() return state:load("return 1") end,
-		["state:globals"] = function() return state:globals() end,
-		["state:table"]   = function() return state:table() end,
-		["chunk:eval"]    = function() return chunk:eval() end,
-		["chunk:call"]    = function() chunk:call() end,
-		["chunk:pcall"]   = function() return chunk:pcall() end,
-		["chunk:xpcall"]  = function() return chunk:xpcall() end,
-		["Table:get"]     = function() return tbl:get("a") end,
-		["Table:set"]     = function() tbl:set("b", 2) end,
-		["Table field"]   = function() return tbl.a end,
-		["Table:pairs"]   = function() for _ in tbl:pairs() do end end,
-		["Table:ipairs"]  = function() for _ in tbl:ipairs() do end end,
-		["callable"]      = function() return fn() end,
-		["jitOff"]        = function() return state:jitOff() end,
-		["jitOn"]         = function() return state:jitOn() end,
-		["jitFlush"]      = function() return state:jitFlush() end,
-		["setHook"]       = function() return state:setHook(nil) end,
+		["state:eval"] = || -> state:eval("return 1"),
+		["state:load"] = || -> state:load("return 1"),
+		["state:globals"] = || -> state:globals(),
+		["state:table"] = || -> state:table(),
+		["chunk:eval"] = || -> chunk:eval(),
+		["chunk:call"] = function() chunk:call() end,
+		["chunk:pcall"] = || -> chunk:pcall(),
+		["chunk:xpcall"] = || -> chunk:xpcall(),
+		["Table:get"] = || -> tbl:get("a"),
+		["Table:set"] = function() tbl:set("b", 2) end,
+		["Table field"] = || -> tbl.a,
+		["Table:pairs"] = function() for _ in tbl:pairs() do end end,
+		["Table:ipairs"] = function() for _ in tbl:ipairs() do end end,
+		["callable"] = || -> fn(),
+		["jitOff"] = || -> state:jitOff(),
+		["jitOn"] = || -> state:jitOn(),
+		["jitFlush"] = || -> state:jitFlush(),
+		["setHook"] = || -> state:setHook(nil)
 	}
 
 	for name, call in pairs(calls) do
 		local ok, err = pcall(call)
 		test.falsy(ok, name .. " must raise after close()")
-		test.includes(err, "state is closed", name)
+		test.includes(err --[[@as string]],  "state is closed",  name )
 	end
 end)
 
 test.it("a callable reports a closed state through pcall", function()
 	local state = lua.new()
-	local fn = state:eval("return function() return 1 end")
+	local fn = state:eval("return function() return 1 end") --[[@as lua.Callable]]
 	state:close()
 
 	local ok, err = fn:pcall()
 	test.falsy(ok)
-	test.includes(err, "state is closed")
+	test.includes(err --[[@as string]],  "state is closed" )
 end)
 
 test.it("close() is safe to repeat and the state stays closed", function()
@@ -2347,9 +2338,9 @@ test.it("close() is safe to repeat and the state stays closed", function()
 	state:close()
 	local ok = pcall(function() state:close() end)
 	test.truthy(ok)
-	local ok2, err = pcall(function() return state:eval("return 1") end)
+	local ok2, err = pcall(|| -> state:eval("return 1"))
 	test.falsy(ok2)
-	test.includes(err, "state is closed")
+	test.includes(err --[[@as string]],  "state is closed" )
 end)
 
 test.it("a table from a closed state does not corrupt later states", function()
@@ -2359,9 +2350,9 @@ test.it("a table from a closed state does not corrupt later states", function()
 
 	local second = lua.new()
 	test.equal(2, second:eval("return 1 + 1"))
-	local ok, err = pcall(function() return tbl:get("a") end)
+	local ok, err = pcall(|| -> tbl:get("a"))
 	test.falsy(ok)
-	test.includes(err, "state is closed")
+	test.includes(err --[[@as string]],  "state is closed" )
 	second:close()
 end)
 
@@ -2383,7 +2374,7 @@ test.it("a stored frame degrades after close()", function()
 	test.equal(false, frame:setUpvalue("x", 2))
 	local ok, err = frame:eval("x")
 	test.falsy(ok)
-	test.includes(err, "no frame")
+	test.includes(err --[[@as string]],  "no frame" )
 end)
 
 test.it("a frame from a coroutine degrades after close()", function()
@@ -2432,7 +2423,7 @@ test.it("state:setMemoryLimit stops an allocation that is too large", function()
 
 	local ok, err = state:load([[return #string.rep("y", 2000000)]]):pcall()
 	test.falsy(ok)
-	test.includes(err, "not enough memory")
+	test.includes(err --[[@as string]],  "not enough memory" )
 
 	-- A small allocation still works while the cap is in force.
 	test.equal(4, state:eval([[return #("abcd")]]))
@@ -2442,7 +2433,7 @@ end)
 test.it("state:setMemoryLimit(0) removes the limit", function()
 	local state = lua.new()
 	state:setMemoryLimit(state:memory() + 10000)
-	test.falsy((state:load([[return #string.rep("z", 100000)]]):pcall()))
+	test.falsy(((state:load([[return #string.rep("z", 100000)]]):pcall())))
 
 	state:setMemoryLimit(0)
 	test.equal(100000, state:eval([[return #string.rep("z", 100000)]]))
@@ -2459,12 +2450,12 @@ end)
 test.it("state:memory() and state:setMemoryLimit() reject a closed state", function()
 	local state = lua.new()
 	state:close()
-	local ok, err = pcall(function() return state:memory() end)
+	local ok, err = pcall(|| -> state:memory())
 	test.falsy(ok)
-	test.includes(err, "state is closed")
+	test.includes(err --[[@as string]],  "state is closed" )
 	local ok2, err2 = pcall(function() state:setMemoryLimit(1000) end)
 	test.falsy(ok2)
-	test.includes(err2, "state is closed")
+	test.includes(err2 --[[@as string]],  "state is closed" )
 end)
 
 test.it("memory is counted per state", function()
@@ -2486,14 +2477,15 @@ end)
 local function make_chain_state(limit)
 	local state = lua.new()
 	if limit ~= nil then state:setChainLimit(limit) end
+	---@type lua.Callable
 	local handler
-	state:globals().dispatch = function(n) return handler(n) end
+	state:globals().dispatch = n -> handler(n)
 	handler = state:eval([[
 		return function(n)
 			if n <= 0 then return "end" end
 			return dispatch(n - 1)
 		end
-	]])
+	]]) --[[@as lua.Callable]]
 	return state, handler
 end
 
@@ -2501,7 +2493,7 @@ test.it("a deep chain gives an error instead of stopping the process", function(
 	local state, handler = make_chain_state()
 	local ok, err = pcall(handler, 5000)
 	test.falsy(ok)
-	test.includes(err, "cross-state call chain reached its limit")
+	test.includes(err --[[@as string]],  "cross-state call chain reached its limit" )
 	test.equal(0, state:chainDepth(), "the depth counter returns to zero")
 	test.equal("end", handler(20), "the state works again after the error")
 	state:close()
@@ -2514,7 +2506,7 @@ test.it("state:chainDepth() reports the depth during a chain", function()
 		inside = state:chainDepth()
 		return 0
 	end
-	local fn = state:eval("return function() return cb() end")
+	local fn = state:eval("return function() return cb() end") --[[@as lua.Callable]]
 
 	test.equal(0, state:chainDepth(), "zero outside a call")
 	fn()
@@ -2540,14 +2532,14 @@ end)
 
 test.it("the guest can catch the chain error itself", function()
 	local state, handler = make_chain_state(3)
-	state:globals().dispatch = function(n) return handler(n) end
+	state:globals().dispatch = n -> handler(n)
 	local ok, err = state:load([[
 		local ok, err = pcall(dispatch, 40)
 		return tostring(ok) .. "|" .. tostring(err)
 	]]):pcall()
 	test.truthy(ok)
-	test.includes(err, "false|")
-	test.includes(err, "reached its limit")
+	test.includes(err --[[@as string]],  "false|" )
+	test.includes(err --[[@as string]],  "reached its limit" )
 	test.equal(0, state:chainDepth())
 	state:close()
 end)
@@ -2557,8 +2549,8 @@ test.it("state:setChainLimit rejects a closed state", function()
 	state:close()
 	local ok, err = pcall(function() state:setChainLimit(10) end)
 	test.falsy(ok)
-	test.includes(err, "state is closed")
-	local ok2, err2 = pcall(function() return state:chainDepth() end)
+	test.includes(err --[[@as string]],  "state is closed" )
+	local ok2, err2 = pcall(|| -> state:chainDepth())
 	test.falsy(ok2)
-	test.includes(err2, "state is closed")
+	test.includes(err2 --[[@as string]],  "state is closed" )
 end)

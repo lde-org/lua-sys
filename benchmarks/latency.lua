@@ -44,15 +44,14 @@ end
 local function row(label, ns, baseline_ns)
 	local overhead = baseline_ns and (ns - baseline_ns) or nil
 	if overhead then
-		io.write(string.format("  %-42s  %8s  (+%s overhead)\n",
-			label, fmt(ns), fmt(overhead)))
+		io.write(string.format("  %-42s  %8s  (+%s overhead)\n", label, fmt(ns), fmt(overhead)))
 	else
 		io.write(string.format("  %-42s  %8s\n", label, fmt(ns)))
 	end
 end
 
 local WARMUP = 50000
-local ITERS  = 2000000
+local ITERS = 2000000
 
 -- ─── Baseline: plain LuaJIT function calls ────────────────────────────────
 
@@ -63,7 +62,7 @@ local function noop() end
 local function add(a, b) return a + b end
 
 local baseline_noop_ns = measure(function() noop() end, WARMUP, ITERS)
-local baseline_add_ns  = measure(function() add(1, 2) end, WARMUP, ITERS)
+local baseline_add_ns = measure(function() add(1, 2) end, WARMUP, ITERS)
 
 row("noop()", baseline_noop_ns)
 row("add(1, 2)", baseline_add_ns)
@@ -73,14 +72,14 @@ row("add(1, 2)", baseline_add_ns)
 print("\nHost → Guest (LuaJIT calls into guest lua_State):")
 
 do
-	local state        = lua.new()
+	local state = lua.new()
 
-	local g_noop       = state:eval("function() end")
-	local g_add        = state:eval("function(a,b) return a+b end")
-	local g_echo4      = state:eval("function(a,b,c,d) return a,b,c,d end")
+	local g_noop = state:eval("function() end") --[[@as lua.Callable]]
+	local g_add = state:eval("function(a,b) return a+b end") --[[@as lua.Callable]]
+	local g_echo4 = state:eval("function(a,b,c,d) return a,b,c,d end") --[[@as lua.Callable]]
 
-	local h2g_noop_ns  = measure(function() g_noop() end, WARMUP, ITERS)
-	local h2g_add_ns   = measure(function() g_add(1, 2) end, WARMUP, ITERS)
+	local h2g_noop_ns = measure(function() g_noop() end, WARMUP, ITERS)
+	local h2g_add_ns = measure(function() g_add(1, 2) end, WARMUP, ITERS)
 	local h2g_echo4_ns = measure(function() g_echo4(1, 2, 3, 4) end, WARMUP, ITERS)
 
 	row("noop()", h2g_noop_ns, baseline_noop_ns)
@@ -96,19 +95,19 @@ print("\nGuest → Host (guest lua_State calls back into LuaJIT):")
 
 do
 	local state = lua.new()
-	local g     = state:globals()
+	local g = state:globals()
 
 	g:set("host_noop", function() end)
-	g:set("host_add", function(a, b) return a + b end)
+	g:set("host_add", |a, b| -> a + b)
 	g:set("host_echo4", function(a, b, c, d) return a, b, c, d end)
 
 	-- Guest wrapper functions that call the host functions
-	local call_noop    = state:eval("function() host_noop() end")
-	local call_add     = state:eval("function() host_add(1, 2) end")
-	local call_echo4   = state:eval("function() host_echo4(1,2,3,4) end")
+	local call_noop = state:eval("function() host_noop() end") --[[@as lua.Callable]]
+	local call_add = state:eval("function() host_add(1, 2) end") --[[@as lua.Callable]]
+	local call_echo4 = state:eval("function() host_echo4(1,2,3,4) end") --[[@as lua.Callable]]
 
-	local g2h_noop_ns  = measure(function() call_noop() end, WARMUP, ITERS)
-	local g2h_add_ns   = measure(function() call_add() end, WARMUP, ITERS)
+	local g2h_noop_ns = measure(function() call_noop() end, WARMUP, ITERS)
+	local g2h_add_ns = measure(function() call_add() end, WARMUP, ITERS)
 	local g2h_echo4_ns = measure(function() call_echo4() end, WARMUP, ITERS)
 
 	row("noop()", g2h_noop_ns, baseline_noop_ns)
@@ -124,10 +123,10 @@ print("\nNested: Host → Guest → Host (round-trip):")
 
 do
 	local state = lua.new()
-	local g     = state:globals()
+	local g = state:globals()
 
-	g:set("host_inc", function(x) return x + 1 end)
-	local round_trip = state:eval("function(x) return host_inc(x) end")
+	g:set("host_inc", x -> x + 1)
+	local round_trip = state:eval("function(x) return host_inc(x) end") --[[@as lua.Callable]]
 
 	local rt_ns = measure(function() round_trip(41) end, WARMUP, ITERS)
 	row("host_fn(guest_fn(host_inc(x)))", rt_ns, baseline_noop_ns)

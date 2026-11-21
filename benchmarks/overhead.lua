@@ -3,7 +3,7 @@
 --
 -- Run with:  lde ./benchmarks/overhead.lua --profile
 
-local lua        = require("lua-sys")
+local lua = require("lua-sys")
 
 local ITERATIONS = 5000000
 
@@ -16,7 +16,7 @@ do
 	local state = lua.new()
 	local g = state:globals()
 	g:set("host_noop", function() end)
-	local wrapper = state:eval("function() host_noop() end")
+	local wrapper = state:eval("function() host_noop() end") --[[@as lua.Callable]]
 
 	print("[1] Guest → Host: no args, no returns")
 	for _ = 1, ITERATIONS do
@@ -46,12 +46,12 @@ for _, cfg in ipairs(configs) do
 
 	local host_fn
 	if n == 0 then
-		if y == 1 then host_fn = function() return 42 end end
+		if y == 1 then host_fn = || -> 42 end
 	elseif n == 1 then
 		if y == 0 then
 			host_fn = function(a) end
 		elseif y == 1 then
-			host_fn = function(a) return a end
+			host_fn = a -> a
 		end
 	elseif n == 2 then
 		if y == 0 then
@@ -72,7 +72,7 @@ for _, cfg in ipairs(configs) do
 	local args = {}
 	for i = 1, n do args[i] = "42" end
 	local arg_str = table.concat(args, ", ")
-	local wrapper = state:eval(string.format("function() host_fn(%s) end", arg_str))
+	local wrapper = state:eval(string.format("function() host_fn(%s) end", arg_str)) --[[@as lua.Callable]]
 
 	print(string.format("[2] Guest → Host: %d arg(s), %d return(s)", n, y))
 	for _ = 1, ITERATIONS do
@@ -87,7 +87,7 @@ end
 -- ═══════════════════════════════════════════════════════════════════
 do
 	local state = lua.new()
-	local fn = state:eval("function() end")
+	local fn = state:eval("function() end") --[[@as lua.Callable]]
 
 	print("[3] Host → Guest: no args, no returns")
 	for _ = 1, ITERATIONS do

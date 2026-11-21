@@ -1,19 +1,14 @@
-local raw           = require("lua-sys.raw")
-local test          = require("lde-test")
-local lua           = raw -- alias so existing test bodies don't need changing
+local raw = require("lua-sys.raw")
+local test = require("lde-test")
+local lua = raw -- alias so existing test bodies don't need changing
 
-local LUA_TNIL      = 0
-local LUA_TBOOLEAN  = 1
-local LUA_TNUMBER   = 3
-local LUA_TSTRING   = 4
-local LUA_TTABLE    = 5
-local LUA_TFUNCTION = 6
-local LUA_TTHREAD   = 8
-local LUA_MULTRET   = -1
+local LUA_TNIL = 0
+local LUA_TBOOLEAN = 1
+local LUA_TNUMBER = 3
+local LUA_TSTRING = 4
+local LUA_TTHREAD = 8
 local LUA_GCCOLLECT = 2
-local LUA_ERRRUN    = 2
-
-
+local LUA_ERRRUN = 2
 
 test.it("creates and closes a state", function()
 	local st = lua.lnewstate()
@@ -207,8 +202,10 @@ test.it("objlen", function()
 	lua.createtable(st, 3, 0)
 	test.equal(0, lua.objlen(st, 2))
 	-- rawseti to populate array part
-	lua.pushnumber(st, 10); lua.rawseti(st, 2, 1)
-	lua.pushnumber(st, 20); lua.rawseti(st, 2, 2)
+	lua.pushnumber(st, 10)
+	lua.rawseti(st, 2, 1)
+	lua.pushnumber(st, 20)
+	lua.rawseti(st, 2, 2)
 	test.equal(2, lua.objlen(st, 2))
 
 	lua.close(st)
@@ -241,7 +238,7 @@ test.it("newthread creates a coroutine-capable thread", function()
 	local st = lua.lnewstate()
 	lua.openBase(st)
 
-	local co = lua.newthread(st)
+	lua.newthread(st)
 	test.equal(LUA_TTHREAD, lua.type(st, -1))
 
 	lua.close(st)
@@ -366,6 +363,7 @@ test.it("debug hook with LUA_MASKCOUNT aborts infinite loop", function()
 
 	-- Keep the hook callback alive so it's not GC'd
 	local hook = ffi.cast("lua_Hook", function(L, ar)
+		---@cast L lua.raw.State
 		lua.pushstring(L, "timeout: infinite loop detected")
 		lua.error(L)
 	end)

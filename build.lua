@@ -16,12 +16,7 @@ local out = assert(os.getenv("LDE_OUTPUT_DIR"), "LDE_OUTPUT_DIR not set")
 local ext, args
 if jit.os == "Windows" then
 	ext = "dll"
-	args = {
-		"-shared", "-O2",
-		"-I", out,
-		"-o", out .. "/bridge." .. ext,
-		out .. "/bridge.c",
-	}
+	args = { "-shared", "-O2", "-I", out, "-o", out .. "/bridge." .. ext, out .. "/bridge.c" }
 elseif jit.os == "OSX" then
 	ext = "dylib"
 	-- macOS dyld dedupes dylibs by install name (LC_ID_DYLIB): if a copy of
@@ -43,20 +38,21 @@ elseif jit.os == "OSX" then
 		end
 	end
 	args = {
-		"-dynamiclib", "-undefined", "dynamic_lookup", "-O2",
-		"-install_name", "@rpath/bridge-" .. bit.tohex(hash, 8) .. ".dylib",
-		"-I", out,
-		"-o", out .. "/bridge." .. ext,
-		out .. "/bridge.c",
+		"-dynamiclib",
+		"-undefined",
+		"dynamic_lookup",
+		"-O2",
+		"-install_name",
+		"@rpath/bridge-" .. bit.tohex(hash, 8) .. ".dylib",
+		"-I",
+		out,
+		"-o",
+		out .. "/bridge." .. ext,
+		out .. "/bridge.c"
 	}
 else
-	ext  = "so"
-	args = {
-		"-shared", "-fPIC", "-O2",
-		"-I", out,
-		"-o", out .. "/bridge." .. ext,
-		out .. "/bridge.c",
-	}
+	ext = "so"
+	args = { "-shared", "-fPIC", "-O2", "-I", out, "-o", out .. "/bridge." .. ext, out .. "/bridge.c" }
 end
 
 build:cc(args)
