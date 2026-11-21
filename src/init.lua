@@ -13,6 +13,7 @@ local raw = require("lua-sys.raw")
 ---@field close_state fun(guest: lightuserdata)
 ---@field memory_used fun(guest: lightuserdata): integer
 ---@field set_memory_limit fun(guest: lightuserdata, bytes: integer)
+---@field heap_snapshot fun(guest: lightuserdata, maxDepth: integer, maxPaths: integer): lua.HeapSnapshot
 ---@field set_frame_meta fun(meta: table)
 
 local bridge = require("lua-sys.bridge") --[[@as lua.bridge]]
@@ -1073,6 +1074,24 @@ end
 function State:setMemoryLimit(bytes)
 	if self.L == nil then closedError() end
 	bridge.set_memory_limit(self._guest_light, bytes or 0)
+end
+
+---@class lua.HeapSnapshot
+---@field attributed number                     # bytes given to a path
+---@field objects    number                     # objects reached
+---@field retained   table<string, number>      # path → bytes reachable through it
+---@field counts     table<string, number>      # path → objects whose path is exactly this one
+---@field parents    table<string, string|false> # path → parent path, false for a root
+
+--- Walk every object that is reachable in the guest state and give each one
+--- to the first path that reaches it, such as `init.lua:local cache.entries[]`.
+--- The walk is C code, adds no garbage to the guest and runs no metamethods,
+--- so it is safe from a hook or a profiler callback.
+---@param opts { maxDepth: integer?, maxPaths: integer? }? # defaults: 10 path segments, 20000 paths
+---@return lua.HeapSnapshot
+function State:heapSnapshot(opts)
+	if self.L == nil then closedError() end
+	return bridge.heap_snapshot(self._guest_light, opts and opts.maxDepth or 10, opts and opts.maxPaths or 20000)
 end
 
 function State:close()

@@ -72,7 +72,7 @@ ffi.cdef[[
   int luaJIT_setmode(lua_State *L, int idx, int mode);
   void luaJIT_profile_start(lua_State *L, const char *mode, void (*cb)(void *data, lua_State *L, int samples, int vmstate), void *data);
   void luaJIT_profile_stop(lua_State *L);
-  const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt, int depth, int *len);
+  const char *luaJIT_profile_dumpstack(lua_State *L, const char *fmt, int depth, size_t *len);
   void luaL_addlstring(luaL_Buffer *B, const char *s, size_t l);
   void luaL_addstring(luaL_Buffer *B, const char *s);
   void luaL_addvalue(luaL_Buffer *B);
@@ -472,8 +472,8 @@ raw.jit_profile_stop = C.luaJIT_profile_stop
 
 -- dumpstack returns a const char* into an internal profiler buffer (valid
 -- only until the next dumpstack call or profile_stop). Copy to a Lua string
--- immediately. len is an int* out-param.
-local _dumpstack_len = ffi.new("int[1]")
+-- immediately. len is a size_t* out-param: a narrower buffer is overrun.
+local _dumpstack_len = ffi.new("size_t[1]")
 
 ---@param L      lua.raw.State
 ---@param fmt    string

@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ── Windows symbol resolution ────────────────────────────────────────────
@@ -75,7 +76,20 @@
     X(int,          lua_setmetatable,       (lua_State *L, int objindex)) \
     X(int,          lua_sethook,            (lua_State *L, lua_Hook func, int mask, int count)) \
     X(int,          lua_getstack,           (lua_State *L, int level, lua_Debug *ar)) \
-    X(int,          lua_getinfo,            (lua_State *L, const char *what, lua_Debug *ar))
+    X(int,          lua_getinfo,            (lua_State *L, const char *what, lua_Debug *ar)) \
+    X(int,          lua_next,               (lua_State *L, int idx)) \
+    X(int,          lua_getmetatable,       (lua_State *L, int objindex)) \
+    X(void,         lua_getfenv,            (lua_State *L, int idx)) \
+    X(const void *, lua_topointer,          (lua_State *L, int idx)) \
+    X(lua_State *,  lua_tothread,           (lua_State *L, int idx)) \
+    X(lua_State *,  lua_newthread,          (lua_State *L)) \
+    X(int,          lua_pushthread,         (lua_State *L)) \
+    X(void,         lua_xmove,              (lua_State *from, lua_State *to, int n)) \
+    X(int,          lua_checkstack,         (lua_State *L, int extra)) \
+    X(const char *, lua_getlocal,           (lua_State *L, const lua_Debug *ar, int n)) \
+    X(const char *, lua_getupvalue,         (lua_State *L, int funcindex, int n)) \
+    X(void *,       lua_upvalueid,          (lua_State *L, int funcindex, int n)) \
+    X(void,         lua_replace,            (lua_State *L, int idx))
 
 /* Each lua_* name becomes a static function pointer; every call site below
  * calls through it unchanged. */
@@ -945,6 +959,824 @@ static int bridge_close_state(lua_State *L) {
     return 0;
 }
 
+// ── Heap snapshot ─────────────────────────────────────────────────────────
+//
+// bridge.heap_snapshot(guest, max_depth, max_paths) walks every object that
+// is reachable in the guest and gives each one to the first retainer path
+// that reaches it, for example "init.lua:local cache.entries[]". It returns
+//   { attributed = bytes, objects = n,
+//     retained = { path = bytes reachable through it },
+//     counts   = { path = objects whose path is exactly this one },
+//     parents  = { path = parent path, or false for a root } }
+//
+// The walk adds no garbage to the guest. The visited set and the paths are C
+// memory, and the containers in progress sit on the stack of a walker thread
+// that the guest registry keeps between snapshots. It only reads the guest and
+// runs no metamethods, so it is safe from a hook or a profiler callback.
+//
+// Root order sets attribution: _G, then each package.loaded entry, then the
+// main thread's stack, then the registry. Sizes follow LuaJIT's GC64 object
+// layouts. String and cdata sizes are exact (cdata through the guest's
+// ffi.sizeof); table and function sizes are estimates from their contents.
+
+#define LUA_TCDATA 10
+
+#define HW_BIG_TABLE    64      /* more keys than this: string keys share "[*]" */
+#define HW_MAX_FRAMES   2000    /* up to 3 stack slots each; lua_checkstack caps a C frame at 8000 */
+#define HW_MAX_SEGMENT  200
+#define HW_MAX_KEY      40
+#define HW_OTHER_PATH   0       /* roots that do not fit in max_paths */
+
+/* Fixed slots on the walker thread's stack; frames start above them. */
+#define HW_SLOT_SIZEOF  1
+#define HW_SLOT_QUEUE   2
+#define HW_SLOT_LOADED  3
+
+/* Registry key under which the guest keeps its walker thread. */
+static const char heap_thread_key = 0;
+
+/* The visited set is a bitmap per 1 MB of address space: one bit per 8 bytes.
+ * GC objects, cdata payloads and upvalue cells are 8-byte aligned and never
+ * share an address. Objects allocated together sit together, so the walk
+ * touches far fewer cache lines than with a hash set of pointers. */
+#define HW_REGION_SHIFT 20
+#define HW_REGION_WORDS ((1u << HW_REGION_SHIFT) / 8 / 64)
+
+typedef struct {
+    uintptr_t region;    /* address >> HW_REGION_SHIFT, plus 1 (0 = empty) */
+    uint64_t *bits;
+} hw_region;
+
+typedef struct {
+    hw_region *regions;
+    size_t mask;
+    size_t count;
+    hw_region *last;     /* the region of the previous lookup */
+} hw_set;
+
+typedef struct {
+    int parent;          /* -1 for a root */
+    uint32_t hash;
+    char *segment;
+    size_t length;
+    double self;         /* bytes of the objects first reached here */
+    double retained;     /* self plus every descendant path */
+    double count;        /* objects whose path is exactly this one */
+} hw_path;
+
+typedef struct {
+    hw_path *items;
+    int count;
+    int cap;
+    int *index;          /* open addressing: path id + 1, 0 = empty */
+    size_t index_mask;
+} hw_paths;
+
+typedef struct {
+    int kind;            /* LUA_TTABLE, LUA_TFUNCTION, LUA_TTHREAD, LUA_TUSERDATA */
+    int base;            /* walker stack slot of the container */
+    int path;
+    int depth;
+    int stage;
+    /* table */
+    int is_big, has_weak_keys, has_weak_values, has_pending_value;
+    int array_path, other_path, value_path;
+    double array_count, hash_count;
+    /* function */
+    int upvalue, upvalues;
+    double bytes;
+    /* thread */
+    lua_State *thread;
+    int level, local, is_root;
+} hw_frame;
+
+typedef struct {
+    lua_State *walker;
+    hw_set seen;
+    hw_paths paths;
+    hw_frame *frames;
+    int frame_count, frame_cap;
+    int *queue_path, *queue_depth;
+    int queue_count, queue_next, queue_cap;
+    int max_depth, max_paths;
+    double attributed, objects;
+    int is_failed;
+} hw_walk;
+
+static hw_region *hw_region_slot(hw_region *regions, size_t mask, uintptr_t key) {
+    size_t i = (size_t)((key * 0x9E3779B97F4A7C15ULL) >> 32) & mask;
+    while (regions[i].region != 0 && regions[i].region != key) i = (i + 1) & mask;
+    return &regions[i];
+}
+
+/* 1 when p is new, 0 when the set has it, -1 when out of memory. */
+static int hw_set_add(hw_set *set, const void *p) {
+    uintptr_t address = (uintptr_t)p;
+    uintptr_t key = (address >> HW_REGION_SHIFT) + 1;
+    hw_region *region = set->last;
+    size_t bit;
+    uint64_t flag;
+    if (region == NULL || region->region != key) {
+        region = hw_region_slot(set->regions, set->mask, key);
+        if (region->region == 0) {
+            if ((set->count + 1) * 2 > set->mask + 1) {
+                size_t cap = (set->mask + 1) * 2, j;
+                hw_region *regions = (hw_region *)calloc(cap, sizeof(hw_region));
+                if (regions == NULL) return -1;
+                for (j = 0; j <= set->mask; j++) {
+                    if (set->regions[j].region != 0) {
+                        *hw_region_slot(regions, cap - 1, set->regions[j].region) = set->regions[j];
+                    }
+                }
+                free(set->regions);
+                set->regions = regions;
+                set->mask = cap - 1;
+                region = hw_region_slot(regions, set->mask, key);
+            }
+            region->bits = (uint64_t *)calloc(HW_REGION_WORDS, sizeof(uint64_t));
+            if (region->bits == NULL) return -1;
+            region->region = key;
+            set->count++;
+        }
+        set->last = region;
+    }
+    bit = (size_t)((address & ((1u << HW_REGION_SHIFT) - 1)) >> 3);
+    flag = (uint64_t)1 << (bit & 63);
+    if (region->bits[bit >> 6] & flag) return 0;
+    region->bits[bit >> 6] |= flag;
+    return 1;
+}
+
+static uint32_t hw_hash_segment(int parent, const char *s, size_t n) {
+    uint32_t h = 2166136261u ^ ((uint32_t)(parent + 1) * 16777619u);
+    size_t i;
+    for (i = 0; i < n; i++) {
+        h ^= (unsigned char)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* The id of (parent, segment), added while there is room. -1 when the table
+ * is full, -2 when out of memory. */
+static int hw_paths_get(hw_paths *paths, int parent, const char *segment, size_t length, int max_paths) {
+    uint32_t hash = hw_hash_segment(parent, segment, length);
+    size_t i = hash & paths->index_mask;
+    hw_path *path;
+    while (paths->index[i] != 0) {
+        path = &paths->items[paths->index[i] - 1];
+        if (path->hash == hash && path->parent == parent && path->length == length
+            && memcmp(path->segment, segment, length) == 0) {
+            return paths->index[i] - 1;
+        }
+        i = (i + 1) & paths->index_mask;
+    }
+    if (paths->count >= max_paths) return -1;
+    if (paths->count == paths->cap) {
+        int cap = paths->cap * 2;
+        hw_path *items = (hw_path *)realloc(paths->items, (size_t)cap * sizeof(hw_path));
+        if (items == NULL) return -2;
+        paths->items = items;
+        paths->cap = cap;
+    }
+    path = &paths->items[paths->count];
+    path->segment = (char *)malloc(length);
+    if (path->segment == NULL) return -2;
+    memcpy(path->segment, segment, length);
+    path->length = length;
+    path->parent = parent;
+    path->hash = hash;
+    path->self = 0;
+    path->retained = 0;
+    path->count = 0;
+    paths->index[i] = ++paths->count;
+
+    if ((size_t)paths->count * 2 > paths->index_mask + 1) {
+        size_t cap = (paths->index_mask + 1) * 2, j;
+        int *index = (int *)calloc(cap, sizeof(int));
+        if (index == NULL) return -2;
+        for (j = 0; j < (size_t)paths->count; j++) {
+            size_t k = paths->items[j].hash & (cap - 1);
+            while (index[k] != 0) k = (k + 1) & (cap - 1);
+            index[k] = (int)j + 1;
+        }
+        free(paths->index);
+        paths->index = index;
+        paths->index_mask = cap - 1;
+    }
+    return paths->count - 1;
+}
+
+/* The path of a child named `segment` at `depth`: its parent's past
+ * max_depth or when the path table is full. */
+static int hw_child(hw_walk *w, int parent, const char *segment, size_t length, int depth) {
+    int id;
+    if (depth > w->max_depth) return parent;
+    id = hw_paths_get(&w->paths, parent, segment, length, w->max_paths);
+    if (id == -2) w->is_failed = 1;
+    if (id < 0) return parent >= 0 ? parent : HW_OTHER_PATH;
+    return id;
+}
+
+static void hw_add(hw_walk *w, int path, double bytes) {
+    w->paths.items[path].self += bytes;
+    w->attributed += bytes;
+}
+
+static size_t hw_format(char *out, const char *fmt, const char *a, const char *b) {
+    int n = snprintf(out, HW_MAX_SEGMENT, fmt, a, b);
+    if (n < 0) return 0;
+    return n >= HW_MAX_SEGMENT ? HW_MAX_SEGMENT - 1 : (size_t)n;
+}
+
+static int hw_is_identifier(const char *s, size_t n) {
+    size_t i;
+    if (n == 0 || n > HW_MAX_KEY) return 0;
+    for (i = 0; i < n; i++) {
+        char c = s[i];
+        int is_alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+        if (!is_alpha && (i == 0 || c < '0' || c > '9')) return 0;
+    }
+    return 1;
+}
+
+/* The cdata on top of the walker stack: header plus ffi.sizeof. */
+static double hw_cdata_size(hw_walk *w) {
+    lua_State *K = w->walker;
+    double size = 16;
+    if (lua_type(K, HW_SLOT_SIZEOF) == LUA_TFUNCTION) {
+        lua_pushvalue(K, HW_SLOT_SIZEOF);
+        lua_pushvalue(K, -2);
+        /* sizeof raises for a variable-length ctype object and returns nil
+         * for an incomplete type: both count as header only. */
+        if (lua_pcall(K, 1, 1, 0) == LUA_OK && lua_type(K, -1) == LUA_TNUMBER) {
+            size += lua_tonumber(K, -1);
+        }
+        lua_pop(K, 1);
+    }
+    return size;
+}
+
+/* Open a frame for the container on top of the walker stack. */
+static void hw_open(hw_walk *w, int kind, int path, int depth) {
+    lua_State *K = w->walker;
+    hw_frame *f;
+    if (w->frame_count == w->frame_cap) {
+        int cap = w->frame_cap * 2;
+        hw_frame *frames = (hw_frame *)realloc(w->frames, (size_t)cap * sizeof(hw_frame));
+        if (frames == NULL) {
+            w->is_failed = 1;
+            lua_pop(K, 1);
+            return;
+        }
+        w->frames = frames;
+        w->frame_cap = cap;
+    }
+    if (!lua_checkstack(K, 8)) {
+        w->is_failed = 1;
+        lua_pop(K, 1);
+        return;
+    }
+    f = &w->frames[w->frame_count++];
+    memset(f, 0, sizeof(*f));
+    f->kind = kind;
+    f->base = lua_gettop(K);
+    f->path = path;
+    f->depth = depth;
+    if (kind == LUA_TTHREAD) {
+        lua_Debug ar;
+        int levels = 0;
+        f->thread = lua_tothread(K, -1);
+        while (lua_getstack(f->thread, levels, &ar)) levels++;
+        f->level = levels - 1;
+    }
+}
+
+/* A container past HW_MAX_FRAMES waits in a queue table on the walker. */
+static void hw_enqueue(hw_walk *w, int path, int depth) {
+    lua_State *K = w->walker;
+    if (lua_type(K, HW_SLOT_QUEUE) != LUA_TTABLE) {
+        lua_createtable(K, 0, 0);
+        if (hw_set_add(&w->seen, lua_topointer(K, -1)) < 0) w->is_failed = 1;
+        lua_replace(K, HW_SLOT_QUEUE);
+    }
+    if (w->queue_count + 1 >= w->queue_cap) {
+        int cap = w->queue_cap ? w->queue_cap * 2 : 256;
+        int *paths = (int *)realloc(w->queue_path, (size_t)cap * sizeof(int));
+        int *depths;
+        if (paths != NULL) w->queue_path = paths;
+        depths = (int *)realloc(w->queue_depth, (size_t)cap * sizeof(int));
+        if (depths != NULL) w->queue_depth = depths;
+        if (paths == NULL || depths == NULL) {
+            w->is_failed = 1;
+            lua_pop(K, 1);
+            return;
+        }
+        w->queue_cap = cap;
+    }
+    w->queue_count++;
+    w->queue_path[w->queue_count] = path;
+    w->queue_depth[w->queue_count] = depth;
+    lua_rawseti(K, HW_SLOT_QUEUE, w->queue_count);
+}
+
+/* Consume the value on top of the walker stack. A new container gets a frame
+ * and stays on the stack as that frame's base. */
+static void hw_discover(hw_walk *w, int parent, int path, int depth) {
+    lua_State *K = w->walker;
+    int type = lua_type(K, -1);
+    int added;
+    if (type != LUA_TSTRING && type != LUA_TTABLE && type != LUA_TFUNCTION
+        && type != LUA_TUSERDATA && type != LUA_TTHREAD && type != LUA_TCDATA) {
+        lua_pop(K, 1);
+        return;
+    }
+    added = hw_set_add(&w->seen, lua_topointer(K, -1));
+    if (added <= 0) {
+        if (added < 0) w->is_failed = 1;
+        lua_pop(K, 1);
+        return;
+    }
+    w->objects++;
+    if (path != parent) w->paths.items[path].count++;
+    if (type == LUA_TSTRING) {
+        size_t length;
+        lua_tolstring(K, -1, &length);
+        hw_add(w, path, 25.0 + (double)length);
+        lua_pop(K, 1);
+    } else if (type == LUA_TCDATA) {
+        hw_add(w, path, hw_cdata_size(w));
+        lua_pop(K, 1);
+    } else if (w->frame_count >= HW_MAX_FRAMES) {
+        hw_enqueue(w, path, depth);
+    } else {
+        hw_open(w, type, path, depth);
+    }
+}
+
+static void hw_finish(hw_walk *w, double bytes) {
+    hw_frame *f = &w->frames[w->frame_count - 1];
+    if (f->path >= 0) hw_add(w, f->path, bytes);
+    lua_settop(w->walker, f->base - 1);
+    w->frame_count--;
+}
+
+static void hw_step_table(hw_walk *w, hw_frame *f) {
+    lua_State *K = w->walker;
+    int path = f->path, depth = f->depth;
+    if (f->stage == 0) {
+        f->stage = 1;
+        if (lua_getmetatable(K, f->base)) {
+            lua_pushstring(K, "__mode");
+            lua_rawget(K, -2);
+            if (lua_type(K, -1) == LUA_TSTRING) {
+                const char *mode = lua_tostring(K, -1);
+                f->has_weak_keys = strchr(mode, 'k') != NULL;
+                f->has_weak_values = strchr(mode, 'v') != NULL;
+            }
+            lua_pop(K, 1);
+            hw_discover(w, path, hw_child(w, path, "<mt>", 4, depth + 1), depth + 1);
+        }
+        return;
+    }
+    if (f->stage == 1) {
+        /* A big table is a collection: its keys are data, not field names. */
+        int entries = 0;
+        lua_pushnil(K);
+        while (lua_next(K, f->base)) {
+            lua_pop(K, 1);
+            if (++entries > HW_BIG_TABLE) {
+                lua_pop(K, 1);
+                break;
+            }
+        }
+        f->is_big = entries > HW_BIG_TABLE;
+        f->array_path = hw_child(w, path, "[]", 2, depth + 1);
+        f->other_path = hw_child(w, path, "[*]", 3, depth + 1);
+        f->stage = 2;
+        lua_pushnil(K);
+        return;
+    }
+    if (f->has_pending_value) {
+        /* [table, key, value]: the key's frame is done, the value is next. */
+        f->has_pending_value = 0;
+        if (f->has_weak_values) {
+            lua_pop(K, 1);
+        } else {
+            int frames = w->frame_count;
+            hw_discover(w, path, f->value_path, depth + 1);
+            if (w->frame_count > frames) return;
+        }
+    }
+    /* Entries run in this loop until one opens a frame: then the walk goes
+     * deeper first and comes back here. */
+    for (;;) {
+        int value_path = f->other_path, frames, type;
+        if (!lua_next(K, f->base)) {
+            double slots = 0;
+            if (f->hash_count > 0) {
+                slots = 1;
+                while (slots < f->hash_count) slots *= 2;
+            }
+            hw_finish(w, 64 + (f->array_count > 0 ? 8 * (f->array_count + 1) : 0) + 24 * slots);
+            return;
+        }
+        switch (lua_type(K, -2)) {
+        case LUA_TNUMBER: {
+            lua_Number n = lua_tonumber(K, -2);
+            if (n >= 1 && n <= 9007199254740992.0 && n == (lua_Number)(int64_t)n) {
+                f->array_count++;
+                value_path = f->array_path;
+            } else {
+                f->hash_count++;
+            }
+            break;
+        }
+        case LUA_TSTRING: {
+            size_t length;
+            const char *key = lua_tolstring(K, -2, &length);
+            int added = hw_set_add(&w->seen, lua_topointer(K, -2));
+            f->hash_count++;
+            if (added < 0) w->is_failed = 1;
+            if (added > 0) {
+                w->objects++;
+                hw_add(w, path, 25.0 + (double)length);
+            }
+            if (!f->is_big && hw_is_identifier(key, length)) {
+                char segment[HW_MAX_KEY + 1];
+                segment[0] = '.';
+                memcpy(segment + 1, key, length);
+                value_path = hw_child(w, path, segment, length + 1, depth + 1);
+            }
+            break;
+        }
+        case LUA_TBOOLEAN:
+        case LUA_TLIGHTUSERDATA:
+            f->hash_count++;
+            break;
+        default:
+            f->hash_count++;
+            if (!f->has_weak_keys) {
+                frames = w->frame_count;
+                f->value_path = value_path;
+                f->has_pending_value = 1;
+                lua_pushvalue(K, -2);
+                hw_discover(w, path, hw_child(w, path, "<key>", 5, depth + 1), depth + 1);
+                if (w->frame_count > frames) return;
+                f->has_pending_value = 0;
+            }
+            break;
+        }
+        if (w->is_failed) return;
+        type = lua_type(K, -1);
+        if (f->has_weak_values || type <= LUA_TNUMBER) {
+            lua_pop(K, 1);
+            continue;
+        }
+        frames = w->frame_count;
+        hw_discover(w, path, value_path, depth + 1);
+        if (w->frame_count > frames) return;
+    }
+}
+
+static void hw_step_function(hw_walk *w, hw_frame *f) {
+    lua_State *K = w->walker;
+    int path = f->path, depth = f->depth;
+    if (f->stage == 0) {
+        lua_Debug ar;
+        lua_pushvalue(K, f->base);
+        lua_getinfo(K, ">u", &ar);
+        f->upvalues = ar.nups;
+        f->bytes = 40.0 + 8.0 * ar.nups;
+        f->stage = 1;
+    }
+    if (f->stage == 1) {
+        while (f->upvalue < f->upvalues) {
+            int i = ++f->upvalue;
+            /* Closures share upvalue cells: count each cell once. */
+            int added = hw_set_add(&w->seen, lua_upvalueid(K, f->base, i));
+            const char *name;
+            char segment[HW_MAX_SEGMENT];
+            if (added < 0) w->is_failed = 1;
+            if (added <= 0) continue;
+            f->bytes += 48;
+            name = lua_getupvalue(K, f->base, i);
+            if (name == NULL) continue;
+            hw_discover(w, path, hw_child(w, path, segment,
+                hw_format(segment, "<upvalue %s%s>", name[0] ? name : "?", ""), depth + 1), depth + 1);
+            return;
+        }
+        f->stage = 2;
+    }
+    if (f->stage == 2) {
+        f->stage = 3;
+        lua_getfenv(K, f->base);
+        hw_discover(w, path, hw_child(w, path, "<env>", 5, depth + 1), depth + 1);
+        return;
+    }
+    hw_finish(w, f->bytes);
+}
+
+static void hw_step_userdata(hw_walk *w, hw_frame *f) {
+    lua_State *K = w->walker;
+    int path = f->path, depth = f->depth;
+    if (f->stage == 0) {
+        f->stage = 1;
+        if (lua_getmetatable(K, f->base)) {
+            hw_discover(w, path, hw_child(w, path, "<mt>", 4, depth + 1), depth + 1);
+        }
+        return;
+    }
+    if (f->stage == 1) {
+        f->stage = 2;
+        lua_getfenv(K, f->base);
+        hw_discover(w, path, hw_child(w, path, "<env>", 5, depth + 1), depth + 1);
+        return;
+    }
+    hw_finish(w, 40);
+}
+
+/* Locals and functions of a thread's Lua frames, outermost frame first. The
+ * main thread is a root: its locals are root paths ("init.lua:local x");
+ * another thread's are children ("<init.lua:12:local x>"). */
+static void hw_step_thread(hw_walk *w, hw_frame *f) {
+    lua_State *K = w->walker, *T = f->thread;
+    int parent = f->is_root ? -1 : f->path;
+    int depth = f->is_root ? 1 : f->depth + 1;
+    while (f->level >= 0) {
+        lua_Debug ar;
+        char frame[HW_MAX_SEGMENT], segment[HW_MAX_SEGMENT];
+        const char *source, *p;
+        size_t length;
+        if (!lua_getstack(T, f->level, &ar)) {
+            f->level--;
+            f->local = 0;
+            continue;
+        }
+        lua_getinfo(T, "S", &ar);
+        if (ar.what != NULL && ar.what[0] == 'C') {
+            f->level--;
+            f->local = 0;
+            continue;
+        }
+        source = ar.short_src;
+        for (p = ar.short_src; *p; p++) {
+            if (*p == '/' || *p == '\\') source = p + 1;
+        }
+        if (ar.what != NULL && strcmp(ar.what, "main") == 0) {
+            snprintf(frame, sizeof(frame), "%s", source);
+        } else {
+            snprintf(frame, sizeof(frame), "%s:%d", source, ar.linedefined);
+        }
+        if (f->local >= 0) {
+            const char *name = lua_getlocal(T, &ar, f->local + 1);
+            if (name != NULL) {
+                f->local++;
+                lua_xmove(T, K, 1);
+                length = hw_format(segment, f->is_root ? "%s:local %s" : "<%s:local %s>",
+                    frame, name[0] == '(' ? "(temp)" : name);
+                hw_discover(w, parent, hw_child(w, parent, segment, length, depth), depth);
+                return;
+            }
+            f->local = -1;
+        }
+        lua_getinfo(T, "f", &ar);
+        lua_xmove(T, K, 1);
+        f->level--;
+        f->local = 0;
+        length = hw_format(segment, f->is_root ? "%s:function%s" : "<%s:function%s>", frame, "");
+        hw_discover(w, parent, hw_child(w, parent, segment, length, depth), depth);
+        return;
+    }
+    hw_finish(w, f->is_root ? 0 : 200);
+}
+
+/* Run frames until none is left, then the queued containers. */
+static void hw_drain(hw_walk *w) {
+    lua_State *K = w->walker;
+    for (;;) {
+        while (w->frame_count > 0 && !w->is_failed) {
+            hw_frame *f = &w->frames[w->frame_count - 1];
+            switch (f->kind) {
+            case LUA_TTABLE:    hw_step_table(w, f); break;
+            case LUA_TFUNCTION: hw_step_function(w, f); break;
+            case LUA_TTHREAD:   hw_step_thread(w, f); break;
+            default:            hw_step_userdata(w, f); break;
+            }
+        }
+        if (w->is_failed || w->queue_next >= w->queue_count) return;
+        w->queue_next++;
+        lua_rawgeti(K, HW_SLOT_QUEUE, w->queue_next);
+        lua_pushnil(K);
+        lua_rawseti(K, HW_SLOT_QUEUE, w->queue_next);
+        hw_open(w, lua_type(K, -1), w->queue_path[w->queue_next], w->queue_depth[w->queue_next]);
+    }
+}
+
+/* Walk the value on top of the walker stack as a root named `label`. */
+static void hw_root(hw_walk *w, const char *label, size_t length) {
+    hw_discover(w, -1, hw_child(w, -1, label, length, 1), 1);
+    hw_drain(w);
+}
+
+static void hw_walk_roots(hw_walk *w, lua_State *guest) {
+    lua_State *K = w->walker;
+    char label[HW_MAX_SEGMENT];
+
+    lua_settop(K, 0);
+    lua_pushnil(K);                                  /* HW_SLOT_SIZEOF */
+    lua_pushnil(K);                                  /* HW_SLOT_QUEUE */
+    lua_pushstring(K, "_LOADED");
+    lua_rawget(K, LUA_REGISTRYINDEX);                /* HW_SLOT_LOADED */
+    if (lua_type(K, HW_SLOT_LOADED) == LUA_TTABLE) {
+        lua_pushstring(K, "ffi");
+        lua_rawget(K, HW_SLOT_LOADED);
+        if (lua_type(K, -1) == LUA_TTABLE) {
+            lua_pushstring(K, "sizeof");
+            lua_rawget(K, -2);
+            lua_replace(K, HW_SLOT_SIZEOF);
+        }
+        lua_pop(K, 1);
+        /* Its entries are roots of their own, not "_G.package.loaded[*]". */
+        if (hw_set_add(&w->seen, lua_topointer(K, HW_SLOT_LOADED)) < 0) w->is_failed = 1;
+    }
+    if (hw_set_add(&w->seen, (const void *)K) < 0) w->is_failed = 1;
+    if (hw_set_add(&w->seen, (const void *)guest) < 0) w->is_failed = 1;
+
+    lua_pushvalue(K, LUA_GLOBALSINDEX);
+    hw_root(w, "_G", 2);
+
+    if (lua_type(K, HW_SLOT_LOADED) == LUA_TTABLE) {
+        lua_pushnil(K);
+        while (!w->is_failed && lua_next(K, HW_SLOT_LOADED)) {
+            size_t length = 1, i;
+            const char *name = "?";
+            if (lua_type(K, -2) == LUA_TSTRING) name = lua_tolstring(K, -2, &length);
+            if (length > 150) length = 150;
+            length = (size_t)snprintf(label, sizeof(label), "require(\"%.*s\")", (int)length, name);
+            for (i = 0; i < length; i++) {
+                if ((unsigned char)label[i] < 32) label[i] = '?';
+            }
+            hw_root(w, label, length);
+        }
+    }
+
+    lua_pushthread(guest);
+    lua_xmove(guest, K, 1);
+    hw_open(w, LUA_TTHREAD, -1, 0);
+    if (w->frame_count > 0) w->frames[w->frame_count - 1].is_root = 1;
+    hw_drain(w);
+
+    lua_pushvalue(K, LUA_REGISTRYINDEX);
+    hw_root(w, "registry", 8);
+    lua_settop(K, 0);
+}
+
+/* Push the result table onto L. Ids grow from parent to child, so one pass
+ * from the last id adds every path's bytes to its parent. */
+static int hw_push_result(lua_State *L, hw_walk *w) {
+    hw_paths *paths = &w->paths;
+    size_t *offsets, *lengths, used = 0, cap = 4096;
+    char *names;
+    int i;
+
+    for (i = paths->count - 1; i >= 0; i--) {
+        hw_path *p = &paths->items[i];
+        p->retained += p->self;
+        if (p->parent >= 0) paths->items[p->parent].retained += p->retained;
+    }
+
+    offsets = (size_t *)malloc((size_t)paths->count * sizeof(size_t));
+    lengths = (size_t *)malloc((size_t)paths->count * sizeof(size_t));
+    names = (char *)malloc(cap);
+    if (offsets == NULL || lengths == NULL || names == NULL) {
+        free(offsets);
+        free(lengths);
+        free(names);
+        return 0;
+    }
+    for (i = 0; i < paths->count; i++) {
+        hw_path *p = &paths->items[i];
+        size_t prefix = p->parent >= 0 ? lengths[p->parent] : 0;
+        if (used + prefix + p->length > cap) {
+            char *grown;
+            while (used + prefix + p->length > cap) cap *= 2;
+            grown = (char *)realloc(names, cap);
+            if (grown == NULL) {
+                free(offsets);
+                free(lengths);
+                free(names);
+                return 0;
+            }
+            names = grown;
+        }
+        if (prefix > 0) memcpy(names + used, names + offsets[p->parent], prefix);
+        memcpy(names + used + prefix, p->segment, p->length);
+        offsets[i] = used;
+        lengths[i] = prefix + p->length;
+        used += lengths[i];
+    }
+
+    lua_createtable(L, 0, 5);
+    lua_pushnumber(L, w->attributed);
+    lua_setfield(L, -2, "attributed");
+    lua_pushnumber(L, w->objects);
+    lua_setfield(L, -2, "objects");
+    lua_createtable(L, 0, paths->count);             /* retained */
+    lua_createtable(L, 0, paths->count);             /* counts */
+    lua_createtable(L, 0, paths->count);             /* parents */
+    for (i = 0; i < paths->count; i++) {
+        hw_path *p = &paths->items[i];
+        lua_pushlstring(L, names + offsets[i], lengths[i]);
+        lua_pushnumber(L, p->retained);
+        lua_rawset(L, -5);
+        if (p->count > 0) {
+            lua_pushlstring(L, names + offsets[i], lengths[i]);
+            lua_pushnumber(L, p->count);
+            lua_rawset(L, -4);
+        }
+        lua_pushlstring(L, names + offsets[i], lengths[i]);
+        if (p->parent >= 0) {
+            lua_pushlstring(L, names + offsets[p->parent], lengths[p->parent]);
+        } else {
+            lua_pushboolean(L, 0);
+        }
+        lua_rawset(L, -3);
+    }
+    lua_setfield(L, -4, "parents");
+    lua_setfield(L, -3, "counts");
+    lua_setfield(L, -2, "retained");
+
+    free(offsets);
+    free(lengths);
+    free(names);
+    return 1;
+}
+
+static void hw_free(hw_walk *w) {
+    size_t j;
+    int i;
+    for (i = 0; i < w->paths.count; i++) free(w->paths.items[i].segment);
+    free(w->paths.items);
+    free(w->paths.index);
+    if (w->seen.regions != NULL) {
+        for (j = 0; j <= w->seen.mask; j++) free(w->seen.regions[j].bits);
+    }
+    free(w->seen.regions);
+    free(w->frames);
+    free(w->queue_path);
+    free(w->queue_depth);
+}
+
+static int bridge_heap_snapshot(lua_State *L) {
+    lua_State *guest = decode_guest_ptr(L, 1);
+    lua_State *walker;
+    hw_walk w;
+    int is_pushed;
+
+    memset(&w, 0, sizeof(w));
+    w.max_depth = lua_type(L, 2) == LUA_TNUMBER ? (int)lua_tonumber(L, 2) : 10;
+    w.max_paths = lua_type(L, 3) == LUA_TNUMBER ? (int)lua_tonumber(L, 3) : 20000;
+    if (w.max_depth < 1) w.max_depth = 1;
+    if (w.max_paths < 1) w.max_paths = 1;
+
+    lua_pushlightuserdata(guest, (void *)&heap_thread_key);
+    lua_rawget(guest, LUA_REGISTRYINDEX);
+    walker = lua_tothread(guest, -1);
+    lua_pop(guest, 1);
+    if (walker == NULL) {
+        walker = lua_newthread(guest);
+        lua_pushlightuserdata(guest, (void *)&heap_thread_key);
+        lua_pushvalue(guest, -2);
+        lua_rawset(guest, LUA_REGISTRYINDEX);
+        lua_pop(guest, 1);
+    }
+    w.walker = walker;
+
+    w.seen.mask = 63;
+    w.seen.regions = (hw_region *)calloc(w.seen.mask + 1, sizeof(hw_region));
+    w.paths.cap = 256;
+    w.paths.items = (hw_path *)malloc((size_t)w.paths.cap * sizeof(hw_path));
+    w.paths.index_mask = 511;
+    w.paths.index = (int *)calloc(w.paths.index_mask + 1, sizeof(int));
+    w.frame_cap = 64;
+    w.frames = (hw_frame *)malloc((size_t)w.frame_cap * sizeof(hw_frame));
+    if (w.seen.regions == NULL || w.paths.items == NULL || w.paths.index == NULL || w.frames == NULL
+        || hw_paths_get(&w.paths, -1, "<other>", 7, w.max_paths + 1) != HW_OTHER_PATH) {
+        hw_free(&w);
+        return luaL_error(L, "heap_snapshot: out of memory");
+    }
+
+    if (!lua_checkstack(walker, 16)) w.is_failed = 1;
+    if (!w.is_failed) hw_walk_roots(&w, guest);
+    lua_settop(walker, 0);
+
+    is_pushed = !w.is_failed && hw_push_result(L, &w);
+    hw_free(&w);
+    if (!is_pushed) return luaL_error(L, "heap_snapshot: out of memory");
+    return 1;
+}
+
 static const luaL_Reg bridge_funcs[] = {
     { "make_callable",   bridge_make_callable  },
     { "compound_tag",    bridge_compound_tag   },
@@ -958,6 +1790,7 @@ static const luaL_Reg bridge_funcs[] = {
     { "close_state",     bridge_close_state    },
     { "memory_used",     bridge_memory_used    },
     { "set_memory_limit", bridge_set_memory_limit },
+    { "heap_snapshot",   bridge_heap_snapshot  },
     { NULL, NULL }
 };
 

@@ -24,7 +24,7 @@ primitives, or by reference for tables, functions, userdata and threads.
 | Object | Members |
 |---|---|
 | `lua` | [`new()`](#luanew--luastate) |
-| `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`memory`](#statememory--integer), [`setMemoryLimit`](#statesetmemorylimitbytes), [`setChainLimit`](#statesetchainlimitlevels), [`chainDepth`](#statechaindepth--integer), [`close`](#stateclose), `L` |
+| `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`memory`](#statememory--integer), [`setMemoryLimit`](#statesetmemorylimitbytes), [`heapSnapshot`](#stateheapsnapshotopts--luaheapsnapshot), [`setChainLimit`](#statesetchainlimitlevels), [`chainDepth`](#statechaindepth--integer), [`close`](#stateclose), `L` |
 | `lua.Chunk` | [`eval`](#chunkeval--value), [`call`](#chunkcall), [`pcall`](#chunkpcall--true---false-err), [`xpcall`](#chunkxpcall--true---false-err), [`setName`](#chunksetnamename--luachunk), [`setMode`](#chunksetmodemode--luachunk), [`getMode`](#chunkgetmode--text--bytecode--both), [`isBytecode`](#chunkisbytecode--boolean) |
 | guest callable | `fn(...)`, [`fn:pcall(...)`](#fnpcall--true---false-err) |
 | `lua.Table` | [`get`](#tablegetkey--value), [`set`](#tablesetkey-value), field syntax, [`pairs`](#tablepairs--iterator), [`ipairs`](#tableipairs--iterator), [`type`](#valuetype--string), [`value`](#valuevalue--any), [`free`](#valuefree) |
@@ -219,6 +219,58 @@ state:setMemoryLimit(0)          -- no limit again
 The guest can catch the error and continue with less memory, so treat the limit
 as a control on the size of the state, and combine it with a hook for the
 execution time.
+
+### `state:heapSnapshot([opts]) → lua.HeapSnapshot`
+
+Walks every object that is reachable in the guest state and gives each one to
+the first path that reaches it. Use it to find what holds memory. Compare two
+snapshots to find what grows.
+
+```lua
+local state = lua.new()
+state:eval([[cache = { entries = {} }
+	for i = 1, 1000 do cache.entries[i] = string.rep("x", 100) .. i end]])
+
+local snap = state:heapSnapshot()
+print(snap.retained["_G.cache.entries"])   -- about 140000
+print(snap.counts["_G.cache.entries[]"])   -- 1000
+print(snap.parents["_G.cache.entries"])    -- "_G.cache"
+```
+
+The result has these fields:
+
+| Field | Value |
+|---|---|
+| `attributed` | The bytes given to a path. |
+| `objects` | The number of objects reached. |
+| `retained` | Path → the bytes reachable through that path. |
+| `counts` | Path → the number of objects whose path is exactly that path. |
+| `parents` | Path → the parent path, or `false` for a root. |
+
+The roots, in order: `_G`, each `package.loaded` entry as `require("name")`,
+the locals and functions of the main thread's stack (`init.lua:local x`, or
+`init.lua:12:local x` in a function defined on line 12), then `registry`. An
+object belongs to the first root that reaches it. Path segments:
+
+| Segment | Meaning |
+|---|---|
+| `.field` | A table field with an identifier key. |
+| `[]` | All the array elements of a table. |
+| `[*]` | All other keys. A table with more than 64 keys uses `[*]` for string keys too. |
+| `<upvalue x>` | An upvalue of a function. |
+| `<mt>`, `<env>`, `<key>` | A metatable, an environment, a table key that is an object. |
+| `<file.lua:12:local x>` | A local in a stack frame of a coroutine. |
+
+`opts.maxDepth` (default 10) limits the segments in a path, and `opts.maxPaths`
+(default 20000) limits the number of paths. Objects past either limit count
+for the deepest path that is available. Weak references are not followed.
+
+String and cdata sizes are exact. The cdata size comes from the guest's
+`ffi.sizeof`. Table and function sizes are estimates from their contents.
+
+The walk is C code. The visited set and the paths are C memory, so the walk
+adds no garbage to the guest. It runs no metamethods, so you can call it from
+a hook or from a profiler callback, where the guest's locals are still live.
 
 ## Evaluating code
 
@@ -1010,7 +1062,7 @@ More examples of the `raw.lX` form: `luaL_error` → `raw.lerror`,
 
 An internal compiled module (`bridge.so`, `.dylib` or `.dll`). Its functions
 support the high-level API: `new_state`, `close_state`, `memory_used`,
-`set_memory_limit`, `make_callable`, `push_callback`, `register`, `unregister`,
+`set_memory_limit`, `heap_snapshot`, `make_callable`, `push_callback`, `register`, `unregister`,
 `set_hook`, `remove_hook`, `compound_tag` and `set_frame_meta`.
 
 These functions are not a public interface. Their signatures and their

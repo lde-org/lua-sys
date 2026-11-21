@@ -139,11 +139,25 @@ void lua_setfield   (lua_State *L, int idx, const char *k);
 int  lua_objlen     (lua_State *L, int idx);
 void lua_rawget     (lua_State *L, int idx);
 void lua_rawset     (lua_State *L, int idx);
+int  lua_next       (lua_State *L, int idx);
+int  lua_getmetatable(lua_State *L, int objindex);
+void lua_getfenv    (lua_State *L, int idx);
+
+/* ── Objects and threads ── */
+const void *lua_topointer(lua_State *L, int idx);
+lua_State  *lua_tothread (lua_State *L, int idx);
+lua_State  *lua_newthread(lua_State *L);
+int         lua_pushthread(lua_State *L);
+void        lua_xmove    (lua_State *from, lua_State *to, int n);
+int         lua_checkstack(lua_State *L, int extra);
 
 /* ── Debug hooks ── */
 int lua_sethook(lua_State *L, lua_Hook func, int mask, int count);
 int lua_getstack(lua_State *L, int level, lua_Debug *ar);
 int lua_getinfo (lua_State *L, const char *what, lua_Debug *ar);
+const char *lua_getlocal  (lua_State *L, const lua_Debug *ar, int n);
+const char *lua_getupvalue(lua_State *L, int funcindex, int n);
+void       *lua_upvalueid (lua_State *L, int funcindex, int n);
 
 /* ── Call / error ── */
 int  lua_pcall (lua_State *L, int nargs, int nresults, int errfunc);
