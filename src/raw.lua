@@ -191,7 +191,58 @@ ffi.cdef[[
 
 ---@class lua.raw.State: ffi.cdata*
 
-local C = ffi.C
+-- Parameters are void* so these declarations stay compatible with any other
+-- module's (Dl_info*, HMODULE*): pcall ignores a redefinition.
+if ffi.os == "Windows" then
+	pcall(ffi.cdef, [[
+		int GetModuleHandleExA(unsigned long flags, const char *name, void *module);
+		unsigned long GetModuleFileNameA(void *module, char *name, unsigned long size);
+	]])
+else
+	pcall(ffi.cdef, [[
+		typedef struct { const char *dli_fname; void *dli_fbase; const char *dli_sname; void *dli_saddr; } lua_sys_DlInfo;
+		int dladdr(const void *addr, void *info);
+	]])
+end
+
+local VoidPtr = ffi.typeof("void*")
+
+--- The loaded image containing `address`, and its path.
+---@param address ffi.cdata*
+---@return ffi.cdata*? image
+---@return string? path
+local function imageOf(address)
+	if ffi.os == "Windows" then
+		local module = ffi.new("void*[1]")
+		-- FROM_ADDRESS | UNCHANGED_REFCOUNT
+		if ffi.C.GetModuleHandleExA(0x4 + 0x2, ffi.cast("const char*", address), ffi.cast(VoidPtr, module)) == 0 then
+			return nil
+		end
+		local buf = ffi.new("char[?]", 4096)
+		local len = ffi.C.GetModuleFileNameA(module[0], buf, 4096)
+		return module[0], ffi.string(buf, len)
+	end
+	local info = ffi.new("lua_sys_DlInfo")
+	if ffi.C.dladdr(address, ffi.cast(VoidPtr, info)) == 0 then return nil end
+	return info.dli_fbase, ffi.string(info.dli_fname)
+end
+
+--- The FFI namespace of the LuaJIT running this code. ffi.C binds the first
+--- lua_* the process loaded, and inside a library built with
+--- `lde compile --shared` that can be the host's Lua (ie Lua 5.4).
+local function luajitNamespace()
+	local hasUtil, util = pcall(require, "jit.util")
+	if not hasUtil then return ffi.C end
+	-- An internal function of the running LuaJIT, so inside the image that exports its C API.
+	local image, imagePath = imageOf(ffi.cast(VoidPtr, util.ircalladdr(0)))
+	if not image then return ffi.C end
+	local hasDefault, gettop = pcall(|| -> ffi.C.lua_gettop)
+	if hasDefault and imageOf(ffi.cast(VoidPtr, gettop)) == image then return ffi.C end
+	-- Loading an already loaded image only returns a handle to it.
+	return ffi.load(imagePath)
+end
+
+local C = luajitNamespace()
 
 local raw = {}
 

@@ -1,23 +1,31 @@
 -- build.lua — Compiles the C bridge module for lua-sys.
 --
--- Linux/macOS: bridge.so/.dylib leaves lua* symbols unresolved at link time;
---   they are satisfied at load time from the host process image.
+-- bridge.c has no undefined lua* symbols on any platform: it resolves them
+-- at load time from the LuaJIT that loads it (see bridge_resolve_symbols), so
+-- it links with no LuaJIT at all and binds to the right one even inside a
+-- library built with `lde compile --shared` whose host has its own Lua.
 --
--- Windows: PE DLLs cannot defer symbol resolution to the process image, so
---   bridge.c resolves all lua* symbols itself at load time via
---   GetProcAddress(GetModuleHandle(NULL), ...) (lde exports them from the
---   exe with -Wl,--export-all-symbols). bridge.dll therefore links with no
---   LuaJIT at all — same single-runtime model as the POSIX builds.
+-- The output follows build.target, not the host, so cross-compiling (e.g.
+-- `lde compile --target windows-x86-64`) produces a bridge.dll.
 
 local build = require("lde-build")
 
 local out = assert(os.getenv("LDE_OUTPUT_DIR"), "LDE_OUTPUT_DIR not set")
 
+local target = build.target or "unknown"
+local isWindows, isMacos
+if target == "unknown" then
+	isWindows, isMacos = jit.os == "Windows", jit.os == "OSX"
+else
+	isWindows = target:find("windows", 1, true) or target:find("mingw", 1, true)
+	isMacos = target:find("apple", 1, true) or target:find("darwin", 1, true)
+end
+
 local ext, args
-if jit.os == "Windows" then
+if isWindows then
 	ext = "dll"
 	args = { "-shared", "-O2", "-I", out, "-o", out .. "/bridge." .. ext, out .. "/bridge.c" }
-elseif jit.os == "OSX" then
+elseif isMacos then
 	ext = "dylib"
 	-- macOS dyld dedupes dylibs by install name (LC_ID_DYLIB): if a copy of
 	-- this dylib is already loaded (e.g. the one embedded in the lde binary,
@@ -53,6 +61,10 @@ elseif jit.os == "OSX" then
 else
 	ext = "so"
 	args = { "-shared", "-fPIC", "-O2", "-I", out, "-o", out .. "/bridge." .. ext, out .. "/bridge.c" }
+	-- dlopen/dladdr1 live in libdl before glibc 2.34; FreeBSD has them in libc.
+	if target:find("linux", 1, true) or (target == "unknown" and jit.os == "Linux") then
+		args[#args + 1] = "-ldl"
+	end
 end
 
 build:cc(args)
