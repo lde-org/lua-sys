@@ -1,14 +1,68 @@
 # Bridge Design
 
-lua-sys gives the Lua C API of LuaJIT to a guest `lua_State` that the host
-makes. This page explains two points:
+lua-sys gives the Lua C API of an embedded or host Lua runtime to a guest
+`lua_State` that the host makes. This page explains two points:
 
 - Why a compiled C bridge is necessary.
 - How the re-entry limits control each design decision.
 
+## Runtime Slots
+
+The host side of the bridge is always the LuaJIT that loaded it: its API is
+resolved from the caller's image and every host operation uses those static
+function pointers unchanged.
+
+A guest runtime is a **slot**: `bridge.runtime(handle, abi)` resolves the
+functions the bridge needs from a `dlopen`/`LoadLibrary` handle for one of the
+ABIs `jit`, `5.1`, `5.4` and `luau`. The same `(handle, abi)` pair returns the
+same slot, and a loaded copy of the bridge keeps at most eight slots. Slot 0 is
+`(nil, "jit")` — the LuaJIT that loaded the bridge — and its API table is a copy
+of the host pointers.
+
+Slot-specific values that are not a function call live in the slot table too:
+the registry pseudo-index (`-10000` for 5.1/jit/Luau, `-1001000` for 5.4), the
+upvalue-index base, the native type ids, the Lua 5.1/5.4/Luau `lua_Debug`
+layouts, and the hook mechanism.
+
+Guest operations always call through the slot's API table. Host operations keep
+calling the static pointers directly, so slot 0 (guest and host are the same
+LuaJIT) pays no indirection for the host side. Values that cross between the two
+runtimes are copied (nil, boolean, string, lightuserdata), converted (numbers;
+integral values in `int64` range become Lua 5.4 integers) or handled as registry
+references through the existing compound paths.
+
+### Per-slot trampolines
+
+A `lua_CFunction` or `lua_Hook` has no upvalues, and reading the guest API table
+from the guest itself would require the API that is being looked up. The bridge
+therefore generates one trampoline per slot:
+
+- `bound_call_0..7` — the host-callable closure from `bridge.make_callable`.
+  The slot is a compile-time address, so the guest API loads are direct and the
+  LuaJIT-on-LuaJIT path keeps its pre-slot speed.
+- `dispatch_callback_0..7` — the guest → host callback from
+  `bridge.push_callback`.
+- `hook_dispatch_0..7` — the line/count/call hook. LuaJIT and Lua 5.1/5.4 use
+  `lua_sethook`; Luau uses the `lua_Callbacks` `debugstep` callback plus
+  `lua_singlestep` for line events and the `interrupt` callback for count
+  events. Luau has no call/return hook, so `bridge.set_hook` returns `nil, err`
+  for those masks.
+- `luau_interrupt_0..7` — Luau's `interrupt` callback (it takes an extra `gc`
+  argument, unlike `lua_Hook`).
+
+Pointers that the bridge stores inside a guest state (JIT depth counter, chain
+box, closed flag) travel as lightuserdata: Luau's `lua_Integer` is 32-bit, so a
+number would truncate them. Lua 5.4's `lua_pcall`/`lua_tonumber`/`lua_tointeger`
+are the `*k`/`*x` symbols and are called with their real extra arguments.
+
+The heap snapshot walks the guest with the slot API as well: its walker thread,
+`lua_getstack`/`lua_getinfo` (level-based on Luau), registry tables and type ids
+all come from the slot. The LuaJIT `ffi.sizeof` cdata sizing is used only for
+the `jit` ABI.
+
 ## The Problem: Two Independent States
 
-The call `lua.new()` makes a guest state with `luaL_newstate()`. This state is
+The call `Lua:new()` makes a guest state with `luaL_newstate()`. This state is
 fully independent of the host LuaJIT interpreter. It has its own heap, its own
 `global_State` and its own call stack.
 
@@ -25,8 +79,8 @@ it.
 
 ## Why Not Use LuaJIT FFI for Calls?
 
-The LuaJIT FFI lets Lua code call C functions and use C pointers. The
-`lua-sys.raw` module gives the complete Lua C API in this way. The functions
+The LuaJIT FFI lets Lua code call C functions and use C pointers. A runtime's
+`rt.raw` table gives the complete Lua C API in this way. The functions
 `raw.pcall`, `raw.rawgeti` and `raw.gettop` are examples of FFI-bound
 functions.
 
@@ -113,7 +167,7 @@ type. The result is the same fault as the first re-entry problem, but the host
 side causes it.
 
 This condition occurs in the test runner of lde. The runner makes a new
-`lua_State` with `lua.new()` inside a host callback from a guest test runner
+`lua_State` with `Lua:new()` inside a host callback from a guest test runner
 state.
 
 ### Correction: JIT engine off for each callback
@@ -140,13 +194,13 @@ Therefore, the cost is small.
 
 ### Correction: bridge_new_state for safe state creation
 
-The function `lua.new()` used `raw.lnewstate()` (FFI) and then
+The function `Lua:new()` used `raw.lnewstate()` (FFI) and then
 `raw.openlibs()` (FFI). Both functions use a `lua_State*` cdata. The JIT-off
 correction makes this sequence safe from a callback. In addition, the bridge
 has `bridge_new_state`. This C function allocates the state's
 memory-accounting box, calls `lua_newstate()` with the counting allocator and
 `luaL_openlibs()`, fully in C. It returns the pointer as a lightuserdata, not as
-cdata. The function `lua.new()` calls it and casts the result to `lua_State*`
+cdata. The function `Lua:new()` calls it and casts the result to `lua_State*`
 cdata on the host side:
 
 ```lua
@@ -290,7 +344,7 @@ is a table, it uses the slow path. Each table argument crosses as a pair
 The host helper `dispatchCallbackSlow` is registered one time and is carried in
 upvalue 2 of the closure. It converts each pair back into a `lua.Table` proxy.
 For this step, it finds the owner `lua.State` in a map with lightuserdata keys
-that `lua.new()` fills. Then it calls the real callback with the original
+that `Lua:new()` fills. Then it calls the real callback with the original
 argument order and the `nil` slots.
 
 The proxies are live views. A read or a write goes directly to the guest table.

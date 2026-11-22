@@ -1,9 +1,10 @@
 local lua = require("lua-sys")
+local rt = lua:lde()
 local profiler = require("lua-sys.profiler")
 local test = require("lde-test")
 
 test.it("heapSnapshot attributes a global table and counts its elements", function()
-	local state = lua.new()
+	local state = rt:new()
 	state:eval([[
 		cache = { entries = {} }
 		for i = 1, 1000 do cache.entries[i] = string.rep("x", 100) .. i end
@@ -19,7 +20,7 @@ test.it("heapSnapshot attributes a global table and counts its elements", functi
 end)
 
 test.it("heapSnapshot names the upvalue that holds a table", function()
-	local state = lua.new()
+	local state = rt:new()
 	state:eval([[
 		local hidden = {}
 		for i = 1, 100 do hidden[i] = { i } end
@@ -31,7 +32,7 @@ test.it("heapSnapshot names the upvalue that holds a table", function()
 end)
 
 test.it("heapSnapshot does not follow weak references", function()
-	local state = lua.new()
+	local state = rt:new()
 	state:eval([[
 		weak = setmetatable({}, { __mode = "v" })
 		for i = 1, 50 do weak[i] = {} end
@@ -42,7 +43,7 @@ test.it("heapSnapshot does not follow weak references", function()
 end)
 
 test.it("heapSnapshot walks a chain deeper than its frame limit", function()
-	local state = lua.new()
+	local state = rt:new()
 	state:eval([[
 		local node = nil
 		for i = 1, 20000 do node = { next = node } end
@@ -55,7 +56,7 @@ test.it("heapSnapshot walks a chain deeper than its frame limit", function()
 end)
 
 test.it("heapSnapshot adds no garbage to the guest", function()
-	local state = lua.new()
+	local state = rt:new()
 	state:eval([[t = {} for i = 1, 5000 do t[i] = { i } end]])
 	state:heapSnapshot() -- the first snapshot creates the walker thread
 	state:eval("collectgarbage() collectgarbage()")
@@ -66,7 +67,7 @@ test.it("heapSnapshot adds no garbage to the guest", function()
 end)
 
 test.it("heapSnapshot from a profiler callback sees the main chunk's locals", function()
-	local state = lua.new()
+	local state = rt:new()
 	---@type lua.HeapSnapshot?
 	local snap
 	profiler.start(state, "fi1", function()

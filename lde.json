@@ -1,7 +1,26 @@
 {
 	"name": "lua-sys",
-	"description": "LuaJIT C api bindings for lde.",
+	"description": "Lua C API bindings and multi-runtime host for lde.",
 	"authors": ["David Cruz <david@bycruz.dev>"],
-	"version": "0.1.7",
-	"dependencies": {}
+	"version": "0.2.0",
+	"dependencies": {},
+	"features": {
+		"default": ["lde", "luajit", "high"],
+		"luajit": ["lua-sys.abi.lua51", "lua-sys.abi.jit", "lua-sys.profiler"],
+		"lua51": ["lua-sys.abi.lua51"],
+		"lua54": ["lua-sys.abi.lua54"],
+		"luau": ["lua-sys.abi.luau"],
+		"high": [
+			"lua-sys.high",
+			"lua-sys.high.state",
+			"lua-sys.high.chunk",
+			"lua-sys.high.value",
+			"lua-sys.high.frame",
+			"lua-sys.high.hooks",
+			"lua-sys.high.convert",
+			"lua-sys.bridge"
+		],
+		"lde": ["lua-sys.embedded.lde", "lua-sys.abi.lua51", "lua-sys.abi.jit", "lua-sys.profiler"],
+		"bundled": ["lua-sys.embedded.bundled", "lua-sys.bundled"]
+	}
 }

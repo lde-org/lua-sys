@@ -4,6 +4,7 @@
 -- Run with:  lde ./benchmarks/overhead.lua --profile
 
 local lua = require("lua-sys")
+local rt = lua:lde()
 
 local ITERATIONS = 5000000
 
@@ -13,7 +14,7 @@ print("=== lua-sys Cross-Boundary Call Overhead ===\n")
 -- Benchmark 1: Guest → Host  bare overhead (no args, no returns)
 -- ═══════════════════════════════════════════════════════════════════
 do
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 	g:set("host_noop", function() end)
 	local wrapper = state:eval("function() host_noop() end") --[[@as lua.Callable]]
@@ -41,7 +42,7 @@ local configs = {
 
 for _, cfg in ipairs(configs) do
 	local n, y = cfg.n, cfg.y
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 
 	local host_fn
@@ -86,7 +87,7 @@ end
 -- Benchmark 3: Host → Guest  (guest-defined noop)
 -- ═══════════════════════════════════════════════════════════════════
 do
-	local state = lua.new()
+	local state = rt:new()
 	local fn = state:eval("function() end") --[[@as lua.Callable]]
 
 	print("[3] Host → Guest: no args, no returns")

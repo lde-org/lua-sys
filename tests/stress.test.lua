@@ -4,7 +4,7 @@
 --
 --   lde runs its test suite by creating a lua-sys guest state per test file
 --   (the "outer" state). Inside that outer state the test file executes, and
---   the test file itself calls lua.new() to create further guest states (the
+--   the test file itself calls rt:new() to create further guest states (the
 --   "inner" states). The profiler may be active on the outer state while inner
 --   states are being created and exercised.
 --
@@ -12,13 +12,14 @@
 -- profiling all remain correct in that layered environment.
 
 local lua = require("lua-sys")
+local rt = lua:lde()
 local profiler = require("lua-sys.profiler")
 local test = require("lde-test")
 
 -- ─── Creating inner states from within an outer guest state ───────────────
 
 test.it("inner state can be created and used from within an outer guest state", function()
-	local outer = lua.new()
+	local outer = rt:new()
 
 	-- The outer state evaluates code that creates a further state via the
 	-- lua-sys C API the host has already loaded. We simulate this by injecting
@@ -27,7 +28,7 @@ test.it("inner state can be created and used from within an outer guest state", 
 
 	g:set("create_inner_and_eval", function(code)
 		---@cast code string
-		local inner = lua.new()
+		local inner = rt:new()
 		local result = inner:eval(code)
 		inner:close()
 		return result
@@ -40,12 +41,12 @@ test.it("inner state can be created and used from within an outer guest state", 
 end)
 
 test.it("many inner states created and closed from outer state do not leak", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 	local count = 0
 
 	g:set("run_inner", function(i)
-		local inner = lua.new()
+		local inner = rt:new()
 		local v = inner:eval("return " .. i .. " * 2")
 		inner:close()
 		count = count + 1
@@ -65,11 +66,11 @@ test.it("many inner states created and closed from outer state do not leak", fun
 end)
 
 test.it("outer state globals are not corrupted by inner state creation", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g:set("make_inner_result", function(n)
-		local inner = lua.new()
+		local inner = rt:new()
 		local ig = inner:globals()
 		ig:set("x", n)
 		local v = inner:eval("return x * x")
@@ -96,7 +97,7 @@ test.it("inner state calls a host callback that itself uses an outer guest funct
 	-- call graph that appears when lde's test runner (outer) runs a lua-sys
 	-- test (inner → host callback → outer guest fn).
 
-	local outer = lua.new()
+	local outer = rt:new()
 	local outer_g = outer:globals()
 
 	-- A guest function in the outer state
@@ -107,7 +108,7 @@ test.it("inner state calls a host callback that itself uses an outer guest funct
 
 	-- inner state calls the host callback
 	outer_g:set("run_inner_round_trip", function(x)
-		local inner = lua.new()
+		local inner = rt:new()
 		local ig = inner:globals()
 		ig:set("call_outer", function(v)
 			return outer_fn(v) -- host callback → outer guest
@@ -124,11 +125,11 @@ test.it("inner state calls a host callback that itself uses an outer guest funct
 end)
 
 test.it("error in inner state does not corrupt outer state", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g:set("run_faulty_inner", function()
-		local inner = lua.new()
+		local inner = rt:new()
 		local ok = pcall(inner.eval, inner, "error('inner boom')")
 		inner:close()
 		-- return primitive error indicator back to outer guest
@@ -149,11 +150,11 @@ end)
 -- ─── Profiler on outer state while inner states run ───────────────────────
 
 test.it("profiler on outer state produces a valid report while inner states are created", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g:set("run_inner_fib", function()
-		local inner = lua.new()
+		local inner = rt:new()
 		local result = inner:eval([[
 			local function fib(n)
 				if n < 2 then return n end
@@ -191,12 +192,12 @@ test.it("profiler on outer state produces a valid report while inner states are 
 end)
 
 test.it("profiler custom callback fires while inner states are active", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 	local ticks = 0
 
 	g:set("run_inner_work", function()
-		local inner = lua.new()
+		local inner = rt:new()
 		inner:load([[
 			local s = 0
 			for i = 1, 10000 do s = s + i end
@@ -228,7 +229,7 @@ end)
 -- them with primitive values. This reproduces that pattern at load.
 
 test.it("reporter callbacks survive outer state running many inner-state tests", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	-- Reporter accumulator (lives on host)
@@ -240,7 +241,7 @@ test.it("reporter callbacks survive outer state running many inner-state tests",
 
 	-- Outer guest runs a "test loop" that creates inner states and reports
 	g:set("run_test", function(should_pass)
-		local inner = lua.new()
+		local inner = rt:new()
 		local ok = pcall(inner.eval, inner, should_pass and "assert(1 == 1)" or "assert(1 == 2, 'expected failure')")
 		inner:close()
 		return ok
@@ -267,7 +268,7 @@ end)
 -- ─── Profiler on outer state during reporter callback pattern ─────────────
 
 test.it("profiler + reporter callbacks + inner states all work together", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	local results = {}
@@ -277,7 +278,7 @@ test.it("profiler + reporter callbacks + inner states all work together", functi
 
 	g:set("run_inner_test", function(name, code)
 		---@cast code string
-		local inner = lua.new()
+		local inner = rt:new()
 		local ok = pcall(inner.eval, inner, code)
 		inner:close()
 		return ok
@@ -318,13 +319,13 @@ end)
 -- ─── Stack integrity across the full nested scenario ──────────────────────
 
 test.it("outer guest stack is balanced throughout nested state + profiler usage", function()
-	local outer = lua.new()
-	local raw = lua.raw
+	local outer = rt:new()
+	local raw = rt.raw
 	local g = outer:globals()
 	local base = raw.gettop(outer.L)
 
 	g:set("make_inner", function(n)
-		local inner = lua.new()
+		local inner = rt:new()
 		local v = inner:eval("return " .. n)
 		inner:close()
 		return v

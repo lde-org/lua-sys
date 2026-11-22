@@ -1,6 +1,5 @@
-local raw = require("lua-sys.raw")
+local lua = require("lua-sys"):lde().raw
 local test = require("lde-test")
-local lua = raw -- alias so existing test bodies don't need changing
 
 local LUA_TNIL = 0
 local LUA_TBOOLEAN = 1

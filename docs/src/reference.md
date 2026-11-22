@@ -1,19 +1,20 @@
 # API Reference
 
-`lua-sys` gives you the Lua C API of LuaJIT. Use it to make guest `lua_State`
-instances and to control them from the host program.
+`lua-sys` binds the C API of several Lua runtimes — LuaJIT, Lua 5.1, Lua 5.4
+and Luau — and gives you a high-level API on top of them.
 
 ```lua
 local lua = require("lua-sys")
 ```
 
-The module has three members:
+The module has four entry points that choose a runtime:
 
 | Member | Function |
 |---|---|
-| `lua.new()` | Makes a guest state. |
-| `lua.raw` | The [`lua-sys.raw`](#lua-sysraw) module. It binds the complete Lua C API with FFI. |
-| `lua.profiler` | The [`lua-sys.profiler`](#profiler) module. It samples guest states. |
+| `lua:lde()` | The LuaJIT that lde itself links (the image running lua-sys). Requires `lde`. |
+| `lua:bundled(version)` | The runtime built by the `bundled` feature. Requires `bundled`. |
+| `lua:vendored(version)` | A runtime of that version the host process already has, or nil. |
+| `lua:open(path)` | The Lua library at `path`. |
 
 The high-level API below is the approved method to control a guest state.
 Values cross between the host and the guest in two ways: by copy for
@@ -23,7 +24,8 @@ primitives, or by reference for tables, functions, userdata and threads.
 
 | Object | Members |
 |---|---|
-| `lua` | [`new()`](#luanew--luastate) |
+| `lua` | [`lde()`](#runtimes), [`bundled(version)`](#runtimes), [`vendored(version)`](#runtimes), [`open(path)`](#runtimes) |
+| `lua.Lua` | [`version`](#runtimes), `abi`, `caps`, `raw`, `handle`, `new()`, `wrap(L)` |
 | `lua.State` | [`load`](#stateloadcode--chunkname--luachunk), [`eval`](#stateevalcode--chunkname--value), [`globals`](#stateglobals--luatable), [`table`](#statetableinit--luatable), [`setHook`](#statesethookfn-mask--count), [`jitOff`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitOn`](#statejitofffn--state-statejitonfn--state-statejitflush), [`jitFlush`](#statejitofffn--state-statejitonfn--state-statejitflush), [`memory`](#statememory--integer), [`setMemoryLimit`](#statesetmemorylimitbytes), [`heapSnapshot`](#stateheapsnapshotopts--luaheapsnapshot), [`setChainLimit`](#statesetchainlimitlevels), [`chainDepth`](#statechaindepth--integer), [`close`](#stateclose), `L` |
 | `lua.Chunk` | [`eval`](#chunkeval--value), [`call`](#chunkcall), [`pcall`](#chunkpcall--true---false-err), [`xpcall`](#chunkxpcall--true---false-err), [`setName`](#chunksetnamename--luachunk), [`setMode`](#chunksetmodemode--luachunk), [`getMode`](#chunkgetmode--text--bytecode--both), [`isBytecode`](#chunkisbytecode--boolean) |
 | guest callable | `fn(...)`, [`fn:pcall(...)`](#fnpcall--true---false-err) |
@@ -31,8 +33,8 @@ primitives, or by reference for tables, functions, userdata and threads.
 | `lua.Value` | [`type`](#valuetype--string), [`value`](#valuevalue--any), [`free`](#valuefree) |
 | `lua.HookInfo` | debug fields, `thread`, [`stack()`](#infostack--luaframe) |
 | `lua.Frame` | [`locals`](#framelocals---name-value-), [`getLocal`](#framegetlocalname--value), [`setLocal`](#framesetlocalname-value--boolean), [`upvalues`](#frameupvalues---name-value-), [`getUpvalue`](#framegetupvaluename--value), [`setUpvalue`](#framesetupvaluename-value--boolean), [`eval`](#frameevalcode--true-any--false-err) |
-| `lua.profiler` | [`start`](#profilerstartstate--mode--callback), [`stop`](#profilerstopstate--report), [`print`](#profilerprintreport--out--min_percent) |
-| `lua.raw` | The complete Lua C API with FFI. Refer to [Naming](#naming). |
+| `lua-sys.profiler` | [`start`](#profilerstartstate--mode--callback), [`stop`](#profilerstopstate--report), [`print`](#profilerprintreport--out--min_percent) |
+| `lua.Lua.raw` | The complete C API of that runtime with FFI. Refer to [Raw access](#raw-access). |
 
 ## How values cross the boundary
 
@@ -104,9 +106,112 @@ end
 state:eval("local cfg = {}; fill(cfg); return cfg.timeout")  -- 5
 ```
 
-## `lua.new() → lua.State`
+## Runtimes
 
-Makes a new guest `lua_State`. These libraries are open in the new state: the
+A lua-sys build picks one Lua version and one source for it. `version` is one
+of `"luajit"`, `"lua51"`, `"lua54"` and `"luau"`; an unknown value raises.
+Handles are cached per (image, ABI), so repeated calls return the same
+`lua.Lua`.
+
+```lua
+local lua = require("lua-sys")
+
+local jit = lua:lde()                -- lde's own LuaJIT
+print(jit.abi, jit.version.string)   -- jit	LuaJIT 2.1.x
+
+local built = lua:bundled("lua54")   -- the runtime build.lua shipped
+print(built.version.string)          -- Lua 5.4.x
+
+local host = lua:vendored("lua54")   -- a Lua 5.4 the host already loaded, or nil
+if host then print(host.version.string) end
+
+local explicit = lua:open("/usr/lib64/liblua-5.4.so")
+```
+
+`lua:lde()` never returns nil; it raises when the `lde` feature is not
+bundled. `lua:bundled(version)` never returns nil; it raises when `bundled` is
+off or when the built runtime's detected version is not `version`.
+`lua:vendored(version)` returns nil when the process has no loaded runtime of
+that version; it never loads one. Both skip lde's image and the bundled image.
+`lua:open(path)` loads the library with `dlopen`/`LoadLibrary` and raises when
+it exports no enabled ABI.
+
+### `lua.Lua`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `version` | `lua.Version` | Name, ABI, language level and release. |
+| `abi` | `"jit" \| "5.1" \| "5.4" \| "luau"` | The binding in use. |
+| `caps` | `lua.Caps` | What the runtime can do. |
+| `raw` | table | The C API of this runtime. Refer to [Raw access](#raw-access). |
+| `handle` | `cdata?` | The loader handle for the bridge; nil only for lde's LuaJIT. |
+
+`lua.Lua:new()` makes a guest state of this runtime and `lua.Lua:wrap(L)`
+wraps an existing `lua_State*` of it. Both need the `high` feature and raise
+`lua-sys: the 'high' feature is not enabled` otherwise. `new()` owns the
+state; `close()` frees it. `wrap()` does not own the state; `close()` only
+drops lua-sys's registrations.
+
+### `lua.Version`
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | `"LuaJIT" \| "Lua" \| "Luau"` | Implementation name. |
+| `abi` | string | The binding name. |
+| `major`, `minor` | integer | Language level: 5.1, 5.4; LuaJIT reports 5.1; Luau reports 0.0. |
+| `release` | `string?` | `"2.1.1795252368"`, `"5.4.8"`; nil for Luau. |
+| `jit` | boolean | True only for LuaJIT. |
+| `string` | string | Printable form: `"LuaJIT 2.1.1795252368"`, `"Lua 5.4.8"`, `"Luau"`. |
+
+Detection never runs guest code for a dumped state: LuaJIT reports its version
+through a temporary state, Lua 5.1 and 5.4 through their `lua_ident` symbol
+(falling back to the numeric API version), and Luau by name.
+
+### `lua.Caps`
+
+| Field | Meaning |
+|---|---|
+| `jit` | `luaJIT_setmode`, JIT on/off/flush and the profiler are available. |
+| `hooks` | `"full"` (call/return/line/count) for LuaJIT, 5.1 and 5.4; `"line"` for Luau (line and count through `lua_callbacks`/`lua_singlestep`); nil when the runtime has neither. |
+| `env` | `"fenv"` (`setfenv`/`getfenv`) or `"_ENV"` (an `_ENV` upvalue). |
+| `integers` | The runtime has an integer subtype (Lua 5.4). |
+| `source` | The runtime can compile source text (Luau only when `luau_compile` is exported). |
+
+## Features
+
+One runtime per build: exactly one version feature and at most one source
+feature. `lde.json` groups the modules by feature; modules no feature claims
+are always bundled.
+
+| Feature | Kind | Claims | Function |
+|---|---|---|---|
+| `luajit` | version | `lua-sys.abi.lua51`, `lua-sys.abi.jit`, `lua-sys.profiler` | LuaJIT bindings, JIT control and profiler. |
+| `lua51` | version | `lua-sys.abi.lua51` | Lua 5.1 bindings. |
+| `lua54` | version | `lua-sys.abi.lua54` | Lua 5.4 bindings. |
+| `luau` | version | `lua-sys.abi.luau` | Luau bindings. |
+| `lde` | source | `lua-sys.embedded.lde`, `lua-sys.abi.lua51`, `lua-sys.abi.jit`, `lua-sys.profiler` | The LuaJIT lde itself links. Implies `luajit`. |
+| `bundled` | source | `lua-sys.embedded.bundled`, `lua-sys.bundled` | build.lua builds the chosen version as `lua-sys.bundled`. |
+| `vendored` | source | none | The host process provides the runtime. A build-script flag only; find it with `vendored(version)` or `open(path)`. |
+| `high` | add-on | `lua-sys.high`, `lua-sys.high.*`, `lua-sys.bridge` | High-level states, chunks, tables, frames, hooks and the C bridge. |
+
+`l:lde()` and `l:bundled(version)` raise when their source feature is not
+enabled. `vendored` claims no modules, so it is not declared in the manifest;
+a dependent can still request it and build.lua sees it with
+`build:feature("vendored")`.
+
+The manifest declares `"default": ["lde", "luajit", "high"]`. Only
+`lde add lua-sys` uses that list: it pre-fills the dependent's `features` so a
+plain `lde add lua-sys` gets lde's LuaJIT and the high-level API.
+
+## `lua:lde():new() → lua.State`
+
+Makes a new guest `lua_State` of lde's LuaJIT. Any `lua.Lua` handle has the
+same method (`lua:open(path):new()`, or `lua:bundled("lua54"):new()`), so a
+program can pick the runtime at run time. The state belongs to the handle;
+`close()` frees it. `lua:open(path):wrap(L)` wraps an existing `lua_State*`
+instead and does not own it.
+
+These libraries are open in the new state: the
 base library, `package`, `coroutine`, `table`, `string`, `math`, `io`, `os`,
 `debug`, `bit` and `jit`.
 
@@ -116,7 +221,7 @@ The modules `ffi` and `string.buffer` are not preloaded. However,
 The new state is fully independent of the host interpreter.
 
 ```lua
-local state = lua.new()
+local state = lua:lde():new()
 print(state:eval("return _VERSION"))       -- Lua 5.1
 print(state:eval("return jit.version"))    -- LuaJIT 2.1.x
 state:close()
@@ -128,7 +233,7 @@ again.
 ### `state.L → lua_State*`
 
 The raw guest state pointer, as an FFI `cdata` value. Use it with
-[`lua-sys.raw`](#lua-sysraw), with `ffi.C` calls, or to compare it with
+[`lua.Lua.raw`](#raw-access), with `ffi.C` calls, or to compare it with
 `info.thread` in a hook. The value is `nil` after the state is closed.
 
 ### `state:close()`
@@ -185,7 +290,7 @@ allocator of the state, so it is exact. A fresh state starts at about 35 KB,
 because the standard libraries are open.
 
 ```lua
-local state = lua.new()
+local state = lua:lde():new()
 print(state:memory())            -- about 35960
 
 local big = state:eval([[return string.rep("x", 1000000)]])
@@ -227,7 +332,7 @@ the first path that reaches it. Use it to find what holds memory. Compare two
 snapshots to find what grows.
 
 ```lua
-local state = lua.new()
+local state = lua:lde():new()
 state:eval([[cache = { entries = {} }
 	for i = 1, 1000 do cache.entries[i] = string.rep("x", 100) .. i end]])
 
@@ -300,7 +405,7 @@ syntax error, it compiles the original source. Thus a bare expression operates,
 and a block of statements operates also:
 
 ```lua
-local state = lua.new()
+local state = lua:lde():new()
 
 print(state:eval("1 + 2"))                        -- 3
 print(state:eval("return 1 + 2"))                 -- 3
@@ -933,7 +1038,7 @@ interpreted.
 ## Profiler
 
 ```lua
-local profiler = require("lua-sys.profiler")   -- also lua.profiler
+local profiler = require("lua-sys.profiler")
 ```
 
 A sampling profiler for guest states. It uses the profiler hooks of LuaJIT.
@@ -991,7 +1096,7 @@ Writes the report to `out` as a table. The default for `out` is `io.stdout`.
 The method hides entries below `min_percent`. The default is `1`.
 
 ```lua
-local state = lua.new()
+local state = lua:lde():new()
 local work = state:load("local function fib(n) if n < 2 then return n end return fib(n-1) + fib(n-2) end for i = 1, 300 do fib(20) end")
 
 profiler.start(state)
@@ -1000,23 +1105,31 @@ profiler.print(profiler.stop(state))
 state:close()
 ```
 
-## `lua-sys.raw`
+## Raw access
 
-`require("lua-sys.raw")` is a thin FFI binding of the complete Lua 5.1 and
-LuaJIT C API. The module is also available as `lua.raw`. Each function takes a
-`lua_State*` as the first argument. Use `state.L` for a guest, or another state
-pointer. The high-level API uses this module.
+`rt.raw` is a thin FFI binding of the C API of the runtime `rt`. Each function
+takes that runtime's `lua_State*` as the first argument. Use `state.L` for a
+guest of the same runtime; a state of one runtime never goes into the raw API
+of another.
 
 ```lua
-local raw = require("lua-sys.raw")
+local lua = require("lua-sys")
+local rt = lua:open("/usr/lib64/liblua-5.4.so")
+local raw = rt.raw
 
 local L = raw.lnewstate()
 raw.openlibs(L)
 raw.loadstring(L, "return 2 + 2")
 raw.pcall(L, 0, 1, 0)          -- 0 == LUA_OK
-print(raw.tonumber(L, -1))     -- 4
+print(raw.tointeger(L, -1))    -- 4
 raw.close(L)
 ```
+
+The names are the same for every runtime. A function the ABI does not have is
+`nil` instead of raising: Lua 5.4 has no `setfenv`, `getfenv`, `cpcall`,
+`luaL_register` or `luaopen_*` bit library, and Luau has no `sethook`,
+`getinfo(L, what, ar)`, `luaL_ref` or `version`. Check before you call when the
+runtime can vary.
 
 ### Naming
 
@@ -1030,7 +1143,7 @@ raw.close(L)
 
 More examples of the `raw.lX` form: `luaL_error` → `raw.lerror`,
 `luaL_checkstack` → `raw.lcheckstack`, `luaL_setmetatable` →
-`raw.lsetmetatable`.
+`raw.lsetmetatable`. Luau's `lua_ref`/`lua_unref` are `raw.ref`/`raw.unref`.
 
 ### Differences from the C API
 
@@ -1048,6 +1161,26 @@ More examples of the `raw.lX` form: `luaL_error` → `raw.lerror`,
   `lua_settop(L, -n-1)`, and `raw.getglobal(L, name)` is
   `lua_getfield(L, LUA_GLOBALSINDEX, name)`.
 - `state.L` is a `lua_State*` cdata. Each `raw` function accepts it directly.
+- Removed functions that have a direct equivalent are Lua wrappers:
+  `raw.call`, `raw.pcall`, `raw.load`, `raw.resume`, `raw.yield`, `raw.dump`,
+  `raw.newuserdata`, `raw.insert`, `raw.remove` and `raw.replace` map to the
+  `lua_*k`, `lua_rotate` or `lua_rawlen` form of the ABI.
+- The 5.1 and LuaJIT paths bind the real `lua_*` names and keep direct cdata
+  calls. Lua 5.4 and Luau use prefixed function-pointer typedefs internally;
+  their `raw` fields are the cast addresses, so the call itself has no Lua
+  wrapper.
+
+### ABI extras
+
+The 5.4 binding also exposes `isinteger`, `tointegerx`, `rotate`,
+`newuserdatauv`, `setiuservalue`, `getiuservalue`, `rawgetp`, `rawsetp`,
+`geti`, `seti`, `compare`, `absindex` and `stringtonumber`. Its buffer helpers
+(`buffinit`, `addlstring`, `addstring`, `addvalue`, `prepbuffer`,
+`pushresult`) take a `lua54_Buffer`, created with `ffi.new("lua54_Buffer")`.
+
+The Luau binding exposes `pushcclosurek`, `ref`, `unref`, `luau_load`,
+`luau_compile` (nil in a VM-only build), `free`, `getinfoAt(L, level, what, ar)`
+and `stackdepth`.
 
 > [!CAUTION]
 > A `raw` call into a state uses the LuaJIT FFI. The FFI is not safe for
@@ -1066,7 +1199,7 @@ support the high-level API: `new_state`, `close_state`, `memory_used`,
 `set_hook`, `remove_hook`, `compound_tag` and `set_frame_meta`.
 
 These functions are not a public interface. Their signatures and their
-operation can change without notice. Do not call them. Use `lua-sys.raw` when
+operation can change without notice. Do not call them. Use `rt.raw` when
 you need a function below the high-level API.
 
 ## Rules and caveats

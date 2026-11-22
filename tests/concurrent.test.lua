@@ -7,15 +7,16 @@
 -- state loaded the bridge module and overwrote the global host_L pointer.
 
 local lua = require("lua-sys")
-local raw = lua.raw
+local rt = lua:lde()
+local raw = rt.raw
 local test = require("lde-test")
 local profiler = require("lua-sys.profiler")
 
 -- ─── Multiple independent concurrent states ───────────────────────────────
 
 test.it("two concurrent states are fully independent", function()
-	local s1 = lua.new()
-	local s2 = lua.new()
+	local s1 = rt:new()
+	local s2 = rt:new()
 
 	s1:eval("X = 10")
 	s2:eval("X = 20")
@@ -34,7 +35,7 @@ test.it("many concurrent states do not interfere", function()
 	---@type lua.State[]
 	local states = {}
 	for i = 1, 10 do
-		local s = lua.new()
+		local s = rt:new()
 		s:eval("_val = " .. i)
 		states[i] = s
 	end
@@ -49,9 +50,9 @@ test.it("many concurrent states do not interfere", function()
 end)
 
 test.it("states can be closed in any order relative to creation", function()
-	local s1 = lua.new()
-	local s2 = lua.new()
-	local s3 = lua.new()
+	local s1 = rt:new()
+	local s2 = rt:new()
+	local s3 = rt:new()
 
 	-- Close middle one first
 	s2:close()
@@ -64,8 +65,8 @@ test.it("states can be closed in any order relative to creation", function()
 end)
 
 test.it("concurrent states can call functions in each other via host", function()
-	local s1 = lua.new()
-	local s2 = lua.new()
+	local s1 = rt:new()
+	local s2 = rt:new()
 
 	local fn1 = s1:eval("function(x) return x * 2 end")
 	local fn2 = s2:eval("function(x) return x + 10 end")
@@ -82,11 +83,11 @@ end)
 -- ─── Nested state creation from guest callbacks (host_L guard) ────────────
 
 test.it("inner state created from host callback passed to guest works", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.create_inner = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		local v = inner:eval("return 42")
 		inner:close()
 		return v
@@ -98,13 +99,13 @@ test.it("inner state created from host callback passed to guest works", function
 end)
 
 test.it("inner state wraps a guest function from outer and calls it", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local outer_g = outer:globals()
 
 	local outer_fn = outer:eval("function(x) return x + 100 end")
 
 	outer_g.spawn_inner = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		local ig = inner:globals()
 		ig.call_outer = v -> outer_fn(v)
 		local r = inner:eval("return call_outer(7)")
@@ -118,12 +119,12 @@ test.it("inner state wraps a guest function from outer and calls it", function()
 end)
 
 test.it("many inner states created inside one host callback per iteration", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 	local count = 0
 
 	g.run_inner = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		inner:eval("local s = 0; for i = 1, 100 do s = s + i end; return s")
 		inner:close()
 		count = count + 1
@@ -138,18 +139,18 @@ test.it("many inner states created inside one host callback per iteration", func
 end)
 
 test.it("inner state can itself create a further inner state via callback", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.nest_deep = function(depth)
 		if depth <= 0 then
 			return depth
 		end
-		local inner = lua.new()
+		local inner = rt:new()
 		local ig = inner:globals()
 		-- The inner state's callback creates yet another state
 		ig.nest_deeper = function(d)
-			local inner2 = lua.new()
+			local inner2 = rt:new()
 			local result = inner2:eval("return " .. d)
 			inner2:close()
 			return result
@@ -170,7 +171,7 @@ test.it("host can still close its own state after guest loads lua-sys module", f
 	-- The key regression: when the guest does require("lua-sys"), it triggers
 	-- loading of bridge.so/dll, which calls luaopen_lua_sys_bridge(guest_L).
 	-- Before the fix, this overwrote host_L and corrupted the host.
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	-- Simulate what happens when a test file requires lua-sys inside the guest:
@@ -178,7 +179,7 @@ test.it("host can still close its own state after guest loads lua-sys module", f
 	-- the ability to create inner states via a host callback so the guest
 	-- can exercise the bridge module (which is what the fix guards).
 	g.make_inner = function(n)
-		local inner = lua.new()
+		local inner = rt:new()
 		local v = inner:eval("return " .. n .. " * 2")
 		inner:close()
 		return v
@@ -197,11 +198,11 @@ end)
 test.it("host can create new states after guest closed (host_L not corrupted)", function()
 	local results = {}
 	for cycle = 1, 5 do
-		local outer = lua.new()
+		local outer = rt:new()
 		local g = outer:globals()
 
 		g.do_inner = function(x)
-			local inner = lua.new()
+			local inner = rt:new()
 			local v = inner:eval("return " .. x .. " + 1")
 			inner:close()
 			return v
@@ -221,11 +222,11 @@ end)
 
 test.it("host can manage multiple outer states after many inner states were created", function()
 	for _ = 1, 10 do
-		local outer = lua.new()
+		local outer = rt:new()
 		local g = outer:globals()
 
 		g.inner_op = function()
-			local inner = lua.new()
+			local inner = rt:new()
 			inner:eval("return 1")
 			inner:close()
 		end
@@ -241,11 +242,11 @@ end)
 
 test.it("closing outer state while inner states still exist does not crash", function()
 	local inner_ptr
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.spawn_inner = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		inner:eval("_alive = true")
 		inner_ptr = inner -- keep reference alive on host side
 		return 42
@@ -265,11 +266,11 @@ test.it("closing outer state while inner states still exist does not crash", fun
 end)
 
 test.it("closing inner state while outer state is still active does not corrupt outer", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.spawn_and_close_inner = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		inner:eval("return 1")
 		inner:close()
 		return "done"
@@ -286,8 +287,8 @@ end)
 -- ─── Callback lifecycle with multiple concurrent states ───────────────────
 
 test.it("callbacks registered on one state do not leak to another", function()
-	local s1 = lua.new()
-	local s2 = lua.new()
+	local s1 = rt:new()
+	local s2 = rt:new()
 
 	local calls1 = 0
 	local calls2 = 0
@@ -318,7 +319,7 @@ test.it("callbacks unregistered by close do not fire during subsequent GC", func
 	-- After state:close() unregisters callbacks, any stray callback
 	-- invocation (from GC finalizers) should not crash.
 	for _ = 1, 5 do
-		local s = lua.new()
+		local s = rt:new()
 		local g = s:globals()
 
 		g.report = function(name, ok)
@@ -337,7 +338,7 @@ end)
 
 test.it("many callbacks registered and unregistered do not corrupt host registry", function()
 	for cycle = 1, 10 do
-		local s = lua.new()
+		local s = rt:new()
 		local g = s:globals()
 
 		-- Register multiple callbacks
@@ -359,12 +360,12 @@ test.it("host stack is balanced after creating and closing many states", functio
 	-- that repeated state creation/closing doesn't cause an unbounded leak.
 	-- Use the raw API on a scratch state to check we can still push/pop.
 
-	local scratch = lua.new()
+	local scratch = rt:new()
 	local L = scratch.L
 	local sb = raw.gettop(L)
 
 	for i = 1, 100 do
-		local s = lua.new()
+		local s = rt:new()
 		s:eval("_ = " .. i)
 		s:close()
 		test.equal(sb, raw.gettop(L))
@@ -374,13 +375,13 @@ test.it("host stack is balanced after creating and closing many states", functio
 end)
 
 test.it("guest stack integrity: nested calls leave guest stack balanced", function()
-	local state = lua.new()
-	local raw_l = lua.raw
+	local state = rt:new()
+	local raw_l = rt.raw
 	local base = raw_l.gettop(state.L)
 	local g = state:globals()
 
 	g.inner_work = function(n)
-		local inner = lua.new()
+		local inner = rt:new()
 		local r = inner:eval("return " .. n .. " * 2")
 		inner:close()
 		return r
@@ -396,11 +397,11 @@ test.it("guest stack integrity: nested calls leave guest stack balanced", functi
 end)
 
 test.it("host stack balanced after guest error during nested state creation", function()
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 
 	g.inner_error = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		-- This eval throws
 		local ok, err = pcall(inner.eval, inner, "error('inner boom')")
 		inner:close()
@@ -424,11 +425,11 @@ test.it("table from inner state can be stored in outer state and accessed", func
 	-- Registry refs are per-state, so we cannot directly push an inner
 	-- state table ref onto the outer state stack. Instead, the host
 	-- callback copies values from the inner table into the outer state.
-	local outer = lua.new()
+	local outer = rt:new()
 	local outer_g = outer:globals()
 
 	outer_g.make_inner_table = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		local t = inner:table({ x = 1, y = 2 })
 		-- Copy values from inner table into outer state globals (host-side access)
 		outer_g.inner_x = t:get("x")
@@ -449,11 +450,11 @@ end)
 test.it("value from inner state is usable after inner is closed", function()
 	-- When inner is closed, Value:free() should handle nil state.L gracefully
 	local val
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.spawn_value = function()
-		local inner = lua.new()
+		local inner = rt:new()
 		val = inner:eval("return 'from-inner'")
 		inner:close()
 		return val
@@ -474,7 +475,7 @@ test.it("rapid create/close cycles of many states do not leak or crash", functio
 		---@type lua.State[]
 		local states = {}
 		for i = 1, 20 do
-			local s = lua.new()
+			local s = rt:new()
 			s:eval("local t = {}; for j = 1,100 do t[j] = j end; return #t")
 			states[i] = s
 		end
@@ -490,11 +491,11 @@ end)
 test.it("profiler on outer while inner states are created (Windows fix)", function()
 	-- This specifically tests the Windows profiler fix where bridge_profile_start/stop
 	-- now read args from L (the caller) instead of host_L.
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.inner_work = function(n)
-		local inner = lua.new()
+		local inner = rt:new()
 		local r = inner:eval("local s = 0; for i = 1, 50000 do s = s + i end; return s")
 		inner:close()
 		return r
@@ -521,7 +522,7 @@ end)
 test.it("dispatch_callback invoked thousands of times does not corrupt host", function()
 	-- Each dispatch_callback call toggles luaJIT_setmode on host_L.
 	-- On Windows with ABI mismatch, many toggles could corrupt the host.
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	local count = 0
@@ -541,7 +542,7 @@ test.it("dispatch_callback invoked thousands of times does not corrupt host", fu
 end)
 
 test.it("callback with error does not leak host stack entries", function()
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 
 	g.explode = function()
@@ -562,7 +563,7 @@ end)
 -- ─── Value proxy GC after state close ─────────────────────────────────────
 
 test.it("Value proxy __gc does not crash when state already closed", function()
-	local state = lua.new()
+	local state = rt:new()
 
 	-- Create a proxy through function return
 	local fn = state:eval("function(x) return x * 2 end")
@@ -580,7 +581,7 @@ test.it("Value proxy __gc does not crash when state already closed", function()
 end)
 
 test.it("Table proxy __gc does not crash when state already closed", function()
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 	g.data = { x = 10, y = 20 }
 
@@ -599,7 +600,7 @@ end)
 -- ─── Multiple simultaneous host callbacks into guest ──────────────────────
 
 test.it("guest function called from host callback re-enters guest correctly", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local outer_g = outer:globals()
 
 	local guest_math_fn = outer:eval("function(a, b) return a * b + 1 end")
@@ -619,7 +620,7 @@ test.it("guest function called from host callback re-enters guest correctly", fu
 end)
 
 test.it("error in re-entered guest call is caught by host pcall", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local outer_g = outer:globals()
 
 	local guest_error_fn = outer:eval("function() error('guest re-enter error') end")
@@ -639,7 +640,7 @@ test.it("closing a state while a bound_call is alive does not crash", function()
 	-- bound_call has upvalue 1 (guest ptr) and upvalue 5 (the owner's closed
 	-- flag). After close the pointer dangles, so the call must report an error
 	-- before it touches the guest state.
-	local state = lua.new()
+	local state = rt:new()
 	local fn = state:eval("function(x) return x + 1 end") --[[@as lua.Callable]]
 
 	test.equal(11, fn(10))
@@ -666,7 +667,7 @@ test.it("simulate lde test runner: many test files each with fresh state", funct
 	local total_calls = 0
 
 	for test_file = 1, 20 do
-		local state = lua.new()
+		local state = rt:new()
 		local g = state:globals()
 
 		-- Set up reporter callbacks (like lde does)
@@ -696,7 +697,7 @@ test.it("simulate lde test runner with inner states in test code", function()
 	local total_results = 0
 
 	for test_file = 1, 10 do
-		local outer = lua.new()
+		local outer = rt:new()
 		local g = outer:globals()
 
 		g._on_result = function(name, ok)
@@ -705,7 +706,7 @@ test.it("simulate lde test runner with inner states in test code", function()
 
 		-- Test code creates inner states (like lua-sys stress tests do)
 		g._run_inner = function(n)
-			local inner = lua.new()
+			local inner = rt:new()
 			local v = inner:eval(string.format("return %d * 2", n))
 			inner:close()
 			return v
@@ -729,12 +730,12 @@ end)
 -- ─── GC: state object collected while another state is active ─────────────
 
 test.it("state left for GC does not corrupt another active state", function()
-	local survivor = lua.new()
+	local survivor = rt:new()
 	survivor:eval("_s = 'alive'")
 
 	-- Create a state in a local scope so it becomes GC-eligible
 	do
-		local temp = lua.new()
+		local temp = rt:new()
 		temp:eval("_x = 10")
 		local g = temp:globals()
 		g.cb = function() end -- register a callback
@@ -753,12 +754,12 @@ test.it("state left for GC does not corrupt another active state", function()
 end)
 
 test.it("many states left for GC while one active state survives", function()
-	local survivor = lua.new()
+	local survivor = rt:new()
 	survivor:eval("_counter = 0")
 
 	for i = 1, 20 do
 		do
-			local temp = lua.new()
+			local temp = rt:new()
 			temp:eval("_v = " .. i)
 			local g = temp:globals()
 			g.report = function(name) end
@@ -780,7 +781,7 @@ end)
 test.it("state left for GC with registered callbacks does not affect new states", function()
 	-- Abandon a state with several registered callbacks
 	do
-		local s = lua.new()
+		local s = rt:new()
 		local g = s:globals()
 		g.on_result = function(name, ok) end
 		g.on_start = function(name) end
@@ -792,7 +793,7 @@ test.it("state left for GC with registered callbacks does not affect new states"
 	collectgarbage()
 
 	-- Create a new state with its own callbacks — must not inherit the old ones
-	local s = lua.new()
+	local s = rt:new()
 	local g = s:globals()
 	local called = false
 	g.new_cb = function(x)
@@ -811,7 +812,7 @@ test.it("state left for GC with bound_call guest functions does not corrupt new 
 	-- Create a state, get a bound_call, drop state, force GC, create new state
 	local new_state
 	do
-		local s = lua.new()
+		local s = rt:new()
 		local fn = s:eval("function(x) return x * 5 end")
 		test.equal(50, fn(10))
 		-- fn is a bound_call with upvalue pointing to s.L
@@ -822,7 +823,7 @@ test.it("state left for GC with bound_call guest functions does not corrupt new 
 	collectgarbage()
 
 	-- Create a fresh state — must work
-	new_state = lua.new()
+	new_state = rt:new()
 	local g = new_state:globals()
 	g.work = x -> x + 1
 	local v = new_state:eval("return work(99)")
@@ -834,14 +835,14 @@ end)
 test.it("alternating: explicit close vs GC abandon does not corrupt state chain", function()
 	for cycle = 1, 10 do
 		-- Explicitly closed state
-		local s1 = lua.new()
+		local s1 = rt:new()
 		s1:eval("_a = " .. cycle)
 		test.equal(cycle, s1:globals()._a)
 		s1:close()
 
 		-- Abandoned state (left for GC)
 		do
-			local s2 = lua.new()
+			local s2 = rt:new()
 			s2:eval("_b = " .. cycle)
 			local g2 = s2:globals()
 			g2.cb = function() end
@@ -850,7 +851,7 @@ test.it("alternating: explicit close vs GC abandon does not corrupt state chain"
 		collectgarbage()
 
 		-- Another explicitly closed state
-		local s3 = lua.new()
+		local s3 = rt:new()
 		s3:eval("_c = " .. cycle)
 		test.equal(cycle, s3:globals()._c)
 		s3:close()
@@ -861,7 +862,7 @@ end)
 -- ─── GC: Value proxy collected while state still alive ────────────────────
 
 test.it("Value proxy GC while state is still alive does not corrupt state", function()
-	local state = lua.new()
+	local state = rt:new()
 	local proxy = nil
 
 	-- Create a proxy in a nested scope so it becomes GC-eligible
@@ -884,7 +885,7 @@ test.it("Value proxy GC while state is still alive does not corrupt state", func
 end)
 
 test.it("Table proxy GC while state is still alive does not corrupt state", function()
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 	g.data_table = { a = 1, b = 2, c = 3 }
 
@@ -908,7 +909,7 @@ test.it("Table proxy GC while state is still alive does not corrupt state", func
 end)
 
 test.it("bulk proxy creation then GC while state alive does not corrupt state", function()
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 	local proxies = {}
 
@@ -939,11 +940,11 @@ end)
 -- ─── GC: inner state abandoned, outer state still alive ───────────────────
 
 test.it("inner state abandoned for GC while outer state still runs", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.leak_inner = function()
-		local inner = lua.new() -- no close() — abandoned for GC
+		local inner = rt:new() -- no close() — abandoned for GC
 		inner:eval("return 42")
 		return "leaked"
 	end
@@ -962,11 +963,11 @@ test.it("inner state abandoned for GC while outer state still runs", function()
 end)
 
 test.it("many inner states abandoned while outer repeatedly used", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.leak_inner = function(n)
-		local inner = lua.new()
+		local inner = rt:new()
 		inner:eval("_n = " .. n)
 		return n
 	end
@@ -992,7 +993,7 @@ end)
 test.it("state GC'd after callback registration but before invocation does not corrupt", function()
 	for i = 1, 10 do
 		do
-			local s = lua.new()
+			local s = rt:new()
 			local g = s:globals()
 			g.cb = n -> n * n
 			local fn = s:eval("function() return cb(" .. i .. ") end")
@@ -1006,7 +1007,7 @@ test.it("state GC'd after callback registration but before invocation does not c
 	collectgarbage()
 
 	-- Create a new state to verify host is still healthy
-	local s = lua.new()
+	local s = rt:new()
 	local g = s:globals()
 	g.work = x -> x * 10
 	local v = s:eval("return work(7)")
@@ -1019,7 +1020,7 @@ end)
 test.it("state GC'd while its Value proxies still reference it", function()
 	-- The State table is kept alive by Value proxies (they hold self._state).
 	-- Test that dropping all proxies then forcing GC doesn't crash.
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 	g.answer = 42
 
@@ -1038,7 +1039,7 @@ end)
 
 test.it("state fully abandoned including all proxy references then GC", function()
 	local function make_abandoned_state()
-		local s = lua.new()
+		local s = rt:new()
 		local g = s:globals()
 		g.value = 99
 		g.cb = || -> "hello"
@@ -1051,7 +1052,7 @@ test.it("state fully abandoned including all proxy references then GC", function
 	collectgarbage()
 
 	-- Create a fresh state to prove host is not corrupted
-	local s = lua.new()
+	local s = rt:new()
 	s:eval("_x = 7")
 	test.equal(7, s:globals()._x)
 	s:close()
@@ -1064,7 +1065,7 @@ test.it("rapid create-abandon-GC-create cycles do not accumulate corruption", fu
 		-- Abandon several states
 		for i = 1, 10 do
 			do
-				local s = lua.new()
+				local s = rt:new()
 				local g = s:globals()
 				g["fn" .. i] = x -> x * i
 				s:eval("_data = " .. i .. cycle)
@@ -1074,7 +1075,7 @@ test.it("rapid create-abandon-GC-create cycles do not accumulate corruption", fu
 		collectgarbage()
 
 		-- Create and explicitly close a state to verify correctness
-		local s = lua.new()
+		local s = rt:new()
 		s:eval("_test = " .. cycle)
 		test.equal(cycle, s:globals()._test)
 		s:close()
@@ -1085,13 +1086,13 @@ end)
 -- ─── GC: collectgarbage during state execution ────────────────────────────
 
 test.it("GC during guest execution does not corrupt outer state", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	g.trigger_gc = function()
 		collectgarbage()
 		collectgarbage()
-		local inner = lua.new()
+		local inner = rt:new()
 		inner:eval("_x = 1")
 		inner:close()
 		return "ok"
@@ -1104,7 +1105,7 @@ test.it("GC during guest execution does not corrupt outer state", function()
 end)
 
 test.it("GC via collectgarbage in host callback while guest function is active", function()
-	local outer = lua.new()
+	local outer = rt:new()
 	local g = outer:globals()
 
 	local guest_fn = outer:eval("function(x) return x * 2 end")

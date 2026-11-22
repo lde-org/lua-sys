@@ -1,8 +1,7 @@
 -- src/profiler.lua
 --
--- Sampling profiler for guest lua_State instances.
-
-local raw = require("lua-sys.raw")
+-- Sampling profiler for guest lua_State instances. It uses the profiler of
+-- the state's LuaJIT runtime (`caps.jit`); a wrapped LuaJIT state works too.
 
 ---@class lua.profiler.Row
 ---@field stack   string
@@ -25,7 +24,7 @@ local raw = require("lua-sys.raw")
 local profiler = {}
 
 -- lua.State → entry, with weak keys. The state object is the key and not its
--- address: a closed state releases its address, and lua.new() reuses it, so an
+-- address: a closed state releases its address, and Lua:new() reuses it, so an
 -- address key would refuse the next state. The entry also goes away with the
 -- state object.
 local _active = setmetatable({}, { __mode = "k" }) --[[@as table<lua.State, lua.profiler.Entry>]]
@@ -37,17 +36,18 @@ local _active = setmetatable({}, { __mode = "k" }) --[[@as table<lua.State, lua.
 ---@param cb    fun(stack: string, samples: integer, vmstate: string)?
 local function start_posix(state, mode, cb)
 	local L = assert(state.L, "state is closed")
+	local raw = state._raw
 	local entry = { isCustom = cb ~= nil, counts = {}, total = 0 }
 
 	if cb then
-		---@type fun(data: ffi.cdata*, L: lua.raw.State, samples: integer, vmstate: integer)
+		---@type fun(data: any, L: any, samples: integer, vmstate: integer)
 		local onSample = function(_, thread, samples, vmstate)
 			cb(raw.jit_profile_dumpstack(thread, "f;", 32), samples, string.char(vmstate))
 		end
 		raw.jit_profile_start(L, mode, onSample, nil)
 	else
 		local counts = entry.counts
-		---@type fun(data: ffi.cdata*, L: lua.raw.State, samples: integer, vmstate: integer)
+		---@type fun(data: any, L: any, samples: integer, vmstate: integer)
 		local onSample = function(_, thread, samples, vmstate)
 			local stack = raw.jit_profile_dumpstack(thread, "f;", 32)
 			local vm = string.char(vmstate)
@@ -69,6 +69,7 @@ end
 ---@param state lua.State
 local function stop_posix(state)
 	local L = assert(state.L, "state is closed")
+	local raw = state._raw
 	raw.jit_profile_stop(L)
 	local entry = assert(_active[state], "profiler is not running for this state")
 	_active[state] = nil
@@ -95,11 +96,15 @@ end
 
 -- The profiler needs a live guest state. A closed state has L == nil, and the
 -- raw profile calls on a freed lua_State would crash.
----@param state lua.State
----@param what  string
-local function checkOpenState(state, what)
+---@param state  lua.State
+---@param what   string
+---@param method string
+local function checkOpenState(state, what, method)
 	if type(state) ~= "table" or state.L == nil then
 		error(what .. ": expected an open lua.State", 3)
+	end
+	if not state.rt.caps.jit then
+		error(method .. ": not supported by " .. state.rt.version.string, 3)
 	end
 end
 
@@ -107,7 +112,7 @@ end
 ---@param mode  string?
 ---@param cb    fun(stack: string, samples: integer, vmstate: string)?
 function profiler.start(state, mode, cb)
-	checkOpenState(state, "profiler.start")
+	checkOpenState(state, "profiler.start", "profiler.start")
 	assert(not _active[state], "profiler already running for this state")
 	start_posix(state, mode or "fi1", cb)
 end
@@ -115,7 +120,7 @@ end
 ---@param state lua.State
 ---@return lua.profiler.Report?
 function profiler.stop(state)
-	checkOpenState(state, "profiler.stop")
+	checkOpenState(state, "profiler.stop", "profiler.stop")
 	assert(_active[state], "profiler not running for this state")
 	return stop_posix(state)
 end

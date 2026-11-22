@@ -1,9 +1,10 @@
 local lua = require("lua-sys")
+local rt = lua:lde()
 local profiler = require("lua-sys.profiler")
 local test = require("lde-test")
 
 local function make_state_with_work()
-	local state = lua.new()
+	local state = rt:new()
 
 	-- fib burns CPU in the guest so the profiler actually fires
 	local work = state:load([[
@@ -135,7 +136,7 @@ test.it("start twice on same state raises an error", function()
 end)
 
 test.it("stop without start raises an error", function()
-	local state = lua.new()
+	local state = rt:new()
 	local ok, err = pcall(profiler.stop, state)
 	test.equal(false, ok)
 	test.truthy((err):find( --[[@as string]]"not running" ))
@@ -167,23 +168,23 @@ test.it("profiler.print writes a formatted report", function()
 	state:close()
 end)
 
--- ─── lua.profiler alias ───────────────────────────────────────────────────
+-- ─── module identity ─────────────────────────────────────────────────────
 
-test.it("lua.profiler is the same module as lua-sys.profiler", function()
-	test.equal(profiler, lua.profiler)
+test.it("lua-sys.profiler is a single module", function()
+	test.equal(profiler, require("lua-sys.profiler"))
 end)
 
 -- ─── State lifetime ───────────────────────────────────────────────────────
 
 test.it("a state closed without stop does not block the next state", function()
 	-- The profiler keys states by the object, not by the address string: a
-	-- closed state frees its address, and lua.new() hands the same address to
+	-- closed state frees its address, and rt:new() hands the same address to
 	-- the next state.
-	local first = lua.new()
+	local first = rt:new()
 	profiler.start(first)
 	first:close() -- deliberately no profiler.stop
 
-	local second = lua.new()
+	local second = rt:new()
 	local ok, err = pcall(function() profiler.start(second) end)
 	test.truthy(ok, tostring(err))
 
@@ -193,7 +194,7 @@ test.it("a state closed without stop does not block the next state", function()
 end)
 
 test.it("start and stop reject a closed state", function()
-	local state = lua.new()
+	local state = rt:new()
 	state:close()
 
 	local ok, err = pcall(function() profiler.start(state) end)

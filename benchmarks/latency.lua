@@ -6,6 +6,7 @@
 
 local lua = require("lua-sys")
 local ffi = require("ffi")
+local rt = lua:lde()
 
 -- ─── Timer ────────────────────────────────────────────────────────────────
 
@@ -72,7 +73,7 @@ row("add(1, 2)", baseline_add_ns)
 print("\nHost → Guest (LuaJIT calls into guest lua_State):")
 
 do
-	local state = lua.new()
+	local state = rt:new()
 
 	local g_noop = state:eval("function() end") --[[@as lua.Callable]]
 	local g_add = state:eval("function(a,b) return a+b end") --[[@as lua.Callable]]
@@ -94,7 +95,7 @@ end
 print("\nGuest → Host (guest lua_State calls back into LuaJIT):")
 
 do
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 
 	g:set("host_noop", function() end)
@@ -122,7 +123,7 @@ end
 print("\nNested: Host → Guest → Host (round-trip):")
 
 do
-	local state = lua.new()
+	local state = rt:new()
 	local g = state:globals()
 
 	g:set("host_inc", x -> x + 1)

@@ -5,7 +5,7 @@ You can give *host* functions to the guest state. Guest code can call them.
 ```lua
 local lua = require("lua-sys")
 
-local state = lua.new()
+local state = lua:lde():new()
 
 state:globals().adder = function(a, b)
 	print("Called by guest!")

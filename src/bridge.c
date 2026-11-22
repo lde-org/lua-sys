@@ -4,15 +4,29 @@
 //
 // lua_xmove cannot be used because host and guest states are created with
 // separate luaL_newstate() calls and do not share a global_State. Only
-// primitive values (nil, boolean, number, string) are copied directly;
-// compound types (table, function, userdata, thread) are handled on the
-// Lua side via registry refs.
+// primitive values (nil, boolean, number, string, lightuserdata) are copied
+// directly; compound types (table, function, userdata, thread) are handled on
+// the Lua side via registry refs.
 //
 // Every host↔guest transition is behind a lua_CFunction boundary. This is
 // required because LuaJIT's JIT recorder crashes (argv2cdata in
 // recff_cdata_call) when it tries to trace FFI calls on a lua_State* pointer
 // encountered during re-entrant execution (host → guest → host). See
-// docs/bridge-design.md.
+// docs/src/bridge-design.md.
+//
+// The HOST side is always the LuaJIT that loaded this module: its API is
+// resolved from the caller's image and every host call goes through those
+// static pointers. The GUEST side is a runtime slot: `bridge.runtime(handle,
+// abi)` resolves a per-ABI API table (LuaJIT, 5.1, 5.4, Luau) from an image
+// handle, and every guest operation goes through that table. Slot 0 is
+// (nil, "jit") — the LuaJIT that loaded the bridge — and shares the host
+// pointers, so today's LuaJIT-on-LuaJIT path pays no extra rounding.
+//
+// C functions the GUEST runtime calls back (callback dispatch, hooks) are
+// per-slot trampolines (dispatch_callback_0..7, hook_dispatch_0..7,
+// luau_interrupt_0..7): a lua_CFunction/lua_Hook carries no context, so the
+// slot is baked into the function instead of being looked up from upvalues
+// the guest API would be needed to read.
 
 /* dladdr1 (glibc) is a GNU extension; it must be requested before any system
  * header. */
@@ -27,7 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* ── LuaJIT symbol resolution ─────────────────────────────────────────────
+/* ── Host LuaJIT symbol resolution ────────────────────────────────────────
  *
  * bridge must call into the LuaJIT that loaded it, which is not always the
  * one the dynamic linker would bind an undefined lua_* to: inside a library
@@ -66,7 +80,7 @@
   X(const char *, lua_tolstring, (lua_State * L, int idx, size_t *len))        \
   X(void *, lua_touserdata, (lua_State * L, int idx))                          \
   X(void, lua_createtable, (lua_State * L, int narr, int nrec))                \
-  X(void, lua_rawgeti, (lua_State * L, int idx, int n))                        \
+  X(int, lua_rawgeti, (lua_State * L, int idx, int n))                         \
   X(void, lua_rawseti, (lua_State * L, int idx, int n))                        \
   X(void, lua_setfield, (lua_State * L, int idx, const char *k))               \
   X(int, lua_pcall, (lua_State * L, int nargs, int nresults, int errfunc))     \
@@ -110,6 +124,14 @@
 LDE_LUA_SYMS(LDE_DECLARE)
 #undef LDE_DECLARE
 
+/* Canonical 3-argument views of LuaJIT's lua_tonumber/lua_tointeger. The
+ * extra `isnum` argument is ignored by LuaJIT's 2-argument functions, so slot
+ * 0 reads numbers with the same one indirect call the old bridge used.
+ * Resolved through void* so the ABI-compatible widening casts are not
+ * -Wcast-function-type warnings. */
+static double (*host_tonumberx)(lua_State *, int, int *);
+static int64_t (*host_tointegerx)(lua_State *, int, int *);
+
 /* Returns 0 when the image that called luaopen does not export LuaJIT's API. */
 static int bridge_resolve_symbols(void *caller) {
 #ifdef _WIN32
@@ -139,6 +161,15 @@ static int bridge_resolve_symbols(void *caller) {
 #define LDE_RESOLVE(ret, name, args) *(void **)&name = dlsym(image, #name);
 #endif
   LDE_LUA_SYMS(LDE_RESOLVE)
+#ifdef _WIN32
+  *(FARPROC *)&host_tonumberx = GetProcAddress(image, "lua_tonumber");
+  *(FARPROC *)&host_tointegerx = GetProcAddress(image, "lua_tointeger");
+#else
+  *(void **)&host_tonumberx = dlsym(image, "lua_tonumber");
+  *(void **)&host_tointegerx = dlsym(image, "lua_tointeger");
+#endif
+  if (host_tonumberx == NULL || host_tointegerx == NULL)
+    return 0;
 #undef LDE_RESOLVE
 #define LDE_CHECK(ret, name, args)                                             \
   if (name == NULL)                                                            \
@@ -148,41 +179,610 @@ static int bridge_resolve_symbols(void *caller) {
   return 1;
 }
 
-// ── Per-state ownership ───────────────────────────────────────────────────
-//
-// There is intentionally NO process-global "host state" pointer in this file.
-// Every lua_State that loads lua-sys is self-contained: bridge.register stores
-// callbacks in the calling state's own registry, and cross-state closures
-// (bound_call, dispatch_callback, hook_dispatch) carry the state that owns
-// their registrations explicitly (as an upvalue or a guest-registry entry).
-//
-// This matters because a dlopen'd copy of bridge.so may be shared by many
-// states: on glibc, closing a state dlcloses the library (so each state gets
-// a fresh image with fresh statics), but musl's dlclose is a no-op — a loaded
-// image stays mapped forever, so a process-global static would be claimed by
-// whichever state loaded the copy first and every later state would fail.
-// Per-state ownership makes the design independent of dlopen/dlclose behavior.
+/* ── Runtime slots ────────────────────────────────────────────────────────
+ *
+ * A slot is one guest runtime image + ABI. Slot 0 is always the LuaJIT that
+ * loaded this module (its API table is a copy of the host pointers). Slots
+ * 1..7 are resolved by name from a dlopen/LoadLibrary handle. The same
+ * (handle, abi) always maps to the same slot, so repeated image resolution
+ * is free.
+ */
 
-// ── Value copying ─────────────────────────────────────────────────────────
+enum {
+  BRIDGE_ABI_JIT = 0,
+  BRIDGE_ABI_51,
+  BRIDGE_ABI_54,
+  BRIDGE_ABI_LUAU
+};
 
-// Returns lua_type and pushes the value onto dst, or returns -1 for compound
-// types (nothing pushed).
-static int push_primitive_typed(lua_State *src, int idx, lua_State *dst) {
-  int t = lua_type(src, idx);
+#define BRIDGE_MAX_SLOTS 8
+
+/* Luau's lua_Callbacks layout (VM/include/lua.h). Kept in sync with the
+ * headers the Luau binding uses; only debugstep/interrupt are touched. */
+typedef struct bridge_luau_callbacks {
+  void *userdata;
+  void (*interrupt)(lua_State *L, int gc);
+  void (*panic)(lua_State *L, int errcode);
+  void (*userthread)(lua_State *LP, lua_State *L);
+  int16_t (*useratom)(lua_State *L, const char *s, size_t l);
+  void (*userfinalizer)(lua_State *L, lua_State *co);
+  void (*debugbreak)(lua_State *L, void *ar);
+  void (*debugstep)(lua_State *L, void *ar);
+  void (*debuginterrupt)(lua_State *L, void *ar);
+  void (*debugprotectederror)(lua_State *L);
+  void (*onallocate)(lua_State *L, void *block, size_t osize, size_t nsize,
+                     uint8_t memcat, int tt, int tag);
+  void (*preresume)(lua_State *L);
+  void (*postresume)(lua_State *L);
+  void (*onfree)(lua_State *L, void *block);
+} bridge_luau_callbacks;
+
+/* The neutral debug view both the hook path and the heap walker consume. */
+typedef struct {
+  int event;
+  const char *name;
+  const char *namewhat;
+  const char *what;
+  const char *source;
+  const char *short_src;
+  int currentline;
+  int linedefined;
+  int lastlinedefined;
+  int nups;
+} bridge_debug;
+
+typedef struct bridge_slot bridge_slot;
+
+/* One guest runtime API. Every function pointer here is called with the
+ * guest lua_State* of that runtime. */
+typedef struct bridge_guest_api {
+  /* stack */
+  int (*gettop)(lua_State *);
+  void (*settop)(lua_State *, int);
+  void (*pushvalue)(lua_State *, int);
+  int (*type)(lua_State *, int);
+  const char *(*typename_)(lua_State *, int);
+  /* push */
+  void (*pushnil)(lua_State *);
+  void (*pushboolean)(lua_State *, int);
+  void (*pushnumber)(lua_State *, double);
+  void (*pushinteger)(lua_State *, int64_t);
+  void (*pushlstring)(lua_State *, const char *, size_t);
+  void (*pushstring)(lua_State *, const char *);
+  const char *(*pushfstring)(lua_State *, const char *, ...);
+  void (*pushlightuserdata)(lua_State *, void *);
+  void (*pushlightuserdata_tag)(lua_State *, void *, int);
+  void (*pushcclosure)(lua_State *, lua_CFunction, int);
+  void (*pushcclosurek)(lua_State *, lua_CFunction, const char *, int, void *);
+  /* access */
+  int (*toboolean)(lua_State *, int);
+  double (*tonumberx)(lua_State *, int, int *);
+  int64_t (*tointegerx)(lua_State *, int, int *);
+  const char *(*tolstring)(lua_State *, int, size_t *);
+  void *(*touserdata)(lua_State *, int);
+  const void *(*topointer)(lua_State *, int);
+  lua_State *(*tothread)(lua_State *, int);
+  /* tables */
+  void (*createtable)(lua_State *, int, int);
+  int (*rawgeti)(lua_State *, int, int);
+  void (*rawseti)(lua_State *, int, int);
+  void (*rawget)(lua_State *, int);
+  void (*rawset)(lua_State *, int);
+  void (*setfield)(lua_State *, int, const char *);
+  int (*next)(lua_State *, int);
+  int (*getmetatable)(lua_State *, int);
+  int (*setmetatable)(lua_State *, int);
+  /* calls */
+  int (*pcall)(lua_State *, int, int, int);
+  int (*pcallk)(lua_State *, int, int, int, intptr_t, void *);
+  void (*error_)(lua_State *);
+  /* refs */
+  int (*ref_table)(lua_State *, int);
+  void (*unref_table)(lua_State *, int, int);
+  int (*ref_value)(lua_State *, int);
+  void (*unref_value)(lua_State *, int);
+  /* state / threads */
+  lua_State *(*newthread)(lua_State *);
+  int (*pushthread)(lua_State *);
+  void (*xmove)(lua_State *, lua_State *, int);
+  int (*checkstack)(lua_State *, int);
+  const char *(*getupvalue)(lua_State *, int, int);
+  void *(*upvalueid)(lua_State *, int, int);
+  void (*getfenv)(lua_State *, int);
+  void (*replace)(lua_State *, int);
+  void (*copy)(lua_State *, int, int);
+  lua_State *(*luaL_newstate)(void);
+  lua_State *(*newstate)(lua_Alloc, void *);
+  void (*openlibs)(lua_State *);
+  lua_Alloc (*getallocf)(lua_State *, void **);
+  void (*setallocf)(lua_State *, lua_Alloc, void *);
+  void (*close_)(lua_State *);
+  /* debug */
+  int (*getstack_native)(lua_State *, int, void *);
+  int (*stackdepth)(lua_State *);
+  int (*getinfo_native)(lua_State *, const char *, void *);
+  int (*getinfo_level)(lua_State *, int, const char *, void *);
+  const char *(*getlocal_ar)(lua_State *, const void *, int);
+  const char *(*getlocal_level)(lua_State *, int, int);
+  void (*debug_read)(const void *, int, bridge_debug *);
+  int (*debug_nups)(const void *);
+  /* hooks */
+  void (*sethook)(lua_State *, void (*)(lua_State *, void *), int, int);
+  int (*setmode)(lua_State *, int, int);
+  bridge_luau_callbacks *(*callbacks)(lua_State *);
+  void (*singlestep)(lua_State *, int);
+} bridge_guest_api;
+
+struct bridge_slot {
+  int used;
+  int abi;
+  void *handle;
+  int registry_index;
+  int upvalue_base;
+  int t_string;
+  int t_table;
+  int t_function;
+  int t_userdata;
+  int t_thread;
+  int t_cdata;
+  bridge_guest_api api;
+};
+
+static bridge_slot g_slots[BRIDGE_MAX_SLOTS];
+static bridge_guest_api host_api;
+
+/* ── Debug layouts ───────────────────────────────────────────────────────── */
+
+static void debug_read_51(const void *ar_, int hint, bridge_debug *out) {
+  const lua_Debug *ar = (const lua_Debug *)ar_;
+  (void)hint;
+  memset(out, 0, sizeof(*out));
+  out->event = ar->event;
+  out->name = ar->name;
+  out->namewhat = ar->namewhat;
+  out->what = ar->what;
+  out->source = ar->source;
+  out->short_src = ar->short_src;
+  out->currentline = ar->currentline;
+  out->linedefined = ar->linedefined;
+  out->lastlinedefined = ar->lastlinedefined;
+  out->nups = ar->nups;
+}
+
+static void debug_read_54(const void *ar_, int hint, bridge_debug *out) {
+  const lua54_Debug *ar = (const lua54_Debug *)ar_;
+  (void)hint;
+  memset(out, 0, sizeof(*out));
+  out->event = ar->event;
+  out->name = ar->name;
+  out->namewhat = ar->namewhat;
+  out->what = ar->what;
+  out->source = ar->source;
+  out->short_src = ar->short_src;
+  out->currentline = ar->currentline;
+  out->linedefined = ar->linedefined;
+  out->lastlinedefined = ar->lastlinedefined;
+  out->nups = ar->nups;
+}
+
+static void debug_read_luau(const void *ar_, int hint, bridge_debug *out) {
+  const luaLuau_Debug *ar = (const luaLuau_Debug *)ar_;
+  memset(out, 0, sizeof(*out));
+  out->event = hint;
+  out->name = ar->name;
+  out->namewhat = NULL;
+  out->what = ar->what;
+  out->source = ar->source;
+  out->short_src = ar->short_src;
+  out->currentline = ar->currentline;
+  out->linedefined = ar->linedefined;
+  out->lastlinedefined = -1;
+  out->nups = ar->nupvals;
+}
+
+static int debug_nups_51(const void *ar) {
+  return ((const lua_Debug *)ar)->nups;
+}
+static int debug_nups_54(const void *ar) {
+  return ((const lua54_Debug *)ar)->nups;
+}
+static int debug_nups_luau(const void *ar) {
+  return ((const luaLuau_Debug *)ar)->nupvals;
+}
+
+/* ── Host API table ──────────────────────────────────────────────────────── */
+
+static void host_pushinteger(lua_State *L, int64_t n) {
+  lua_pushinteger(L, (lua_Integer)n);
+}
+
+static int host_getstack(lua_State *L, int level, void *ar) {
+  return lua_getstack(L, level, (lua_Debug *)ar);
+}
+
+static int host_getinfo(lua_State *L, const char *what, void *ar) {
+  return lua_getinfo(L, what, (lua_Debug *)ar);
+}
+
+static const char *host_getlocal(lua_State *L, const void *ar, int n) {
+  return lua_getlocal(L, (const lua_Debug *)ar, n);
+}
+
+static void host_sethook(lua_State *L, void (*fn)(lua_State *, void *),
+                         int mask, int count) {
+  (void)lua_sethook(L, (lua_Hook)fn, mask, count);
+}
+
+static void host_error(lua_State *L) {
+  (void)lua_error(L);
+}
+
+static void host_pushcclosure(lua_State *L, lua_CFunction fn, int nup) {
+  lua_pushcclosure(L, fn, nup);
+}
+
+static void init_host_api(void) {
+  memset(&host_api, 0, sizeof(host_api));
+  host_api.gettop = lua_gettop;
+  host_api.settop = lua_settop;
+  host_api.pushvalue = lua_pushvalue;
+  host_api.type = lua_type;
+  host_api.typename_ = lua_typename;
+  host_api.pushnil = lua_pushnil;
+  host_api.pushboolean = lua_pushboolean;
+  host_api.pushnumber = lua_pushnumber;
+  host_api.pushinteger = host_pushinteger;
+  host_api.pushlstring = lua_pushlstring;
+  host_api.pushstring = lua_pushstring;
+  host_api.pushfstring = lua_pushfstring;
+  host_api.pushlightuserdata = lua_pushlightuserdata;
+  host_api.pushcclosure = host_pushcclosure;
+  host_api.toboolean = lua_toboolean;
+  host_api.tonumberx = host_tonumberx;
+  host_api.tointegerx = host_tointegerx;
+  host_api.tolstring = lua_tolstring;
+  host_api.touserdata = lua_touserdata;
+  host_api.topointer = lua_topointer;
+  host_api.tothread = lua_tothread;
+  host_api.createtable = lua_createtable;
+  host_api.rawgeti = lua_rawgeti;
+  host_api.rawseti = lua_rawseti;
+  host_api.rawget = lua_rawget;
+  host_api.rawset = lua_rawset;
+  host_api.setfield = lua_setfield;
+  host_api.next = lua_next;
+  host_api.getmetatable = lua_getmetatable;
+  host_api.setmetatable = lua_setmetatable;
+  host_api.pcall = lua_pcall;
+  host_api.error_ = host_error;
+  host_api.ref_table = luaL_ref;
+  host_api.unref_table = luaL_unref;
+  host_api.newthread = lua_newthread;
+  host_api.pushthread = lua_pushthread;
+  host_api.xmove = lua_xmove;
+  host_api.checkstack = lua_checkstack;
+  host_api.getupvalue = lua_getupvalue;
+  host_api.upvalueid = lua_upvalueid;
+  host_api.getfenv = lua_getfenv;
+  host_api.replace = lua_replace;
+  host_api.luaL_newstate = luaL_newstate;
+  host_api.newstate = lua_newstate;
+  host_api.openlibs = luaL_openlibs;
+  host_api.getallocf = lua_getallocf;
+  host_api.setallocf = lua_setallocf;
+  host_api.close_ = lua_close;
+  host_api.getstack_native = host_getstack;
+  host_api.getinfo_native = host_getinfo;
+  host_api.getlocal_ar = host_getlocal;
+  host_api.debug_read = debug_read_51;
+  host_api.debug_nups = debug_nups_51;
+  host_api.sethook = host_sethook;
+  host_api.setmode = luaJIT_setmode;
+}
+
+/* ── Slot helpers ────────────────────────────────────────────────────────── */
+
+static int slot_upvalue(const bridge_slot *s, int i) {
+  return s->upvalue_base - i;
+}
+
+static int64_t slot_tointeger(const bridge_slot *s, lua_State *L, int idx) {
+  return s->api.tointegerx(L, idx, NULL);
+}
+
+static double slot_tonumber(const bridge_slot *s, lua_State *L, int idx) {
+  return s->api.tonumberx(L, idx, NULL);
+}
+
+static void slot_pushinteger(const bridge_slot *s, lua_State *L, int64_t n) {
+  s->api.pushinteger(L, n);
+}
+
+static void slot_pushlightuserdata(const bridge_slot *s, lua_State *L,
+                                   void *p) {
+  if (s->abi == BRIDGE_ABI_LUAU)
+    s->api.pushlightuserdata_tag(L, p, 0);
+  else
+    s->api.pushlightuserdata(L, p);
+}
+
+static void slot_pushcclosure(const bridge_slot *s, lua_State *L,
+                              lua_CFunction fn, int nup) {
+  if (s->abi == BRIDGE_ABI_LUAU)
+    s->api.pushcclosurek(L, fn, NULL, nup, NULL);
+  else
+    s->api.pushcclosure(L, fn, nup);
+}
+
+static int slot_pcall(const bridge_slot *s, lua_State *L, int nargs,
+                      int nresults, int errfunc) {
+  if (s->abi == BRIDGE_ABI_54)
+    return s->api.pcallk(L, nargs, nresults, errfunc, 0, NULL);
+  return s->api.pcall(L, nargs, nresults, errfunc);
+}
+
+/* Reference the value on top of the guest stack (popping it). */
+static int slot_ref_top(const bridge_slot *s, lua_State *L) {
+  if (s->abi == BRIDGE_ABI_LUAU) {
+    int ref = s->api.ref_value(L, -1);
+    s->api.settop(L, -2);
+    return ref;
+  }
+  return s->api.ref_table(L, s->registry_index);
+}
+
+/* Host pointers (JIT depth, chain box, closed flag) travel as lightuserdata:
+ * 64-bit in every guest runtime, unlike Luau's 32-bit lua_Integer. */
+static void slot_push_ptr(const bridge_slot *s, lua_State *L, void *p) {
+  slot_pushlightuserdata(s, L, p);
+}
+
+static void *slot_read_ptr(const bridge_slot *s, lua_State *L, int idx) {
+  return s->api.touserdata(L, idx);
+}
+
+static void slot_pushglobals(const bridge_slot *s, lua_State *L) {
+  if (s->abi == BRIDGE_ABI_54)
+    s->api.rawgeti(L, s->registry_index, LUA54_RIDX_GLOBALS);
+  else
+    s->api.pushvalue(L, LUA_GLOBALSINDEX);
+}
+
+/* 5.4 debug info uses lowercase 's' (source); 5.1 accepts 'S'. */
+static const char *slot_debug_what(const bridge_slot *s, const char *what,
+                                   char *buffer, size_t size) {
+  size_t i, n;
+  if (s->abi != BRIDGE_ABI_LUAU)
+    return what;
+  n = strlen(what);
+  if (n >= size)
+    n = size - 1;
+  for (i = 0; i < n; i++)
+    buffer[i] = what[i] == 'S' ? 's' : what[i];
+  buffer[n] = '\0';
+  return buffer;
+}
+
+static int slot_getstack(const bridge_slot *s, lua_State *L, int level,
+                         void *ar) {
+  if (s->abi == BRIDGE_ABI_LUAU)
+    return level >= 0 && level < s->api.stackdepth(L);
+  return s->api.getstack_native(L, level, ar);
+}
+
+static int slot_getinfo(const bridge_slot *s, lua_State *L, int level,
+                        const char *what, void *ar) {
+  char buffer[8];
+  const char *real = slot_debug_what(s, what, buffer, sizeof(buffer));
+  if (s->abi == BRIDGE_ABI_LUAU)
+    return s->api.getinfo_level(L, level, real, ar);
+  return s->api.getinfo_native(L, real, ar);
+}
+
+static const char *slot_getlocal(const bridge_slot *s, lua_State *L,
+                                 int level, int n) {
+  bridge_debug_ar ar;
+  if (s->abi == BRIDGE_ABI_LUAU)
+    return s->api.getlocal_level(L, level, n);
+  memset(&ar, 0, sizeof(ar));
+  if (!s->api.getstack_native(L, level, &ar))
+    return NULL;
+  return s->api.getlocal_ar(L, &ar, n);
+}
+
+/* Push the function at `idx`, read its upvalue count and pop it again. */
+static int slot_nups(const bridge_slot *s, lua_State *L, int idx, int *nups) {
+  bridge_debug_ar ar;
+  int ok;
+  memset(&ar, 0, sizeof(ar));
+  s->api.pushvalue(L, idx);
+  if (s->abi == BRIDGE_ABI_LUAU) {
+    ok = s->api.getinfo_level(L, -1, "u", &ar);
+    s->api.settop(L, -2);
+  } else {
+    /* '>' pops the function for 5.1/jit/5.4. */
+    ok = s->api.getinfo_native(L, ">u", &ar);
+  }
+  if (!ok)
+    return 0;
+  *nups = s->api.debug_nups(&ar);
+  return 1;
+}
+
+static void slot_debug_read(const bridge_slot *s, const void *ar, int hint,
+                            bridge_debug *out) {
+  s->api.debug_read(ar, hint, out);
+}
+
+/* ── Value copying ───────────────────────────────────────────────────────── */
+
+#if defined(__GNUC__) || defined(__clang__)
+#define BRIDGE_INLINE static inline __attribute__((always_inline))
+#else
+#define BRIDGE_INLINE static
+#endif
+
+
+static void push_number_54(const bridge_slot *s, lua_State *L, double n) {
+  /* Host numbers stay doubles; integral values in int64 range cross as
+   * 5.4 integers (the contract's pushNumber rule). */
+  if (n >= -9223372036854775808.0 && n < 9223372036854775808.0 &&
+      n == (double)(int64_t)n)
+    s->api.pushinteger(L, (int64_t)n);
+  else
+    s->api.pushnumber(L, n);
+}
+
+/* Slot 0's guest runtime is the host LuaJIT itself, so its guest operations
+ * can use the static host pointers directly. `isHost` is a compile-time
+ * constant at every per-slot trampoline call site (always_inline), so the
+ * branch folds away and slot 0 matches the pre-slot bridge exactly. */
+BRIDGE_INLINE int guest_gettop(bridge_slot *s, lua_State *L, int isHost) {
+  return isHost ? lua_gettop(L) : s->api.gettop(L);
+}
+
+BRIDGE_INLINE void guest_settop(bridge_slot *s, lua_State *L, int idx,
+                                int isHost) {
+  if (isHost)
+    lua_settop(L, idx);
+  else
+    s->api.settop(L, idx);
+}
+
+BRIDGE_INLINE int guest_type(bridge_slot *s, lua_State *L, int idx,
+                             int isHost) {
+  return isHost ? lua_type(L, idx) : s->api.type(L, idx);
+}
+
+BRIDGE_INLINE int guest_rawgeti(bridge_slot *s, lua_State *L, int idx, int n,
+                                int isHost) {
+  return isHost ? lua_rawgeti(L, idx, n) : s->api.rawgeti(L, idx, n);
+}
+
+BRIDGE_INLINE int guest_pcall(bridge_slot *s, lua_State *L, int nargs,
+                              int nresults, int errfunc, int isHost) {
+  if (isHost)
+    return lua_pcall(L, nargs, nresults, errfunc);
+  return slot_pcall(s, L, nargs, nresults, errfunc);
+}
+
+BRIDGE_INLINE const char *guest_tolstring(bridge_slot *s, lua_State *L,
+                                          int idx, size_t *len, int isHost) {
+  return isHost ? lua_tolstring(L, idx, len) : s->api.tolstring(L, idx, len);
+}
+
+BRIDGE_INLINE int64_t guest_tointeger(bridge_slot *s, lua_State *L, int idx,
+                                      int isHost) {
+  /* The macro is what the pre-slot bridge used: lua_tonumber + cast. */
+  return isHost ? (int64_t)lua_tointeger(L, idx)
+                : s->api.tointegerx(L, idx, NULL);
+}
+
+/* The host's upvalue pseudo-indices are compile-time constants; slot tables
+ * carry theirs at runtime. */
+BRIDGE_INLINE int guest_upvalue(bridge_slot *s, int i, int isHost) {
+  return isHost ? lua_upvalueindex(i) : slot_upvalue(s, i);
+}
+
+BRIDGE_INLINE void *guest_touserdata(bridge_slot *s, lua_State *L, int idx,
+                                     int isHost) {
+  return isHost ? lua_touserdata(L, idx) : s->api.touserdata(L, idx);
+}
+
+BRIDGE_INLINE void guest_pushvalue(bridge_slot *s, lua_State *L, int idx,
+                                   int isHost) {
+  if (isHost)
+    lua_pushvalue(L, idx);
+  else
+    s->api.pushvalue(L, idx);
+}
+
+BRIDGE_INLINE void guest_pushstring(bridge_slot *s, lua_State *L,
+                                    const char *str, int isHost) {
+  if (isHost)
+    lua_pushstring(L, str);
+  else
+    s->api.pushstring(L, str);
+}
+
+BRIDGE_INLINE void guest_error(bridge_slot *s, lua_State *L, int isHost) {
+  if (isHost)
+    (void)lua_error(L);
+  else
+    s->api.error_(L);
+}
+
+BRIDGE_INLINE void *guest_read_ptr(bridge_slot *s, lua_State *L, int idx,
+                                   int isHost) {
+  if (isHost)
+    return (void *)(intptr_t)lua_tointeger(L, idx);
+  return slot_read_ptr(s, L, idx);
+}
+
+static int is_primitive_type(int t, const bridge_slot *s) {
+  return t == LUA_TNIL || t == LUA_TBOOLEAN || t == LUA_TLIGHTUSERDATA ||
+         t == LUA_TNUMBER || t == (s != NULL ? s->t_string : LUA_TSTRING);
+}
+
+/* Push the value at `idx` of `src` onto `dst`. `dst_slot` NULL means the host
+ * state. Returns the source lua_type, or -1 for a compound value (nothing
+ * pushed). Inlined: the hot bound_call loop must devirtualize the API table
+ * loads exactly like the pre-slot bridge did. */
+BRIDGE_INLINE int push_value(const bridge_guest_api *a, lua_State *src, int idx,
+                      bridge_slot *dst_slot, lua_State *dst, int isHost) {
+  int t = isHost ? lua_type(src, idx) : a->type(src, idx);
   switch (t) {
   case LUA_TNIL:
-    lua_pushnil(dst);
+    if (isHost)
+      lua_pushnil(dst);
+    else if (dst_slot)
+      dst_slot->api.pushnil(dst);
+    else
+      lua_pushnil(dst);
     break;
-  case LUA_TBOOLEAN:
-    lua_pushboolean(dst, lua_toboolean(src, idx));
+  case LUA_TBOOLEAN: {
+    int b = isHost ? lua_toboolean(src, idx) : a->toboolean(src, idx);
+    if (isHost)
+      lua_pushboolean(dst, b);
+    else if (dst_slot)
+      dst_slot->api.pushboolean(dst, b);
+    else
+      lua_pushboolean(dst, b);
     break;
-  case LUA_TNUMBER:
-    lua_pushnumber(dst, lua_tonumber(src, idx));
+  }
+  case LUA_TNUMBER: {
+    double n = isHost ? lua_tonumber(src, idx)
+                      : a->tonumberx(src, idx, NULL);
+    if (isHost)
+      lua_pushnumber(dst, n);
+    else if (dst_slot == NULL)
+      lua_pushnumber(dst, n);
+    else if (dst_slot->abi == BRIDGE_ABI_54)
+      push_number_54(dst_slot, dst, n);
+    else
+      dst_slot->api.pushnumber(dst, n);
     break;
+  }
+  case LUA_TLIGHTUSERDATA: {
+    void *p = isHost ? lua_touserdata(src, idx) : a->touserdata(src, idx);
+    if (isHost)
+      lua_pushlightuserdata(dst, p);
+    else if (dst_slot)
+      slot_pushlightuserdata(dst_slot, dst, p);
+    else
+      lua_pushlightuserdata(dst, p);
+    break;
+  }
   case LUA_TSTRING: {
     size_t len;
-    const char *s = lua_tolstring(src, idx, &len);
-    lua_pushlstring(dst, s, len);
+    const char *str = isHost ? lua_tolstring(src, idx, &len)
+                             : a->tolstring(src, idx, &len);
+    if (isHost)
+      lua_pushlstring(dst, str, len);
+    else if (dst_slot)
+      dst_slot->api.pushlstring(dst, str, len);
+    else
+      lua_pushlstring(dst, str, len);
     break;
   }
   default:
@@ -191,232 +791,67 @@ static int push_primitive_typed(lua_State *src, int idx, lua_State *dst) {
   return t;
 }
 
-static void push_primitive_or_error(lua_State *src, int idx, lua_State *dst) {
-  if (push_primitive_typed(src, idx, dst) < 0) {
-    lua_pushfstring(src, "bridge: cannot pass %s across independent states",
-                    lua_typename(src, lua_type(src, idx)));
-    lua_error(src);
+BRIDGE_INLINE void push_value_or_error(const bridge_guest_api *a,
+                                       lua_State *src, int idx,
+                                       bridge_slot *dst_slot, lua_State *dst,
+                                       int isHost) {
+  if (push_value(a, src, idx, dst_slot, dst, isHost) < 0) {
+    a->pushfstring(src, "bridge: cannot pass %s across independent states",
+                   a->typename_(src, a->type(src, idx)));
+    a->error_(src);
   }
 }
 
-// ── Guest state pointer decoding ─────────────────────────────────────────
+/* ── Argument decoding ───────────────────────────────────────────────────── */
+
+/* Every slot-scoped function takes the runtime slot first: f(slot, guest, ...). */
+typedef struct {
+  int slot;
+  int first; /* first argument after the slot, 1-based */
+} bridge_slot_args;
+
+static void decode_slot_args(lua_State *L, bridge_slot_args *out) {
+  if (lua_type(L, 1) == LUA_TNUMBER) {
+    lua_Number n = lua_tonumber(L, 1);
+    if (n >= 0 && n < BRIDGE_MAX_SLOTS && n == (lua_Number)(int)n) {
+      out->slot = (int)n;
+      out->first = 2;
+      return;
+    }
+  }
+  luaL_error(L, "bridge: argument 1 must be a runtime slot (0..%d)", BRIDGE_MAX_SLOTS - 1);
+}
+
+static bridge_slot *slot_at(lua_State *L, int index) {
+  if (index < 0 || index >= BRIDGE_MAX_SLOTS || !g_slots[index].used)
+    luaL_error(L, "bridge: runtime slot %d is not initialized "
+                  "(call bridge.runtime first)",
+               index);
+  return &g_slots[index];
+}
+
+/* A LuaJIT pointer cdata is a value box: lua_topointer returns the box
+ * address, so its value is the first pointer-sized word. Handles, lua_State*
+ * and flag addresses all arrive as pointer cdata; lua_touserdata does not
+ * see cdata at all. */
+static void *decode_cdata_value(lua_State *L, int idx) {
+  const void *box = lua_topointer(L, idx);
+  return box != NULL ? *(void *const *)box : NULL;
+}
 
 static lua_State *decode_guest_ptr(lua_State *L, int stack_pos) {
   int t = lua_type(L, stack_pos);
   if (t == LUA_TNUMBER)
-    return (lua_State *)(uintptr_t)lua_tonumber(L, stack_pos);
+    return (lua_State *)(uintptr_t)lua_tointeger(L, stack_pos);
   if (t == LUA_TLIGHTUSERDATA)
     return (lua_State *)lua_touserdata(L, stack_pos);
+  if (t == LUA_TCDATA)
+    return (lua_State *)decode_cdata_value(L, stack_pos);
   luaL_error(L, "bridge: arg %d must be a guest lua_State pointer", stack_pos);
   return NULL; /* unreachable: luaL_error longjmps */
 }
 
-// ── bound_call ────────────────────────────────────────────────────────────
-//
-// lua_CFunction returned by bridge.make_callable.
-//
-// Upvalue 1: lightuserdata  — guest lua_State*
-// Upvalue 2: integer        — guest registry ref for the function
-// Upvalue 3: table          — guestState (lua.State object)
-// Upvalue 4: integer        — registry ref for callGuestSlow(guestState,
-// guestRef, ...) Upvalue 5: integer        — address of the owner's closed flag
-// Upvalue 6: integer        — registry ref for convertGuestResults
-//
-// Primitive args and results copy directly. Compound args go through
-// callGuestSlow on the Lua side. A compound result goes through
-// convertGuestResults, which reads the results from the guest stack, so the
-// guest function never runs a second time.
-
-static int bound_call(lua_State *host) {
-  /* lua-sys sets this flag before lua_close. Check it FIRST: the guest
-   * pointer below dangles once the state is closed, so nothing may touch it
-   * before this test. NULL means the closure carries no flag. */
-  int *closed = (int *)(intptr_t)lua_tointeger(host, lua_upvalueindex(5));
-  lua_State *guest;
-  int fn_ref, nargs, guest_base;
-
-  if (closed != NULL && *closed) {
-    return luaL_error(host, "state is closed");
-  }
-
-  guest = (lua_State *)lua_touserdata(host, lua_upvalueindex(1));
-  fn_ref = (int)lua_tointeger(host, lua_upvalueindex(2));
-  nargs = lua_gettop(host);
-  guest_base = lua_gettop(guest);
-
-  /* Fast path: all args are primitives. */
-  int i;
-  int all_primitive = 1;
-  for (i = 1; i <= nargs; i++) {
-    int t = lua_type(host, i);
-    if (t != LUA_TNIL && t != LUA_TBOOLEAN && t != LUA_TNUMBER &&
-        t != LUA_TSTRING) {
-      all_primitive = 0;
-      break;
-    }
-  }
-
-  if (!all_primitive) {
-    /* Slow path: delegate to callGuestSlow for Lua-side toLua() handling. */
-    int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(4));
-    lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref);
-    lua_pushvalue(host, lua_upvalueindex(3));
-    lua_pushinteger(host, fn_ref);
-    for (i = 1; i <= nargs; i++)
-      lua_pushvalue(host, i);
-    int status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
-    if (status != LUA_OK)
-      lua_error(host);
-    return lua_gettop(host) - nargs;
-  }
-
-  lua_rawgeti(guest, LUA_REGISTRYINDEX, fn_ref);
-
-  for (i = 1; i <= nargs; i++)
-    push_primitive_or_error(host, i, guest);
-
-  int status = lua_pcall(guest, nargs, LUA_MULTRET, 0);
-  if (status != 0) {
-    const char *err = lua_tostring(guest, -1);
-    lua_settop(guest, guest_base);
-    lua_pushstring(host, err ? err : "bridge: guest error");
-    lua_error(host);
-    return 0;
-  }
-
-  int nresults = lua_gettop(guest) - guest_base;
-  if (nresults == 0)
-    return 0; /* guest stack already at guest_base */
-
-  int all_primitive_res = 1;
-  for (i = 0; i < nresults; i++) {
-    int t = lua_type(guest, guest_base + 1 + i);
-    if (t != LUA_TNIL && t != LUA_TBOOLEAN && t != LUA_TNUMBER &&
-        t != LUA_TSTRING) {
-      all_primitive_res = 0;
-      break;
-    }
-  }
-
-  if (all_primitive_res) {
-    for (i = 0; i < nresults; i++)
-      push_primitive_typed(guest, guest_base + 1 + i, host);
-    lua_settop(guest, guest_base);
-    return nresults;
-  }
-
-  /* A compound result: convert each result on the Lua side, from the guest
-   * stack. Do NOT call the guest function again — its side effects must
-   * happen one time. */
-  int convert_ref = (int)lua_tointeger(host, lua_upvalueindex(6));
-  lua_rawgeti(host, LUA_REGISTRYINDEX, convert_ref);
-  lua_pushvalue(host, lua_upvalueindex(3)); /* guestState */
-  lua_pushinteger(host, guest_base + 1);    /* first result index */
-  lua_pushinteger(host, nresults);
-  status = lua_pcall(host, 3, LUA_MULTRET, 0);
-  lua_settop(guest, guest_base);
-  if (status != LUA_OK)
-    lua_error(host);
-  return lua_gettop(host) - nargs;
-}
-
-// ── bound_pcall ───────────────────────────────────────────────────────────
-//
-// `fn:pcall(...)` method attached to every bound_call closure via a shared
-// function metatable (built in init_callable_metatable).
-//
-// Runs the same guest call as bound_call but with pcall semantics: returns
-// `true, ...results` on success or `false, err` on error instead of raising a
-// host error. The guest call itself is delegated to the bound_call closure at
-// host stack index 1 (self), so the fast/slow path and compound-result
-// handling are all reused unchanged.
-
-static int bound_pcall(lua_State *host) {
-  /* The method call `fn:pcall(a1, ..., aN)` arrives as [fn, a1..aN] with
-     fn at index 1 — exactly the layout lua_pcall expects (callee at
-     top - nargs). fn is the bound_call closure, so the whole guest call
-     (fast path, slow path, compound results) is reused unchanged. */
-  int nargs = lua_gettop(host) - 1; /* exclude self */
-  int status = lua_pcall(host, nargs, LUA_MULTRET, 0);
-  if (status != LUA_OK) { /* [err] */
-    lua_pushboolean(host, 0);
-    lua_insert(host, 1); /* [false, err] */
-    return 2;
-  }
-  int nresults = lua_gettop(host); /* [r1..rM] */
-  lua_pushboolean(host, 1);
-  lua_insert(host, 1); /* [true, r1..rM] */
-  return nresults + 1;
-}
-
-// Registry key for the shared callable metatable (built at module open).
-static char callable_mt_key;
-
-static void init_callable_metatable(lua_State *L);
-
-// Lightuserdata tag prefixing guest table registry refs passed host-side by
-// dispatch_callback's slow path. bridge.compound_tag() returns it so the host
-// can recognise (tag, ref) pairs.
-static char compound_tag_key;
-
-static int bridge_make_callable(lua_State *L) {
-  // bound_call operates on the state that created the closure: every state
-  // that loads lua-sys is self-contained (its registrations live in its own
-  // registry), so the callable is built on the calling state L with the
-  // upvalues read from L's stack. There is no process-global host state.
-  lua_State *guest = decode_guest_ptr(L, 1);
-  lua_pushlightuserdata(L, (void *)guest); /* upvalue 1 */
-  lua_pushvalue(L, 2);                     /* upvalue 2: guestRef */
-  lua_pushvalue(L, 3);                     /* upvalue 3: guestState */
-  lua_pushvalue(L, 4);                     /* upvalue 4: callGuestSlow ref */
-  lua_pushvalue(L, 5);                     /* upvalue 5: closed flag address */
-  lua_pushvalue(L, 6);                     /* upvalue 6: result converter */
-  lua_pushcclosure(L, bound_call, 6);      /* the callable */
-  /* Ensure the fn:pcall() metatable exists in THIS state's registry. A
-   * dlopen'd copy of bridge.so may be shared by many states (musl never
-   * unloads libraries), so luaopen — and its init_callable_metatable — only
-   * ran for whichever state opened the copy first. */
-  lua_pushlightuserdata(L, (void *)&callable_mt_key);
-  lua_rawget(L, LUA_REGISTRYINDEX);
-  if (lua_isnil(L, -1)) {
-    lua_pop(L, 1);
-    init_callable_metatable(L);
-    lua_pushlightuserdata(L, (void *)&callable_mt_key);
-    lua_rawget(L, LUA_REGISTRYINDEX);
-  }
-  lua_setmetatable(L, -2);
-  return 1;
-}
-
-// Build the metatable providing `fn:pcall()` on every bound_call closure and
-// park it in a state's registry under a lightuserdata key. Shared by all
-// callables so each closure carries only the metatable reference. Called from
-// luaopen (for the opening state) and lazily from bridge_make_callable (for
-// every other state that shares the same dlopen'd copy).
-static void init_callable_metatable(lua_State *L) {
-  lua_createtable(L, 0, 1); /* mt */
-  lua_createtable(L, 0, 1); /* methods */
-  lua_pushcclosure(L, bound_pcall, 0);
-  lua_setfield(L, -2, "pcall");   /* methods.pcall = bound_pcall */
-  lua_setfield(L, -2, "__index"); /* mt.__index = methods */
-  lua_pushlightuserdata(L, (void *)&callable_mt_key);
-  lua_pushvalue(L, -2);             /* [mt, key, mt] */
-  lua_rawset(L, LUA_REGISTRYINDEX); /* registry[key] = mt */
-  lua_pop(L, 1);
-}
-
-static int bridge_compound_tag(lua_State *L) {
-  lua_pushlightuserdata(L, (void *)&compound_tag_key);
-  return 1;
-}
-
-// ── JIT engine guard ──────────────────────────────────────────────────────
-//
-// A host callback runs with the JIT engine off: a trace recorded inside it can
-// attempt argv2cdata on a lua_State* FFI argument (docs/src/bridge-design.md).
-// The counter is per owner state, so a nested callback (host -> guest -> host)
-// does not enable the engine again while an outer callback still runs. A NULL
-// counter keeps the plain behavior.
+/* ── JIT engine guard ────────────────────────────────────────────────────── */
 
 static void jit_guard_enter(lua_State *owner, int *depth) {
   if (depth == NULL) {
@@ -438,34 +873,248 @@ static void jit_guard_leave(lua_State *owner, int *depth) {
   }
 }
 
-// ── dispatch_callback ─────────────────────────────────────────────────────
+/* ── bound_call ──────────────────────────────────────────────────────────── */
+//
+// lua_CFunction returned by bridge.make_callable.
+//
+// Upvalue 1: lightuserdata   — guest lua_State*
+// Upvalue 2: integer         — guest registry ref for the function
+// Upvalue 3: table           — guestState (lua.State object)
+// Upvalue 4: integer         — registry ref for callGuestSlow
+// Upvalue 5: lightuserdata   — address of the owner's closed flag
+// Upvalue 6: integer         — registry ref for convertGuestResults
+//
+// One function per slot (bound_call_0..7): the slot is a compile-time
+// address, so the guest API table and registry index never depend on a value
+// read through an upvalue. That keeps slot 0 — where guest and host are the
+// same LuaJIT — at the same speed as the pre-slot bridge.
+
+enum {
+  BOUND_UV_GUEST = 1,
+  BOUND_UV_FNREF = 2,
+  BOUND_UV_STATE = 3,
+  BOUND_UV_SLOW = 4,
+  BOUND_UV_CLOSED = 5,
+  BOUND_UV_CONVERT = 6
+};
+
+BRIDGE_INLINE int bound_call_impl(lua_State *host, bridge_slot *slot,
+                                  int isHost) {
+  const bridge_guest_api *ga = &slot->api;
+  /* lua-sys sets this flag before lua_close. Check it FIRST: the guest
+   * pointer below dangles once the state is closed, so nothing may touch it
+   * before this test. NULL means the closure carries no flag. */
+  int *closed =
+      (int *)(intptr_t)lua_tointeger(host, lua_upvalueindex(BOUND_UV_CLOSED));
+  lua_State *guest;
+  int fn_ref, nargs, guest_base;
+
+  if (closed != NULL && *closed) {
+    return luaL_error(host, "state is closed");
+  }
+
+  guest = (lua_State *)lua_touserdata(host, lua_upvalueindex(BOUND_UV_GUEST));
+  fn_ref = (int)lua_tointeger(host, lua_upvalueindex(BOUND_UV_FNREF));
+  nargs = lua_gettop(host);
+  guest_base = guest_gettop(slot, guest, isHost);
+
+  /* Fast path: all args are primitives. */
+  int i;
+  int all_primitive = 1;
+  for (i = 1; i <= nargs; i++) {
+    if (!is_primitive_type(lua_type(host, i), NULL)) {
+      all_primitive = 0;
+      break;
+    }
+  }
+
+  if (!all_primitive) {
+    /* Slow path: delegate to callGuestSlow for Lua-side toLua() handling. */
+    int slow_ref = (int)lua_tointeger(host, lua_upvalueindex(BOUND_UV_SLOW));
+    lua_rawgeti(host, LUA_REGISTRYINDEX, slow_ref);
+    lua_pushvalue(host, lua_upvalueindex(BOUND_UV_STATE));
+    lua_pushinteger(host, fn_ref);
+    for (i = 1; i <= nargs; i++)
+      lua_pushvalue(host, i);
+    int status = lua_pcall(host, 2 + nargs, LUA_MULTRET, 0);
+    if (status != LUA_OK)
+      lua_error(host);
+    return lua_gettop(host) - nargs;
+  }
+
+  guest_rawgeti(slot, guest, slot->registry_index, fn_ref, isHost);
+
+  for (i = 1; i <= nargs; i++)
+    push_value_or_error(&host_api, host, i, slot, guest, isHost);
+
+  int status = guest_pcall(slot, guest, nargs, LUA_MULTRET, 0, isHost);
+  if (status != 0) {
+    const char *err = guest_tolstring(slot, guest, -1, NULL, isHost);
+    guest_settop(slot, guest, guest_base, isHost);
+    lua_pushstring(host, err ? err : "bridge: guest error");
+    lua_error(host);
+    return 0;
+  }
+
+  int nresults = guest_gettop(slot, guest, isHost) - guest_base;
+  if (nresults == 0)
+    return 0; /* guest stack already at guest_base */
+
+  int all_primitive_res = 1;
+  for (i = 0; i < nresults; i++) {
+    if (!is_primitive_type(guest_type(slot, guest, guest_base + 1 + i, isHost),
+                           slot)) {
+      all_primitive_res = 0;
+      break;
+    }
+  }
+
+  if (all_primitive_res) {
+    for (i = 0; i < nresults; i++)
+      push_value(ga, guest, guest_base + 1 + i, NULL, host, isHost);
+    guest_settop(slot, guest, guest_base, isHost);
+    return nresults;
+  }
+
+  /* A compound result: convert each result on the Lua side, from the guest
+   * stack. Do NOT call the guest function again — its side effects must
+   * happen one time. */
+  int convert_ref = (int)lua_tointeger(host, lua_upvalueindex(BOUND_UV_CONVERT));
+  lua_rawgeti(host, LUA_REGISTRYINDEX, convert_ref);
+  lua_pushvalue(host, lua_upvalueindex(BOUND_UV_STATE));
+  lua_pushinteger(host, guest_base + 1); /* first result index */
+  lua_pushinteger(host, nresults);
+  status = lua_pcall(host, 3, LUA_MULTRET, 0);
+  guest_settop(slot, guest, guest_base, isHost);
+  if (status != LUA_OK)
+    lua_error(host);
+  return lua_gettop(host) - nargs;
+}
+
+#define BRIDGE_DEFINE_BOUND(n)                                                \
+  static int bound_call_##n(lua_State *host) {                                \
+    return bound_call_impl(host, &g_slots[n], (n) == 0);                       \
+  }
+
+BRIDGE_DEFINE_BOUND(0)
+BRIDGE_DEFINE_BOUND(1)
+BRIDGE_DEFINE_BOUND(2)
+BRIDGE_DEFINE_BOUND(3)
+BRIDGE_DEFINE_BOUND(4)
+BRIDGE_DEFINE_BOUND(5)
+BRIDGE_DEFINE_BOUND(6)
+BRIDGE_DEFINE_BOUND(7)
+
+static lua_CFunction g_bound[BRIDGE_MAX_SLOTS] = {
+    bound_call_0, bound_call_1, bound_call_2, bound_call_3,
+    bound_call_4, bound_call_5, bound_call_6, bound_call_7};
+
+/* ── bound_pcall ─────────────────────────────────────────────────────────── */
+
+static int bound_pcall(lua_State *host) {
+  int nargs = lua_gettop(host) - 1; /* exclude self */
+  int status = lua_pcall(host, nargs, LUA_MULTRET, 0);
+  if (status != LUA_OK) { /* [err] */
+    lua_pushboolean(host, 0);
+    lua_insert(host, 1); /* [false, err] */
+    return 2;
+  }
+  int nresults = lua_gettop(host); /* [r1..rM] */
+  lua_pushboolean(host, 1);
+  lua_insert(host, 1); /* [true, r1..rM] */
+  return nresults + 1;
+}
+
+static char callable_mt_key;
+
+static void init_callable_metatable(lua_State *L);
+
+/* Lightuserdata tag prefixing guest table registry refs. */
+static char compound_tag_key;
+
+static int bridge_compound_tag(lua_State *L) {
+  lua_pushlightuserdata(L, (void *)&compound_tag_key);
+  return 1;
+}
+
+static void *decode_host_ptr(lua_State *L, int idx) {
+  int t = lua_type(L, idx);
+  if (t == LUA_TLIGHTUSERDATA)
+    return lua_touserdata(L, idx);
+  if (t == LUA_TCDATA)
+    return decode_cdata_value(L, idx);
+  if (t == LUA_TNUMBER)
+    return (void *)(intptr_t)lua_tointeger(L, idx);
+  return NULL;
+}
+
+static int bridge_make_callable(lua_State *L) {
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *slot = slot_at(L, args.slot);
+  lua_State *guest = decode_guest_ptr(L, args.first);
+  void *closed = decode_host_ptr(L, args.first + 4);
+  (void)slot;
+  lua_pushlightuserdata(L, (void *)guest); /* upvalue 1: guest */
+  lua_pushvalue(L, args.first + 1);        /* upvalue 2: guestRef */
+  lua_pushvalue(L, args.first + 2);        /* upvalue 3: guestState */
+  lua_pushvalue(L, args.first + 3);        /* upvalue 4: callGuestSlow ref */
+  lua_pushinteger(L, (lua_Integer)(intptr_t)closed); /* upvalue 5 */
+  lua_pushvalue(L, args.first + 5);        /* upvalue 6: result converter */
+  lua_pushcclosure(L, g_bound[args.slot], 6); /* the callable */
+  lua_pushlightuserdata(L, (void *)&callable_mt_key);
+  lua_rawget(L, LUA_REGISTRYINDEX);
+  if (lua_isnil(L, -1)) {
+    lua_pop(L, 1);
+    init_callable_metatable(L);
+    lua_pushlightuserdata(L, (void *)&callable_mt_key);
+    lua_rawget(L, LUA_REGISTRYINDEX);
+  }
+  lua_setmetatable(L, -2);
+  return 1;
+}
+
+static void init_callable_metatable(lua_State *L) {
+  lua_createtable(L, 0, 1); /* mt */
+  lua_createtable(L, 0, 1); /* methods */
+  lua_pushcclosure(L, bound_pcall, 0);
+  lua_setfield(L, -2, "pcall");   /* methods.pcall = bound_pcall */
+  lua_setfield(L, -2, "__index"); /* mt.__index = methods */
+  lua_pushlightuserdata(L, (void *)&callable_mt_key);
+  lua_pushvalue(L, -2);             /* [mt, key, mt] */
+  lua_rawset(L, LUA_REGISTRYINDEX); /* registry[key] = mt */
+  lua_pop(L, 1);
+}
+
+/* ── dispatch_callback ───────────────────────────────────────────────────── */
 //
 // lua_CFunction installed on the guest state via bridge.push_callback.
-// Upvalue 1: integer — registry ref for the callback function.
-// Upvalue 2: integer — registry ref for the slow-path helper
-//            (dispatchCallbackSlow), used when any argument is a table.
-// Upvalue 3: lightuserdata — the owner state whose registry holds the two
-//            refs above (the state that called bridge.push_callback).
-//
-// The owner's stack must be fully restored on every exit path to avoid
-// corrupting nested guest→host→guest→host call chains.
+// Upvalue 1: integer       — guest registry ref for the callback function
+// Upvalue 2: integer       — guest registry ref for the slow-path helper
+// Upvalue 3: lightuserdata — the owner state holding the two refs
+// Upvalue 4: pointer       — JIT depth counter (lightuserdata on Luau)
+// Upvalue 5: pointer       — chain depth box (lightuserdata on Luau)
 
-// The body returns -1 when the error message is on the guest stack. It never
-// raises, so the chain guard of the caller always restores its counter.
-static int dispatch_callback_body(lua_State *guest) {
-  int fn_ref = (int)lua_tointeger(guest, lua_upvalueindex(1));
-  int slow_ref = (int)lua_tointeger(guest, lua_upvalueindex(2));
-  lua_State *owner = (lua_State *)lua_touserdata(guest, lua_upvalueindex(3));
+/* The body returns -1 when the error message is on the guest stack. It never
+ * raises, so the chain guard of the caller always restores its counter. */
+BRIDGE_INLINE int dispatch_callback_body(bridge_slot *s, lua_State *guest,
+                                         int isHost) {
+  const bridge_guest_api *ga = &s->api;
+  int fn_ref = (int)guest_tointeger(s, guest, guest_upvalue(s, 1, isHost),
+                                    isHost);
+  int slow_ref = (int)guest_tointeger(s, guest, guest_upvalue(s, 2, isHost),
+                                      isHost);
+  lua_State *owner = (lua_State *)guest_touserdata(
+      s, guest, guest_upvalue(s, 3, isHost), isHost);
   int saved_top = lua_gettop(owner);
-  int nargs = lua_gettop(guest);
+  int nargs = guest_gettop(s, guest, isHost);
   int i;
 
   /* Fast path: all args are primitives. */
   int all_primitive = 1;
   for (i = 1; i <= nargs; i++) {
-    int t = lua_type(guest, i);
-    if (t != LUA_TNIL && t != LUA_TBOOLEAN && t != LUA_TNUMBER &&
-        t != LUA_TSTRING) {
+    if (!is_primitive_type(guest_type(s, guest, i, isHost),
+                           isHost ? NULL : s)) {
       all_primitive = 0;
       break;
     }
@@ -474,53 +1123,54 @@ static int dispatch_callback_body(lua_State *guest) {
   int n_sent;
   if (!all_primitive) {
     /* Slow path: dispatchCallbackSlow(guest, fn, args...) — table args
-     * cross as (TAG, guest_registry_ref) pairs so the Lua side can wrap
-     * them in lua.Table proxies. */
+     * cross as (TAG, guest_registry_ref) pairs. */
     lua_rawgeti(owner, LUA_REGISTRYINDEX, slow_ref);
     lua_pushlightuserdata(owner, (void *)guest);
     lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref);
     n_sent = 2;
     for (i = 1; i <= nargs; i++) {
-      if (lua_type(guest, i) == LUA_TTABLE) {
-        lua_pushvalue(guest, i);
-        int ref = luaL_ref(guest, LUA_REGISTRYINDEX);
+      if (guest_type(s, guest, i, isHost) ==
+          (isHost ? LUA_TTABLE : s->t_table)) {
+        guest_pushvalue(s, guest, i, isHost);
+        int ref = slot_ref_top(s, guest);
         lua_pushlightuserdata(owner, (void *)&compound_tag_key);
         lua_pushinteger(owner, ref);
         n_sent += 2;
       } else {
-        push_primitive_or_error(guest, i, owner);
+        push_value_or_error(ga, guest, i, NULL, owner, isHost);
         n_sent += 1;
       }
     }
   } else {
     lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref);
     for (i = 1; i <= nargs; i++)
-      push_primitive_or_error(guest, i, owner);
+      push_value_or_error(ga, guest, i, NULL, owner, isHost);
     n_sent = nargs;
   }
 
-  int *depth = (int *)(intptr_t)lua_tointeger(guest, lua_upvalueindex(4));
+  int *depth = (int *)guest_read_ptr(s, guest, guest_upvalue(s, 4, isHost),
+                                     isHost);
   jit_guard_enter(owner, depth);
   int status = lua_pcall(owner, n_sent, LUA_MULTRET, 0);
   jit_guard_leave(owner, depth);
 
   if (status != LUA_OK) {
     const char *err = lua_tostring(owner, -1);
-    lua_pushstring(guest, err ? err : "bridge: host error");
+    guest_pushstring(s, guest, err ? err : "bridge: host error", isHost);
     lua_settop(owner, saved_top);
     return -1;
   }
 
   int nresults = lua_gettop(owner) - saved_top;
   if (nresults == 0)
-    return 0; /* owner stack already at saved_top */
+    return 0;
 
   for (i = 0; i < nresults; i++) {
-    int t = push_primitive_typed(owner, saved_top + 1 + i, guest);
+    int t = push_value(&host_api, owner, saved_top + 1 + i, s, guest, isHost);
     if (t < 0) {
       lua_settop(owner, saved_top);
-      lua_settop(guest, 0);
-      lua_pushfstring(guest,
+      guest_settop(s, guest, 0, isHost);
+      ga->pushfstring(guest,
                       "bridge: host callback returned a %s; "
                       "only primitives (nil, boolean, number, string) "
                       "can be returned from host to guest",
@@ -533,102 +1183,62 @@ static int dispatch_callback_body(lua_State *guest) {
   return nresults;
 }
 
-// Guest -> host dispatch, with the chain guard.
-//
-// Every level of a nested host <-> guest chain passes through this function, so
-// its counter is the depth of the chain. Each level costs C stack, and a chain
-// that is too deep stops the process: deepen it inside a tail call on the guest
-// side and the guest Lua stack stays flat, so only the C stack grows. The
-// counter belongs to the guest state (upvalue 5): box[0] is the current depth
-// and box[1] is the limit (0 = no limit).
-static int dispatch_callback(lua_State *guest) {
-  int *box = (int *)(intptr_t)lua_tointeger(guest, lua_upvalueindex(5));
+/* Guest -> host dispatch, with the chain guard. Inlined into each per-slot
+ * trampoline so the slot address is a compile-time constant. */
+BRIDGE_INLINE int dispatch_callback_common(bridge_slot *s, lua_State *guest,
+                                           int isHost) {
+  const bridge_guest_api *ga = &s->api;
+  int *box = (int *)guest_read_ptr(s, guest, guest_upvalue(s, 5, isHost),
+                                   isHost);
   if (box == NULL) {
-    int n = dispatch_callback_body(guest);
+    int n = dispatch_callback_body(s, guest, isHost);
     if (n < 0)
-      lua_error(guest);
+      guest_error(s, guest, isHost);
     return n;
   }
 
   if (box[1] > 0 && box[0] >= box[1]) {
-    lua_pushfstring(
+    ga->pushfstring(
         guest,
         "bridge: the cross-state call chain reached its limit of %d levels "
         "(state:setChainLimit)",
         box[1]);
-    lua_error(guest);
+    guest_error(s, guest, isHost);
     return 0;
   }
 
   box[0]++;
-  int n = dispatch_callback_body(guest);
+  int n = dispatch_callback_body(s, guest, isHost);
   box[0]--;
   if (n < 0)
-    lua_error(guest);
+    guest_error(s, guest, isHost);
   return n;
 }
 
-// ── Exported functions ────────────────────────────────────────────────────
+#define BRIDGE_DEFINE_DISPATCH(n)                                             \
+  static int dispatch_callback_##n(lua_State *guest) {                        \
+    return dispatch_callback_common(&g_slots[n], guest, (n) == 0);            \
+  }
 
-// Stores the function in the CALLING state's registry, marks it
-// LUAJIT_MODE_FUNC|OFF so the JIT never compiles it (prevents argv2cdata on
-// lua_State* cdata args in FFI calls made by the callback — see
-// docs/bridge-design.md), and returns the ref id. Every state is
-// self-contained: the ref lands in L's own registry, and the dispatch
-// closures that consume it carry L (the owner) explicitly.
-static int bridge_register(lua_State *L) {
-  luaL_checktype(L, 1, LUA_TFUNCTION);
-  lua_pushvalue(L, 1);
-  luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
-  int id = luaL_ref(L, LUA_REGISTRYINDEX);
-  lua_pushinteger(L, id);
-  return 1;
-}
+BRIDGE_DEFINE_DISPATCH(0)
+BRIDGE_DEFINE_DISPATCH(1)
+BRIDGE_DEFINE_DISPATCH(2)
+BRIDGE_DEFINE_DISPATCH(3)
+BRIDGE_DEFINE_DISPATCH(4)
+BRIDGE_DEFINE_DISPATCH(5)
+BRIDGE_DEFINE_DISPATCH(6)
+BRIDGE_DEFINE_DISPATCH(7)
 
-// Pushes a dispatch_callback closure onto the guest state as a real
-// lua_CFunction (not FFI cdata), preventing JIT tracing into the host.
-// L is the OWNER: the state whose registry holds fn_ref/slow_ref. The owner
-// is baked into the closure as upvalue 3 so dispatch_callback can reach the
-// registrations without a process-global state pointer.
-static int bridge_push_callback(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
-  int fn_ref = (int)lua_tointeger(L, 2);
-  int slow_ref = (int)lua_tointeger(L, 3);
-  lua_pushinteger(guest, fn_ref);
-  lua_pushinteger(guest, slow_ref);
-  lua_pushlightuserdata(guest, (void *)L); /* upvalue 3: owner */
-  lua_pushinteger(guest,
-                  lua_tointeger(L, 4)); /* upvalue 4: JIT depth counter */
-  lua_pushinteger(guest, lua_tointeger(L, 5)); /* upvalue 5: chain depth box */
-  lua_pushcclosure(guest, dispatch_callback, 5);
-  return 0;
-}
+static lua_CFunction g_dispatch[BRIDGE_MAX_SLOTS] = {
+    dispatch_callback_0, dispatch_callback_1, dispatch_callback_2,
+    dispatch_callback_3, dispatch_callback_4, dispatch_callback_5,
+    dispatch_callback_6, dispatch_callback_7};
 
-static int bridge_unregister(lua_State *L) {
-  int fn_ref = (int)lua_tointeger(L, 1);
-  luaL_unref(L, LUA_REGISTRYINDEX, fn_ref);
-  return 0;
-}
-
-// ── Debug hooks ───────────────────────────────────────────────────────────
-//
-// High-level counterpart to lua_sethook: the hook fires on the guest state
-// while guest code runs, and dispatches to a callback function stored in the
-// OWNER state's registry (the state that installed the hook) — the same
-// owner↔guest pattern as dispatch_callback. A lua_Hook is a plain C function
-// pointer with no upvalues, so the callback ref AND the owner pointer are
-// parked in the guest registry under private keys that the hook looks up on
-// every event.
+/* ── Debug hooks ─────────────────────────────────────────────────────────── */
 
 static char hook_registry_key;
 static char hook_meta_key;
 static char hook_owner_key;
-
-/* Host-side lua.Frame class, registered via bridge.set_frame_meta; applied as
- * the metatable of every frame returned by info:stack() so Frame methods
- * (locals, getLocal, setLocal, eval, ...) resolve through __index. Stored per
- * state under a lightuserdata registry key — not a process-global ref —
- * because a dlopen'd copy of bridge.so may be shared by many states. */
 static char frame_meta_key;
 
 static int hook_info_stack(lua_State *L);
@@ -652,80 +1262,90 @@ static const char *hook_event_name(int event) {
   }
 }
 
-// lua_Hook installed on the guest state by bridge_set_hook.
-//
-// The info table handed to the host callback carries every debug field
-// (name, what, source, short_src, currentline, ...), `event`, `thread`, and
-// a shared metatable providing info:stack(). The `_hook_active` flag is
-// cleared when this function returns so a stored info table's stack() —
-// which needs the guest thread paused at the hook — refuses instead of
-// walking a stale stack.
-static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
-  /* Locate the callback ref AND the owner state stored by bridge_set_hook. */
-  lua_pushlightuserdata(guest, (void *)&hook_registry_key);
-  lua_rawget(guest, LUA_REGISTRYINDEX);
-  if (lua_isnil(guest, -1)) {
-    lua_pop(guest, 1);
+/* lua_Hook installed on a guest state by bridge.set_hook. The event hint is
+ * used by Luau, whose lua_Debug has no event field (debugstep = line,
+ * interrupt = count); other ABIs read their native ar->event. */
+static void hook_dispatch_common(bridge_slot *s, lua_State *guest,
+                                 void *hook_ar, int event_hint) {
+  const bridge_guest_api *ga = &s->api;
+  bridge_debug_ar native_ar;
+  bridge_debug dbg;
+
+  /* Locate the callback ref and owner stored by bridge.set_hook. */
+  slot_pushlightuserdata(s, guest, (void *)&hook_registry_key);
+  ga->rawget(guest, s->registry_index);
+  if (ga->type(guest, -1) != LUA_TNUMBER) {
+    ga->settop(guest, -2);
     return; /* hook removed between events — no-op */
   }
-  int fn_ref = (int)lua_tointeger(guest, -1);
-  lua_pop(guest, 1);
+  int fn_ref = (int)slot_tointeger(s, guest, -1);
+  ga->settop(guest, -2);
 
-  lua_pushlightuserdata(guest, (void *)&hook_owner_key);
-  lua_rawget(guest, LUA_REGISTRYINDEX);
-  if (lua_type(guest, -1) != LUA_TLIGHTUSERDATA) {
-    lua_pop(guest, 1);
+  slot_pushlightuserdata(s, guest, (void *)&hook_owner_key);
+  ga->rawget(guest, s->registry_index);
+  if (ga->type(guest, -1) != LUA_TLIGHTUSERDATA) {
+    ga->settop(guest, -2);
     return; /* stale hook entry without an owner — no-op */
   }
-  lua_State *owner = (lua_State *)lua_touserdata(guest, -1);
-  lua_pop(guest, 1);
+  lua_State *owner = (lua_State *)ga->touserdata(guest, -1);
+  ga->settop(guest, -2);
+
+  memset(&native_ar, 0, sizeof(native_ar));
+  if (s->abi == BRIDGE_ABI_LUAU) {
+    ga->getinfo_level(guest, 0, "sln", &native_ar);
+    slot_debug_read(s, &native_ar,
+                    event_hint != 0 ? event_hint : LUA_HOOKLINE, &dbg);
+  } else {
+    ga->getinfo_native(guest, "Sln", hook_ar);
+    slot_debug_read(s, hook_ar, event_hint, &dbg);
+  }
 
   int saved_top = lua_gettop(owner);
 
   /* Arg 1: event name. */
-  lua_pushstring(owner, hook_event_name(ar->event));
+  lua_pushstring(owner, hook_event_name(dbg.event));
 
   /* Arg 2: info table with all debug fields populated eagerly. */
-  lua_getinfo(guest, "Sln", ar);
   lua_createtable(owner, 0, 12);
-  lua_pushstring(owner, hook_event_name(ar->event));
+  lua_pushstring(owner, hook_event_name(dbg.event));
   lua_setfield(owner, -2, "event");
-  if (ar->name) {
-    lua_pushstring(owner, ar->name);
+  if (dbg.name) {
+    lua_pushstring(owner, dbg.name);
     lua_setfield(owner, -2, "name");
   }
-  if (ar->namewhat) {
-    lua_pushstring(owner, ar->namewhat);
+  if (dbg.namewhat) {
+    lua_pushstring(owner, dbg.namewhat);
     lua_setfield(owner, -2, "namewhat");
   }
-  if (ar->what) {
-    lua_pushstring(owner, ar->what);
+  if (dbg.what) {
+    lua_pushstring(owner, dbg.what);
     lua_setfield(owner, -2, "what");
   }
-  if (ar->source) {
-    lua_pushstring(owner, ar->source);
+  if (dbg.source) {
+    lua_pushstring(owner, dbg.source);
     lua_setfield(owner, -2, "source");
   }
-  lua_pushstring(owner, ar->short_src);
-  lua_setfield(owner, -2, "short_src");
-  lua_pushinteger(owner, ar->currentline);
+  if (dbg.short_src) {
+    lua_pushstring(owner, dbg.short_src);
+    lua_setfield(owner, -2, "short_src");
+  }
+  lua_pushinteger(owner, dbg.currentline);
   lua_setfield(owner, -2, "currentline");
-  lua_pushinteger(owner, ar->linedefined);
+  lua_pushinteger(owner, dbg.linedefined);
   lua_setfield(owner, -2, "linedefined");
-  lua_pushinteger(owner, ar->lastlinedefined);
+  lua_pushinteger(owner, dbg.lastlinedefined);
   lua_setfield(owner, -2, "lastlinedefined");
-  lua_pushinteger(owner, ar->nups);
+  lua_pushinteger(owner, dbg.nups);
   lua_setfield(owner, -2, "nups");
+  lua_pushinteger(owner, (lua_Integer)(s - g_slots));
+  lua_setfield(owner, -2, "_slot");
 
-  /* The thread the hook fired on — the guest main thread, or a coroutine
-   * running inside it. */
+  /* The thread the hook fired on. */
   lua_pushlightuserdata(owner, (void *)guest);
   lua_setfield(owner, -2, "thread");
   lua_pushboolean(owner, 1);
   lua_setfield(owner, -2, "_hook_active");
 
-  /* Shared metatable providing info:stack() — ensure it exists in the
-   * owner's registry (the .so image may be shared by many states). */
   lua_pushlightuserdata(owner, (void *)&hook_meta_key);
   lua_rawget(owner, LUA_REGISTRYINDEX);
   if (lua_isnil(owner, -1)) {
@@ -735,40 +1355,60 @@ static void hook_dispatch(lua_State *guest, lua_Debug *ar) {
     lua_rawget(owner, LUA_REGISTRYINDEX);
   }
   lua_setmetatable(owner, -2);
-  int info_idx = lua_gettop(owner); /* info table stays put through pcall */
+  int info_idx = lua_gettop(owner);
 
-  lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref); /* callback fn */
-  lua_pushvalue(owner, -3);                      /* event */
-  lua_pushvalue(owner, -3);                      /* info table */
+  lua_rawgeti(owner, LUA_REGISTRYINDEX, fn_ref);
+  lua_pushvalue(owner, -3); /* event */
+  lua_pushvalue(owner, -3); /* info table */
 
   luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
   int status = lua_pcall(owner, 2, 0, 0);
   luaJIT_setmode(owner, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
-  /* The hook's ar is about to go out of scope — invalidate the info table
-   * so a stored info:stack() refuses instead of walking a stale stack. */
   lua_pushstring(owner, "_hook_active");
   lua_pushboolean(owner, 0);
   lua_rawset(owner, info_idx);
 
   if (status != LUA_OK) {
-    /* A hook that raises aborts the running guest code with that error. */
     const char *err = lua_tostring(owner, -1);
-    lua_pushstring(guest, err ? err : "bridge: hook error");
+    ga->pushstring(guest, err ? err : "bridge: hook error");
     lua_settop(owner, saved_top);
-    lua_error(guest);
-    return; /* unreachable: lua_error longjmps */
+    ga->error_(guest);
+    return;
   }
   lua_settop(owner, saved_top);
 }
 
-// info:stack() — walk the stack of the thread the hook fired on (level 0 =
-// the frame the hook fired in), returning an array of lua.Frame objects,
-// each with the debug fields plus thread/level and the Frame metatable so
-// the host can read/write locals and upvalues and eval in the frame. Must
-// be called from within the hook callback while the thread is paused.
+#define BRIDGE_DEFINE_HOOKS(n)                                                \
+  static void hook_dispatch_##n(lua_State *guest, void *ar) {                 \
+    hook_dispatch_common(&g_slots[n], guest, ar, 0);                          \
+  }                                                                           \
+  static void luau_interrupt_##n(lua_State *guest, int gc) {                  \
+    (void)gc;                                                                 \
+    hook_dispatch_common(&g_slots[n], guest, NULL, LUA_HOOKCOUNT);            \
+  }
+
+BRIDGE_DEFINE_HOOKS(0)
+BRIDGE_DEFINE_HOOKS(1)
+BRIDGE_DEFINE_HOOKS(2)
+BRIDGE_DEFINE_HOOKS(3)
+BRIDGE_DEFINE_HOOKS(4)
+BRIDGE_DEFINE_HOOKS(5)
+BRIDGE_DEFINE_HOOKS(6)
+BRIDGE_DEFINE_HOOKS(7)
+
+typedef void (*bridge_hook_fn)(lua_State *, void *);
+typedef void (*bridge_interrupt_fn)(lua_State *, int);
+
+static bridge_hook_fn g_hooks[BRIDGE_MAX_SLOTS] = {
+    hook_dispatch_0, hook_dispatch_1, hook_dispatch_2, hook_dispatch_3,
+    hook_dispatch_4, hook_dispatch_5, hook_dispatch_6, hook_dispatch_7};
+static bridge_interrupt_fn g_interrupts[BRIDGE_MAX_SLOTS] = {
+    luau_interrupt_0, luau_interrupt_1, luau_interrupt_2, luau_interrupt_3,
+    luau_interrupt_4, luau_interrupt_5, luau_interrupt_6, luau_interrupt_7};
+
+/* info:stack() — walk the stack of the thread the hook fired on. */
 static int hook_info_stack(lua_State *L) {
-  /* Refuse once the hook has returned (thread may have moved on). */
   lua_pushstring(L, "_hook_active");
   lua_rawget(L, 1);
   int active = lua_toboolean(L, -1);
@@ -781,58 +1421,69 @@ static int hook_info_stack(lua_State *L) {
   }
 
   lua_pushstring(L, "thread");
-  lua_rawget(L, 1); /* self.thread — lightuserdata of the guest lua_State */
+  lua_rawget(L, 1);
   lua_State *guest = (lua_State *)lua_touserdata(L, -1);
   lua_pop(L, 1);
 
+  lua_pushstring(L, "_slot");
+  lua_rawget(L, 1);
+  int slot_index = (int)lua_tointeger(L, -1);
+  lua_pop(L, 1);
+  if (slot_index < 0 || slot_index >= BRIDGE_MAX_SLOTS ||
+      !g_slots[slot_index].used) {
+    lua_pushstring(L, "bridge: hook info lost its runtime slot");
+    lua_error(L);
+    return 0;
+  }
+  bridge_slot *s = &g_slots[slot_index];
+
   lua_createtable(L, 8, 0);
   if (guest == NULL)
-    return 1; /* defensive: no thread — empty trace */
+    return 1;
   int level = 0;
   for (;;) {
-    lua_Debug ar;
-    if (!lua_getstack(guest, level, &ar))
+    bridge_debug_ar ar;
+    bridge_debug dbg;
+    memset(&ar, 0, sizeof(ar));
+    if (!slot_getstack(s, guest, level, &ar))
       break;
-    lua_getinfo(guest, "Slnu", &ar);
+    slot_getinfo(s, guest, level, "Slnu", &ar);
+    slot_debug_read(s, &ar, 0, &dbg);
     lua_createtable(L, 0, 12);
-    if (ar.name) {
-      lua_pushstring(L, ar.name);
+    if (dbg.name) {
+      lua_pushstring(L, dbg.name);
       lua_setfield(L, -2, "name");
     }
-    if (ar.namewhat) {
-      lua_pushstring(L, ar.namewhat);
+    if (dbg.namewhat) {
+      lua_pushstring(L, dbg.namewhat);
       lua_setfield(L, -2, "namewhat");
     }
-    if (ar.what) {
-      lua_pushstring(L, ar.what);
+    if (dbg.what) {
+      lua_pushstring(L, dbg.what);
       lua_setfield(L, -2, "what");
     }
-    if (ar.source) {
-      lua_pushstring(L, ar.source);
+    if (dbg.source) {
+      lua_pushstring(L, dbg.source);
       lua_setfield(L, -2, "source");
     }
-    lua_pushstring(L, ar.short_src);
-    lua_setfield(L, -2, "short_src");
-    lua_pushinteger(L, ar.currentline);
+    if (dbg.short_src) {
+      lua_pushstring(L, dbg.short_src);
+      lua_setfield(L, -2, "short_src");
+    }
+    lua_pushinteger(L, dbg.currentline);
     lua_setfield(L, -2, "currentline");
-    lua_pushinteger(L, ar.linedefined);
+    lua_pushinteger(L, dbg.linedefined);
     lua_setfield(L, -2, "linedefined");
-    lua_pushinteger(L, ar.lastlinedefined);
+    lua_pushinteger(L, dbg.lastlinedefined);
     lua_setfield(L, -2, "lastlinedefined");
-    lua_pushinteger(L, ar.nups);
+    lua_pushinteger(L, dbg.nups);
     lua_setfield(L, -2, "nups");
     lua_pushlightuserdata(L, (void *)guest);
     lua_setfield(L, -2, "thread");
     lua_pushinteger(L, level);
     lua_setfield(L, -2, "level");
-    /* Keep the info table on the frame: it clears _hook_active when the
-     * hook returns, so a stale frame can refuse before it touches the
-     * guest thread. */
     lua_pushvalue(L, 1);
     lua_setfield(L, -2, "_info");
-    /* Attach the host-side lua.Frame class (registered via
-     * bridge.set_frame_meta in this state's registry) so Frame methods
-     * resolve via __index. */
     lua_pushlightuserdata(L, (void *)&frame_meta_key);
     lua_rawget(L, LUA_REGISTRYINDEX);
     if (!lua_isnil(L, -1)) {
@@ -846,8 +1497,6 @@ static int hook_info_stack(lua_State *L) {
   return 1;
 }
 
-// __index for hook info tables: provides info:stack(). All debug fields are
-// populated eagerly, so only the method lookup takes this path.
 static int hook_info_index(lua_State *L) {
   const char *key = lua_tostring(L, 2);
   if (key && strcmp(key, "stack") == 0) {
@@ -857,12 +1506,6 @@ static int hook_info_index(lua_State *L) {
   return 0;
 }
 
-// Build the shared metatable providing `info:stack()` on every hook info
-// table and park it in a state's registry under a lightuserdata key (same
-// pattern as init_callable_metatable), so hook_dispatch only pays a
-// rawget + setmetatable per event. Called from luaopen (for the opening
-// state) and lazily from hook_dispatch (for every other state that shares
-// the same dlopen'd copy).
 static void init_hook_info_metatable(lua_State *L) {
   lua_createtable(L, 0, 1); /* mt */
   lua_pushcclosure(L, hook_info_index, 0);
@@ -873,59 +1516,87 @@ static void init_hook_info_metatable(lua_State *L) {
   lua_pop(L, 1);
 }
 
-// Stores the callback ref in the guest registry — together with the OWNER
-// state (L, whose registry holds the actual callback function) — and
-// installs hook_dispatch as the guest's debug hook.
-//
-// LuaJIT only fires debug hooks from the interpreter — code compiled to
-// traces never dispatches through the hook. To make hooks reliable we
-// unpatch any existing traces and disable the JIT engine for as long as the
-// hook is installed; bridge_remove_hook re-enables it.
+/* Install the per-slot trampoline. Luau has no lua_sethook: line hooks use
+ * the debugstep callback + singlestep, count hooks use the interrupt
+ * callback; call/return events cannot be emulated. */
 static int bridge_set_hook(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
-  int fn_ref = (int)lua_tointeger(L, 2);
-  int mask = (int)lua_tointeger(L, 3);
-  int count = (int)lua_tointeger(L, 4);
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  const bridge_guest_api *ga = &s->api;
+  lua_State *guest = decode_guest_ptr(L, args.first);
+  int fn_ref = (int)lua_tointeger(L, args.first + 1);
+  int mask = (int)lua_tointeger(L, args.first + 2);
+  int count = (int)lua_tointeger(L, args.first + 3);
 
-  lua_pushlightuserdata(guest, (void *)&hook_registry_key);
-  lua_pushinteger(guest, fn_ref);
-  lua_rawset(guest, LUA_REGISTRYINDEX);
+  if (s->abi == BRIDGE_ABI_LUAU &&
+      (mask & (LUA_MASKCALL | LUA_MASKRET)) != 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "set_hook: call/return hooks are not supported by Luau");
+    return 2;
+  }
 
-  lua_pushlightuserdata(guest, (void *)&hook_owner_key);
-  lua_pushlightuserdata(guest, (void *)L);
-  lua_rawset(guest, LUA_REGISTRYINDEX);
+  slot_pushlightuserdata(s, guest, (void *)&hook_registry_key);
+  slot_pushinteger(s, guest, fn_ref);
+  ga->rawset(guest, s->registry_index);
 
-  lua_sethook(guest, hook_dispatch, mask, count);
-  luaJIT_setmode(guest, 0,
-                 LUAJIT_MODE_ENGINE | LUAJIT_MODE_FLUSH); /* unpatch traces */
-  luaJIT_setmode(guest, 0,
-                 LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF); /* stop compilation */
-  return 0;
+  slot_pushlightuserdata(s, guest, (void *)&hook_owner_key);
+  slot_pushlightuserdata(s, guest, (void *)L);
+  ga->rawset(guest, s->registry_index);
+
+  if (s->abi == BRIDGE_ABI_LUAU) {
+    bridge_luau_callbacks *cb = ga->callbacks(guest);
+    int line = (mask & LUA_MASKLINE) != 0;
+    int counter = (mask & LUA_MASKCOUNT) != 0;
+    int slot_index = (int)(s - g_slots);
+    if (cb != NULL) {
+      cb->debugstep = line ? g_hooks[slot_index] : NULL;
+      cb->interrupt = counter ? g_interrupts[slot_index] : NULL;
+    }
+    ga->singlestep(guest, line ? 1 : 0);
+  } else {
+    int slot_index = (int)(s - g_slots);
+    ga->sethook(guest, g_hooks[slot_index], mask, count);
+    if (ga->setmode != NULL) {
+      ga->setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_FLUSH);
+      ga->setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    }
+  }
+  lua_pushboolean(L, 1);
+  return 1;
 }
 
-// Removes the debug hook, drops the stored callback ref and owner, and
-// re-enables the JIT engine that bridge_set_hook turned off.
 static int bridge_remove_hook(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  const bridge_guest_api *ga = &s->api;
+  lua_State *guest = decode_guest_ptr(L, args.first);
 
-  lua_pushlightuserdata(guest, (void *)&hook_registry_key);
-  lua_pushnil(guest);
-  lua_rawset(guest, LUA_REGISTRYINDEX);
+  slot_pushlightuserdata(s, guest, (void *)&hook_registry_key);
+  ga->pushnil(guest);
+  ga->rawset(guest, s->registry_index);
 
-  lua_pushlightuserdata(guest, (void *)&hook_owner_key);
-  lua_pushnil(guest);
-  lua_rawset(guest, LUA_REGISTRYINDEX);
+  slot_pushlightuserdata(s, guest, (void *)&hook_owner_key);
+  ga->pushnil(guest);
+  ga->rawset(guest, s->registry_index);
 
-  lua_sethook(guest, NULL, 0, 0);
-  luaJIT_setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
-  return 0;
+  if (s->abi == BRIDGE_ABI_LUAU) {
+    bridge_luau_callbacks *cb = ga->callbacks(guest);
+    if (cb != NULL) {
+      cb->debugstep = NULL;
+      cb->interrupt = NULL;
+    }
+    ga->singlestep(guest, 0);
+  } else {
+    ga->sethook(guest, NULL, 0, 0);
+    if (ga->setmode != NULL)
+      ga->setmode(guest, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+  }
+  lua_pushboolean(L, 1);
+  return 1;
 }
 
-// Stores the host-side lua.Frame class table as the metatable for frames
-// returned by info:stack(), so Frame methods resolve via __index. Called by
-// init.lua at module load in every state that loads lua-sys; stored in the
-// calling state's own registry (a dlopen'd copy of bridge.so may be shared
-// by many states, so a process-global ref would point at the wrong registry).
 static int bridge_set_frame_meta(lua_State *L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   lua_pushlightuserdata(L, (void *)&frame_meta_key);
@@ -934,35 +1605,29 @@ static int bridge_set_frame_meta(lua_State *L) {
   return 0;
 }
 
-// Returns the new state as a lightuserdata so no lua_State* cdata crosses
-// the call boundary — safe to call from within a guest callback.
-// ── Memory accounting ─────────────────────────────────────────────────────
-//
-// Every guest state counts its own allocations, so the host can read the usage
-// and set a hard cap. box->used is the bytes in use, box->limit is the cap
-// (0 = no cap).
-//
-// The box is allocated here, in C, and stashed in the guest's registry as a
-// lightuserdata, so no pointer ever crosses the Lua boundary as a number: a
-// pointer carried through a Lua number is rounded to a double above 2^53 and
-// comes back corrupted. The box lives exactly as long as the guest state — it
-// is freed by bridge_close_state.
+/* ── Memory accounting ───────────────────────────────────────────────────── */
 
-/* Registry key under which the guest state's mem_box is stored. */
 static const char mem_box_key = 0;
 
-/* The state is created with luaL_newstate(), i.e. with LuaJIT's own allocator,
- * and the counting allocator wraps that one. Blocks keep coming from the
- * allocator that already knows LuaJIT's rules — notably the 47-bit GC64
- * pointer space, where a plain malloc() block above the limit makes
- * lua_newstate() refuse the state (the ARM64 CI crash) — while the wrapper
- * only counts bytes and enforces the cap. */
 typedef struct {
   int64_t used;        /* bytes in use */
   int64_t limit;       /* cap, 0 = none */
-  lua_Alloc old_alloc; /* the wrapped allocator (LuaJIT's own) */
+  lua_Alloc old_alloc; /* the wrapped allocator */
   void *old_ud;        /* its context */
 } mem_box;
+
+/* Plain allocator used when the runtime has no allocator to wrap (Luau has
+ * lua_getallocf but no lua_setallocf; its lua_newstate takes the allocator
+ * directly). */
+static void *default_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
+  (void)ud;
+  (void)osize;
+  if (nsize == 0) {
+    free(ptr);
+    return NULL;
+  }
+  return realloc(ptr, nsize);
+}
 
 static void *limited_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
   mem_box *box = (mem_box *)ud;
@@ -983,22 +1648,23 @@ static void *limited_alloc(void *ud, void *ptr, size_t osize, size_t nsize) {
   return np;
 }
 
-/* The mem_box of a guest state, or NULL when it has none (not created by
- * bridge_new_state, or already closed). */
-static mem_box *guest_mem_box(lua_State *guest) {
+static mem_box *guest_mem_box(const bridge_slot *s, lua_State *guest) {
   mem_box *box;
-  lua_pushlightuserdata(guest, (void *)&mem_box_key);
-  lua_rawget(guest, LUA_REGISTRYINDEX);
-  box = (mem_box *)lua_touserdata(guest, -1);
-  lua_pop(guest, 1);
+  slot_pushlightuserdata(s, guest, (void *)&mem_box_key);
+  s->api.rawget(guest, s->registry_index);
+  box = (mem_box *)s->api.touserdata(guest, -1);
+  s->api.settop(guest, -2);
   return box;
 }
 
 static int bridge_new_state(lua_State *L) {
-  /* The box is allocated and owned here, never in Lua: its pointer must not
-   * travel through a Lua number. */
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  const bridge_guest_api *ga = &s->api;
+
   mem_box *box = (mem_box *)malloc(sizeof(mem_box));
-  lua_State *new_state;
+  lua_State *new_state = NULL;
   if (box == NULL) {
     lua_pushstring(L, "bridge_new_state: out of memory");
     lua_error(L);
@@ -1006,112 +1672,93 @@ static int bridge_new_state(lua_State *L) {
   }
   box->used = 0;
   box->limit = 0;
-  box->old_alloc = NULL;
+  box->old_alloc = default_alloc;
   box->old_ud = NULL;
 
-  /* LuaJIT's own allocator creates the state; the counting wrapper is
-   * installed on top of it right after, so every later block still comes
-   * from the allocator that knows LuaJIT's rules. */
-  new_state = luaL_newstate();
-  if (!new_state) {
+  if (s->abi == BRIDGE_ABI_JIT && ga->luaL_newstate != NULL &&
+      ga->getallocf != NULL && ga->setallocf != NULL) {
+    /* LuaJIT's own allocator creates the state; the counting wrapper is
+     * installed on top of it right after, so every later block still comes
+     * from the allocator that knows LuaJIT's rules (GC64 pointer space). */
+    new_state = ga->luaL_newstate();
+    if (new_state != NULL) {
+      box->old_alloc = ga->getallocf(new_state, &box->old_ud);
+      ga->setallocf(new_state, limited_alloc, box);
+    }
+  } else if (ga->newstate != NULL) {
+    /* Lua 5.1/5.4/Luau take the counting allocator directly (default_alloc
+     * underneath it). */
+    new_state = ga->newstate(limited_alloc, box);
+  }
+
+  if (new_state == NULL) {
     free(box);
-    lua_pushstring(L, "bridge_new_state: luaL_newstate() returned NULL");
+    lua_pushstring(L, "bridge_new_state: the guest runtime failed to create "
+                      "a state");
     lua_error(L);
     return 0;
   }
-  box->old_alloc = lua_getallocf(new_state, &box->old_ud);
-  lua_setallocf(new_state, limited_alloc, box);
 
-  /* Hand the box to the guest state itself: the memory accessors and close
-   * find it through the registry, so it stays a plain pointer end to end. */
-  lua_pushlightuserdata(new_state, (void *)&mem_box_key);
-  lua_pushlightuserdata(new_state, (void *)box);
-  lua_rawset(new_state, LUA_REGISTRYINDEX);
+  slot_pushlightuserdata(s, new_state, (void *)&mem_box_key);
+  slot_pushlightuserdata(s, new_state, (void *)box);
+  ga->rawset(new_state, s->registry_index);
 
-  luaL_openlibs(new_state);
+  ga->openlibs(new_state);
   lua_pushlightuserdata(L, (void *)new_state);
   return 1;
 }
 
-/* Bytes the guest state holds right now. */
 static int bridge_memory_used(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
-  mem_box *box = guest_mem_box(guest);
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  lua_State *guest = decode_guest_ptr(L, args.first);
+  mem_box *box = guest_mem_box(s, guest);
   lua_pushinteger(L, (lua_Integer)(box ? box->used : 0));
   return 1;
 }
 
-/* Set the guest state's memory cap; 0 removes it. */
 static int bridge_set_memory_limit(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
-  mem_box *box = guest_mem_box(guest);
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  lua_State *guest = decode_guest_ptr(L, args.first);
+  mem_box *box = guest_mem_box(s, guest);
   if (box)
-    box->limit = (int64_t)lua_tointeger(L, 2);
+    box->limit = (int64_t)lua_tointeger(L, args.first + 1);
   return 0;
 }
 
-// Close a guest Lua state created by bridge_new_state.
-// This must be called instead of raw lua_close() so that on Windows the
-// state is freed by bridge.dll's CRT — the same one that allocated it via
-// luaL_newstate(). Using the host's lua_close() (via ffi.C) on a state
-// allocated by bridge.dll's luaL_newstate() is a cross-CRT free and
-// corrupts the heap.
 static int bridge_close_state(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
-  /* Recover the allocator box before the state (and its registry) is gone,
-   * then release both. The box is C memory, so it outlives lua_close. */
-  mem_box *box = guest_mem_box(guest);
-  lua_close(guest);
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  lua_State *guest = decode_guest_ptr(L, args.first);
+  mem_box *box = guest_mem_box(s, guest);
+  s->api.close_(guest);
   free(box);
   return 0;
 }
 
-// ── Heap snapshot ─────────────────────────────────────────────────────────
-//
-// bridge.heap_snapshot(guest, max_depth, max_paths) walks every object that
-// is reachable in the guest and gives each one to the first retainer path
-// that reaches it, for example "init.lua:local cache.entries[]". It returns
-//   { attributed = bytes, objects = n,
-//     retained = { path = bytes reachable through it },
-//     counts   = { path = objects whose path is exactly this one },
-//     parents  = { path = parent path, or false for a root } }
-//
-// The walk adds no garbage to the guest. The visited set and the paths are C
-// memory, and the containers in progress sit on the stack of a walker thread
-// that the guest registry keeps between snapshots. It only reads the guest and
-// runs no metamethods, so it is safe from a hook or a profiler callback.
-//
-// Root order sets attribution: _G, then each package.loaded entry, then the
-// main thread's stack, then the registry. Sizes follow LuaJIT's GC64 object
-// layouts. String and cdata sizes are exact (cdata through the guest's
-// ffi.sizeof); table and function sizes are estimates from their contents.
+/* ── Heap snapshot ───────────────────────────────────────────────────────── */
 
-#define LUA_TCDATA 10
-
-#define HW_BIG_TABLE 64 /* more keys than this: string keys share "[*]" */
-#define HW_MAX_FRAMES                                                          \
-  2000 /* up to 3 stack slots each; lua_checkstack caps a C frame at 8000 */
+#define HW_BIG_TABLE 64
+#define HW_MAX_FRAMES 2000
 #define HW_MAX_SEGMENT 200
 #define HW_MAX_KEY 40
-#define HW_OTHER_PATH 0 /* roots that do not fit in max_paths */
+#define HW_OTHER_PATH 0
 
-/* Fixed slots on the walker thread's stack; frames start above them. */
 #define HW_SLOT_SIZEOF 1
 #define HW_SLOT_QUEUE 2
 #define HW_SLOT_LOADED 3
 
-/* Registry key under which the guest keeps its walker thread. */
 static const char heap_thread_key = 0;
 
-/* The visited set is a bitmap per 1 MB of address space: one bit per 8 bytes.
- * GC objects, cdata payloads and upvalue cells are 8-byte aligned and never
- * share an address. Objects allocated together sit together, so the walk
- * touches far fewer cache lines than with a hash set of pointers. */
 #define HW_REGION_SHIFT 20
 #define HW_REGION_WORDS ((1u << HW_REGION_SHIFT) / 8 / 64)
 
 typedef struct {
-  uintptr_t region; /* address >> HW_REGION_SHIFT, plus 1 (0 = empty) */
+  uintptr_t region;
   uint64_t *bits;
 } hw_region;
 
@@ -1119,46 +1766,44 @@ typedef struct {
   hw_region *regions;
   size_t mask;
   size_t count;
-  hw_region *last; /* the region of the previous lookup */
+  hw_region *last;
 } hw_set;
 
 typedef struct {
-  int parent; /* -1 for a root */
+  int parent;
   uint32_t hash;
   char *segment;
   size_t length;
-  double self;     /* bytes of the objects first reached here */
-  double retained; /* self plus every descendant path */
-  double count;    /* objects whose path is exactly this one */
+  double self;
+  double retained;
+  double count;
 } hw_path;
 
 typedef struct {
   hw_path *items;
   int count;
   int cap;
-  int *index; /* open addressing: path id + 1, 0 = empty */
+  int *index;
   size_t index_mask;
 } hw_paths;
 
 typedef struct {
-  int kind; /* LUA_TTABLE, LUA_TFUNCTION, LUA_TTHREAD, LUA_TUSERDATA */
-  int base; /* walker stack slot of the container */
+  int kind;
+  int base;
   int path;
   int depth;
   int stage;
-  /* table */
   int is_big, has_weak_keys, has_weak_values, has_pending_value;
   int array_path, other_path, value_path;
   double array_count, hash_count;
-  /* function */
   int upvalue, upvalues;
   double bytes;
-  /* thread */
   lua_State *thread;
   int level, local, is_root;
 } hw_frame;
 
 typedef struct {
+  bridge_slot *slot;
   lua_State *walker;
   hw_set seen;
   hw_paths paths;
@@ -1179,7 +1824,6 @@ static hw_region *hw_region_slot(hw_region *regions, size_t mask,
   return &regions[i];
 }
 
-/* 1 when p is new, 0 when the set has it, -1 when out of memory. */
 static int hw_set_add(hw_set *set, const void *p) {
   uintptr_t address = (uintptr_t)p;
   uintptr_t key = (address >> HW_REGION_SHIFT) + 1;
@@ -1231,8 +1875,6 @@ static uint32_t hw_hash_segment(int parent, const char *s, size_t n) {
   return h;
 }
 
-/* The id of (parent, segment), added while there is room. -1 when the table
- * is full, -2 when out of memory. */
 static int hw_paths_get(hw_paths *paths, int parent, const char *segment,
                         size_t length, int max_paths) {
   uint32_t hash = hw_hash_segment(parent, segment, length);
@@ -1288,8 +1930,6 @@ static int hw_paths_get(hw_paths *paths, int parent, const char *segment,
   return paths->count - 1;
 }
 
-/* The path of a child named `segment` at `depth`: its parent's past
- * max_depth or when the path table is full. */
 static int hw_child(hw_walk *w, int parent, const char *segment, size_t length,
                     int depth) {
   int id;
@@ -1329,25 +1969,26 @@ static int hw_is_identifier(const char *s, size_t n) {
   return 1;
 }
 
-/* The cdata on top of the walker stack: header plus ffi.sizeof. */
 static double hw_cdata_size(hw_walk *w) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   double size = 16;
-  if (lua_type(K, HW_SLOT_SIZEOF) == LUA_TFUNCTION) {
-    lua_pushvalue(K, HW_SLOT_SIZEOF);
-    lua_pushvalue(K, -2);
-    /* sizeof raises for a variable-length ctype object and returns nil
-     * for an incomplete type: both count as header only. */
-    if (lua_pcall(K, 1, 1, 0) == LUA_OK && lua_type(K, -1) == LUA_TNUMBER) {
-      size += lua_tonumber(K, -1);
+  if (ga->type(K, HW_SLOT_SIZEOF) == s->t_function) {
+    ga->pushvalue(K, HW_SLOT_SIZEOF);
+    ga->pushvalue(K, -2);
+    if (slot_pcall(s, K, 1, 1, 0) == LUA_OK &&
+        ga->type(K, -1) == LUA_TNUMBER) {
+      size += slot_tonumber(s, K, -1);
     }
-    lua_pop(K, 1);
+    ga->settop(K, -2);
   }
   return size;
 }
 
-/* Open a frame for the container on top of the walker stack. */
 static void hw_open(hw_walk *w, int kind, int path, int depth) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   hw_frame *f;
   if (w->frame_count == w->frame_cap) {
@@ -1356,41 +1997,53 @@ static void hw_open(hw_walk *w, int kind, int path, int depth) {
         (hw_frame *)realloc(w->frames, (size_t)cap * sizeof(hw_frame));
     if (frames == NULL) {
       w->is_failed = 1;
-      lua_pop(K, 1);
+      ga->settop(K, -2);
       return;
     }
     w->frames = frames;
     w->frame_cap = cap;
   }
-  if (!lua_checkstack(K, 8)) {
+  if (!ga->checkstack(K, 8)) {
     w->is_failed = 1;
-    lua_pop(K, 1);
+    ga->settop(K, -2);
     return;
   }
   f = &w->frames[w->frame_count++];
   memset(f, 0, sizeof(*f));
   f->kind = kind;
-  f->base = lua_gettop(K);
+  f->base = ga->gettop(K);
   f->path = path;
   f->depth = depth;
-  if (kind == LUA_TTHREAD) {
-    lua_Debug ar;
+  if (kind == s->t_thread) {
     int levels = 0;
-    f->thread = lua_tothread(K, -1);
-    while (lua_getstack(f->thread, levels, &ar))
+    bridge_debug_ar ar;
+    f->thread = ga->tothread(K, -1);
+    memset(&ar, 0, sizeof(ar));
+    while (slot_getstack(s, f->thread, levels, &ar))
       levels++;
     f->level = levels - 1;
   }
 }
 
-/* A container past HW_MAX_FRAMES waits in a queue table on the walker. */
+/* Replace stack slot `idx` with the value on top (popping it). */
+static void slot_replace(const bridge_slot *s, lua_State *L, int idx) {
+  if (s->api.replace != NULL) {
+    s->api.replace(L, idx);
+    return;
+  }
+  s->api.copy(L, -1, idx);
+  s->api.settop(L, -2);
+}
+
 static void hw_enqueue(hw_walk *w, int path, int depth) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
-  if (lua_type(K, HW_SLOT_QUEUE) != LUA_TTABLE) {
-    lua_createtable(K, 0, 0);
-    if (hw_set_add(&w->seen, lua_topointer(K, -1)) < 0)
+  if (ga->type(K, HW_SLOT_QUEUE) != s->t_table) {
+    ga->createtable(K, 0, 0);
+    if (hw_set_add(&w->seen, ga->topointer(K, -1)) < 0)
       w->is_failed = 1;
-    lua_replace(K, HW_SLOT_QUEUE);
+    slot_replace(s, K, HW_SLOT_QUEUE);
   }
   if (w->queue_count + 1 >= w->queue_cap) {
     int cap = w->queue_cap ? w->queue_cap * 2 : 256;
@@ -1403,7 +2056,7 @@ static void hw_enqueue(hw_walk *w, int path, int depth) {
       w->queue_depth = depths;
     if (paths == NULL || depths == NULL) {
       w->is_failed = 1;
-      lua_pop(K, 1);
+      ga->settop(K, -2);
       return;
     }
     w->queue_cap = cap;
@@ -1411,38 +2064,39 @@ static void hw_enqueue(hw_walk *w, int path, int depth) {
   w->queue_count++;
   w->queue_path[w->queue_count] = path;
   w->queue_depth[w->queue_count] = depth;
-  lua_rawseti(K, HW_SLOT_QUEUE, w->queue_count);
+  ga->rawseti(K, HW_SLOT_QUEUE, w->queue_count);
 }
 
-/* Consume the value on top of the walker stack. A new container gets a frame
- * and stays on the stack as that frame's base. */
 static void hw_discover(hw_walk *w, int parent, int path, int depth) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
-  int type = lua_type(K, -1);
+  int type = ga->type(K, -1);
   int added;
-  if (type != LUA_TSTRING && type != LUA_TTABLE && type != LUA_TFUNCTION &&
-      type != LUA_TUSERDATA && type != LUA_TTHREAD && type != LUA_TCDATA) {
-    lua_pop(K, 1);
+  if (type != s->t_string && type != s->t_table && type != s->t_function &&
+      type != s->t_userdata && type != s->t_thread &&
+      (s->t_cdata < 0 || type != s->t_cdata)) {
+    ga->settop(K, -2);
     return;
   }
-  added = hw_set_add(&w->seen, lua_topointer(K, -1));
+  added = hw_set_add(&w->seen, ga->topointer(K, -1));
   if (added <= 0) {
     if (added < 0)
       w->is_failed = 1;
-    lua_pop(K, 1);
+    ga->settop(K, -2);
     return;
   }
   w->objects++;
   if (path != parent)
     w->paths.items[path].count++;
-  if (type == LUA_TSTRING) {
+  if (type == s->t_string) {
     size_t length;
-    lua_tolstring(K, -1, &length);
+    ga->tolstring(K, -1, &length);
     hw_add(w, path, 25.0 + (double)length);
-    lua_pop(K, 1);
-  } else if (type == LUA_TCDATA) {
+    ga->settop(K, -2);
+  } else if (s->t_cdata >= 0 && type == s->t_cdata) {
     hw_add(w, path, hw_cdata_size(w));
-    lua_pop(K, 1);
+    ga->settop(K, -2);
   } else if (w->frame_count >= HW_MAX_FRAMES) {
     hw_enqueue(w, path, depth);
   } else {
@@ -1454,24 +2108,26 @@ static void hw_finish(hw_walk *w, double bytes) {
   hw_frame *f = &w->frames[w->frame_count - 1];
   if (f->path >= 0)
     hw_add(w, f->path, bytes);
-  lua_settop(w->walker, f->base - 1);
+  w->slot->api.settop(w->walker, f->base - 1);
   w->frame_count--;
 }
 
 static void hw_step_table(hw_walk *w, hw_frame *f) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   int path = f->path, depth = f->depth;
   if (f->stage == 0) {
     f->stage = 1;
-    if (lua_getmetatable(K, f->base)) {
-      lua_pushstring(K, "__mode");
-      lua_rawget(K, -2);
-      if (lua_type(K, -1) == LUA_TSTRING) {
-        const char *mode = lua_tostring(K, -1);
+    if (ga->getmetatable(K, f->base)) {
+      ga->pushstring(K, "__mode");
+      ga->rawget(K, -2);
+      if (ga->type(K, -1) == s->t_string) {
+        const char *mode = ga->tolstring(K, -1, NULL);
         f->has_weak_keys = strchr(mode, 'k') != NULL;
         f->has_weak_values = strchr(mode, 'v') != NULL;
       }
-      lua_pop(K, 1);
+      ga->settop(K, -2);
       hw_discover(w, path, hw_child(w, path, "<mt>", 4, depth + 1), depth + 1);
     }
     return;
@@ -1479,11 +2135,11 @@ static void hw_step_table(hw_walk *w, hw_frame *f) {
   if (f->stage == 1) {
     /* A big table is a collection: its keys are data, not field names. */
     int entries = 0;
-    lua_pushnil(K);
-    while (lua_next(K, f->base)) {
-      lua_pop(K, 1);
+    ga->pushnil(K);
+    while (ga->next(K, f->base)) {
+      ga->settop(K, -2);
       if (++entries > HW_BIG_TABLE) {
-        lua_pop(K, 1);
+        ga->settop(K, -2);
         break;
       }
     }
@@ -1491,14 +2147,14 @@ static void hw_step_table(hw_walk *w, hw_frame *f) {
     f->array_path = hw_child(w, path, "[]", 2, depth + 1);
     f->other_path = hw_child(w, path, "[*]", 3, depth + 1);
     f->stage = 2;
-    lua_pushnil(K);
+    ga->pushnil(K);
     return;
   }
   if (f->has_pending_value) {
     /* [table, key, value]: the key's frame is done, the value is next. */
     f->has_pending_value = 0;
     if (f->has_weak_values) {
-      lua_pop(K, 1);
+      ga->settop(K, -2);
     } else {
       int frames = w->frame_count;
       hw_discover(w, path, f->value_path, depth + 1);
@@ -1510,7 +2166,8 @@ static void hw_step_table(hw_walk *w, hw_frame *f) {
    * deeper first and comes back here. */
   for (;;) {
     int value_path = f->other_path, frames, type;
-    if (!lua_next(K, f->base)) {
+    int key_type;
+    if (!ga->next(K, f->base)) {
       double slots = 0;
       if (f->hash_count > 0) {
         slots = 1;
@@ -1521,21 +2178,19 @@ static void hw_step_table(hw_walk *w, hw_frame *f) {
                        24 * slots);
       return;
     }
-    switch (lua_type(K, -2)) {
-    case LUA_TNUMBER: {
-      lua_Number n = lua_tonumber(K, -2);
-      if (n >= 1 && n <= 9007199254740992.0 && n == (lua_Number)(int64_t)n) {
+    key_type = ga->type(K, -2);
+    if (key_type == LUA_TNUMBER) {
+      double n = slot_tonumber(s, K, -2);
+      if (n >= 1 && n <= 9007199254740992.0 && n == (double)(int64_t)n) {
         f->array_count++;
         value_path = f->array_path;
       } else {
         f->hash_count++;
       }
-      break;
-    }
-    case LUA_TSTRING: {
+    } else if (key_type == s->t_string) {
       size_t length;
-      const char *key = lua_tolstring(K, -2, &length);
-      int added = hw_set_add(&w->seen, lua_topointer(K, -2));
+      const char *key = ga->tolstring(K, -2, &length);
+      int added = hw_set_add(&w->seen, ga->topointer(K, -2));
       f->hash_count++;
       if (added < 0)
         w->is_failed = 1;
@@ -1549,32 +2204,27 @@ static void hw_step_table(hw_walk *w, hw_frame *f) {
         memcpy(segment + 1, key, length);
         value_path = hw_child(w, path, segment, length + 1, depth + 1);
       }
-      break;
-    }
-    case LUA_TBOOLEAN:
-    case LUA_TLIGHTUSERDATA:
+    } else if (key_type == LUA_TBOOLEAN || key_type == LUA_TLIGHTUSERDATA) {
       f->hash_count++;
-      break;
-    default:
+    } else {
       f->hash_count++;
       if (!f->has_weak_keys) {
         frames = w->frame_count;
         f->value_path = value_path;
         f->has_pending_value = 1;
-        lua_pushvalue(K, -2);
+        ga->pushvalue(K, -2);
         hw_discover(w, path, hw_child(w, path, "<key>", 5, depth + 1),
                     depth + 1);
         if (w->frame_count > frames)
           return;
         f->has_pending_value = 0;
       }
-      break;
     }
     if (w->is_failed)
       return;
-    type = lua_type(K, -1);
+    type = ga->type(K, -1);
     if (f->has_weak_values || type <= LUA_TNUMBER) {
-      lua_pop(K, 1);
+      ga->settop(K, -2);
       continue;
     }
     frames = w->frame_count;
@@ -1585,31 +2235,39 @@ static void hw_step_table(hw_walk *w, hw_frame *f) {
 }
 
 static void hw_step_function(hw_walk *w, hw_frame *f) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   int path = f->path, depth = f->depth;
   if (f->stage == 0) {
-    lua_Debug ar;
-    lua_pushvalue(K, f->base);
-    lua_getinfo(K, ">u", &ar);
-    f->upvalues = ar.nups;
-    f->bytes = 40.0 + 8.0 * ar.nups;
+    int nups = 0;
+    int known = slot_nups(s, K, f->base, &nups);
+    f->upvalues = known ? nups : -1;
+    f->bytes = 40.0 + 8.0 * (f->upvalues > 0 ? f->upvalues : 0);
     f->stage = 1;
   }
   if (f->stage == 1) {
-    while (f->upvalue < f->upvalues) {
+    while (f->upvalues < 0 || f->upvalue < f->upvalues) {
       int i = ++f->upvalue;
-      /* Closures share upvalue cells: count each cell once. */
-      int added = hw_set_add(&w->seen, lua_upvalueid(K, f->base, i));
       const char *name;
       char segment[HW_MAX_SEGMENT];
-      if (added < 0)
-        w->is_failed = 1;
-      if (added <= 0)
-        continue;
+      if (ga->upvalueid != NULL) {
+        void *id = ga->upvalueid(K, f->base, i);
+        if (id != NULL) {
+          int added = hw_set_add(&w->seen, id);
+          if (added < 0)
+            w->is_failed = 1;
+          if (added <= 0)
+            continue;
+        }
+      }
+      /* Closures share upvalue cells: count each cell once. */
       f->bytes += 48;
-      name = lua_getupvalue(K, f->base, i);
-      if (name == NULL)
-        continue;
+      name = ga->getupvalue(K, f->base, i);
+      if (name == NULL) {
+        f->upvalue--;
+        break;
+      }
       hw_discover(w, path,
                   hw_child(w, path, segment,
                            hw_format(segment, "<upvalue %s%s>",
@@ -1622,70 +2280,81 @@ static void hw_step_function(hw_walk *w, hw_frame *f) {
   }
   if (f->stage == 2) {
     f->stage = 3;
-    lua_getfenv(K, f->base);
-    hw_discover(w, path, hw_child(w, path, "<env>", 5, depth + 1), depth + 1);
-    return;
+    if (ga->getfenv != NULL) {
+      ga->getfenv(K, f->base);
+      hw_discover(w, path, hw_child(w, path, "<env>", 5, depth + 1),
+                  depth + 1);
+      return;
+    }
   }
   hw_finish(w, f->bytes);
 }
 
 static void hw_step_userdata(hw_walk *w, hw_frame *f) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   int path = f->path, depth = f->depth;
   if (f->stage == 0) {
     f->stage = 1;
-    if (lua_getmetatable(K, f->base)) {
+    if (ga->getmetatable(K, f->base)) {
       hw_discover(w, path, hw_child(w, path, "<mt>", 4, depth + 1), depth + 1);
     }
     return;
   }
   if (f->stage == 1) {
     f->stage = 2;
-    lua_getfenv(K, f->base);
-    hw_discover(w, path, hw_child(w, path, "<env>", 5, depth + 1), depth + 1);
-    return;
+    if (ga->getfenv != NULL) {
+      ga->getfenv(K, f->base);
+      hw_discover(w, path, hw_child(w, path, "<env>", 5, depth + 1),
+                  depth + 1);
+      return;
+    }
   }
   hw_finish(w, 40);
 }
 
-/* Locals and functions of a thread's Lua frames, outermost frame first. The
- * main thread is a root: its locals are root paths ("init.lua:local x");
- * another thread's are children ("<init.lua:12:local x>"). */
+/* Locals and functions of a thread's Lua frames, outermost frame first. */
 static void hw_step_thread(hw_walk *w, hw_frame *f) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker, *T = f->thread;
   int parent = f->is_root ? -1 : f->path;
   int depth = f->is_root ? 1 : f->depth + 1;
   while (f->level >= 0) {
-    lua_Debug ar;
+    bridge_debug_ar ar;
+    bridge_debug dbg;
     char frame[HW_MAX_SEGMENT], segment[HW_MAX_SEGMENT];
     const char *source, *p;
     size_t length;
-    if (!lua_getstack(T, f->level, &ar)) {
+    memset(&ar, 0, sizeof(ar));
+    if (!slot_getstack(s, T, f->level, &ar)) {
       f->level--;
       f->local = 0;
       continue;
     }
-    lua_getinfo(T, "S", &ar);
-    if (ar.what != NULL && ar.what[0] == 'C') {
+    slot_getinfo(s, T, f->level, "S", &ar);
+    slot_debug_read(s, &ar, 0, &dbg);
+    if (dbg.what != NULL && dbg.what[0] == 'C') {
       f->level--;
       f->local = 0;
       continue;
     }
-    source = ar.short_src;
-    for (p = ar.short_src; *p; p++) {
+    source = dbg.short_src != NULL ? dbg.short_src : "?";
+    for (p = source; *p; p++) {
       if (*p == '/' || *p == '\\')
         source = p + 1;
     }
-    if (ar.what != NULL && strcmp(ar.what, "main") == 0) {
+    if (dbg.what != NULL && strcmp(dbg.what, "main") == 0) {
       snprintf(frame, sizeof(frame), "%s", source);
     } else {
-      snprintf(frame, sizeof(frame), "%s:%d", source, ar.linedefined);
+      snprintf(frame, sizeof(frame), "%s:%d", source, dbg.linedefined);
     }
     if (f->local >= 0) {
-      const char *name = lua_getlocal(T, &ar, f->local + 1);
+      const char *name = slot_getlocal(s, T, f->level, f->local + 1);
       if (name != NULL) {
         f->local++;
-        lua_xmove(T, K, 1);
+        ga->xmove(T, K, 1);
         length =
             hw_format(segment, f->is_root ? "%s:local %s" : "<%s:local %s>",
                       frame, name[0] == '(' ? "(temp)" : name);
@@ -1695,8 +2364,8 @@ static void hw_step_thread(hw_walk *w, hw_frame *f) {
       }
       f->local = -1;
     }
-    lua_getinfo(T, "f", &ar);
-    lua_xmove(T, K, 1);
+    slot_getinfo(s, T, f->level, "f", &ar);
+    ga->xmove(T, K, 1);
     f->level--;
     f->local = 0;
     length = hw_format(
@@ -1707,64 +2376,62 @@ static void hw_step_thread(hw_walk *w, hw_frame *f) {
   hw_finish(w, f->is_root ? 0 : 200);
 }
 
-/* Run frames until none is left, then the queued containers. */
 static void hw_drain(hw_walk *w) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   for (;;) {
     while (w->frame_count > 0 && !w->is_failed) {
       hw_frame *f = &w->frames[w->frame_count - 1];
-      switch (f->kind) {
-      case LUA_TTABLE:
+      if (f->kind == s->t_table)
         hw_step_table(w, f);
-        break;
-      case LUA_TFUNCTION:
+      else if (f->kind == s->t_function)
         hw_step_function(w, f);
-        break;
-      case LUA_TTHREAD:
+      else if (f->kind == s->t_thread)
         hw_step_thread(w, f);
-        break;
-      default:
+      else
         hw_step_userdata(w, f);
-        break;
-      }
     }
     if (w->is_failed || w->queue_next >= w->queue_count)
       return;
     w->queue_next++;
-    lua_rawgeti(K, HW_SLOT_QUEUE, w->queue_next);
-    lua_pushnil(K);
-    lua_rawseti(K, HW_SLOT_QUEUE, w->queue_next);
-    hw_open(w, lua_type(K, -1), w->queue_path[w->queue_next],
+    ga->rawgeti(K, HW_SLOT_QUEUE, w->queue_next);
+    ga->pushnil(K);
+    ga->rawseti(K, HW_SLOT_QUEUE, w->queue_next);
+    hw_open(w, ga->type(K, -1), w->queue_path[w->queue_next],
             w->queue_depth[w->queue_next]);
   }
 }
 
-/* Walk the value on top of the walker stack as a root named `label`. */
 static void hw_root(hw_walk *w, const char *label, size_t length) {
   hw_discover(w, -1, hw_child(w, -1, label, length, 1), 1);
   hw_drain(w);
 }
 
 static void hw_walk_roots(hw_walk *w, lua_State *guest) {
+  bridge_slot *s = w->slot;
+  const bridge_guest_api *ga = &s->api;
   lua_State *K = w->walker;
   char label[HW_MAX_SEGMENT];
 
-  lua_settop(K, 0);
-  lua_pushnil(K); /* HW_SLOT_SIZEOF */
-  lua_pushnil(K); /* HW_SLOT_QUEUE */
-  lua_pushstring(K, "_LOADED");
-  lua_rawget(K, LUA_REGISTRYINDEX); /* HW_SLOT_LOADED */
-  if (lua_type(K, HW_SLOT_LOADED) == LUA_TTABLE) {
-    lua_pushstring(K, "ffi");
-    lua_rawget(K, HW_SLOT_LOADED);
-    if (lua_type(K, -1) == LUA_TTABLE) {
-      lua_pushstring(K, "sizeof");
-      lua_rawget(K, -2);
-      lua_replace(K, HW_SLOT_SIZEOF);
+  ga->settop(K, 0);
+  ga->pushnil(K); /* HW_SLOT_SIZEOF */
+  ga->pushnil(K); /* HW_SLOT_QUEUE */
+  ga->pushstring(K, "_LOADED");
+  ga->rawget(K, s->registry_index); /* HW_SLOT_LOADED */
+  if (ga->type(K, HW_SLOT_LOADED) == s->t_table) {
+    if (s->abi == BRIDGE_ABI_JIT) {
+      ga->pushstring(K, "ffi");
+      ga->rawget(K, HW_SLOT_LOADED);
+      if (ga->type(K, -1) == s->t_table) {
+        ga->pushstring(K, "sizeof");
+        ga->rawget(K, -2);
+        slot_replace(s, K, HW_SLOT_SIZEOF);
+      }
+      ga->settop(K, -2);
     }
-    lua_pop(K, 1);
     /* Its entries are roots of their own, not "_G.package.loaded[*]". */
-    if (hw_set_add(&w->seen, lua_topointer(K, HW_SLOT_LOADED)) < 0)
+    if (hw_set_add(&w->seen, ga->topointer(K, HW_SLOT_LOADED)) < 0)
       w->is_failed = 1;
   }
   if (hw_set_add(&w->seen, (const void *)K) < 0)
@@ -1772,16 +2439,16 @@ static void hw_walk_roots(hw_walk *w, lua_State *guest) {
   if (hw_set_add(&w->seen, (const void *)guest) < 0)
     w->is_failed = 1;
 
-  lua_pushvalue(K, LUA_GLOBALSINDEX);
+  slot_pushglobals(s, K);
   hw_root(w, "_G", 2);
 
-  if (lua_type(K, HW_SLOT_LOADED) == LUA_TTABLE) {
-    lua_pushnil(K);
-    while (!w->is_failed && lua_next(K, HW_SLOT_LOADED)) {
+  if (ga->type(K, HW_SLOT_LOADED) == s->t_table) {
+    ga->pushnil(K);
+    while (!w->is_failed && ga->next(K, HW_SLOT_LOADED)) {
       size_t length = 1, i;
       const char *name = "?";
-      if (lua_type(K, -2) == LUA_TSTRING)
-        name = lua_tolstring(K, -2, &length);
+      if (ga->type(K, -2) == s->t_string)
+        name = ga->tolstring(K, -2, &length);
       if (length > 150)
         length = 150;
       length = (size_t)snprintf(label, sizeof(label), "require(\"%.*s\")",
@@ -1794,16 +2461,16 @@ static void hw_walk_roots(hw_walk *w, lua_State *guest) {
     }
   }
 
-  lua_pushthread(guest);
-  lua_xmove(guest, K, 1);
-  hw_open(w, LUA_TTHREAD, -1, 0);
+  ga->pushthread(guest);
+  ga->xmove(guest, K, 1);
+  hw_open(w, s->t_thread, -1, 0);
   if (w->frame_count > 0)
     w->frames[w->frame_count - 1].is_root = 1;
   hw_drain(w);
 
-  lua_pushvalue(K, LUA_REGISTRYINDEX);
+  ga->pushvalue(K, s->registry_index);
   hw_root(w, "registry", 8);
-  lua_settop(K, 0);
+  ga->settop(K, 0);
 }
 
 /* Push the result table onto L. Ids grow from parent to child, so one pass
@@ -1908,29 +2575,38 @@ static void hw_free(hw_walk *w) {
 }
 
 static int bridge_heap_snapshot(lua_State *L) {
-  lua_State *guest = decode_guest_ptr(L, 1);
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  const bridge_guest_api *ga = &s->api;
+  lua_State *guest = decode_guest_ptr(L, args.first);
   lua_State *walker;
   hw_walk w;
   int is_pushed;
 
   memset(&w, 0, sizeof(w));
-  w.max_depth = lua_type(L, 2) == LUA_TNUMBER ? (int)lua_tonumber(L, 2) : 10;
-  w.max_paths = lua_type(L, 3) == LUA_TNUMBER ? (int)lua_tonumber(L, 3) : 20000;
+  w.slot = s;
+  w.max_depth = lua_type(L, args.first + 1) == LUA_TNUMBER
+                    ? (int)lua_tonumber(L, args.first + 1)
+                    : 10;
+  w.max_paths = lua_type(L, args.first + 2) == LUA_TNUMBER
+                    ? (int)lua_tonumber(L, args.first + 2)
+                    : 20000;
   if (w.max_depth < 1)
     w.max_depth = 1;
   if (w.max_paths < 1)
     w.max_paths = 1;
 
-  lua_pushlightuserdata(guest, (void *)&heap_thread_key);
-  lua_rawget(guest, LUA_REGISTRYINDEX);
-  walker = lua_tothread(guest, -1);
-  lua_pop(guest, 1);
+  slot_pushlightuserdata(s, guest, (void *)&heap_thread_key);
+  ga->rawget(guest, s->registry_index);
+  walker = ga->tothread(guest, -1);
+  ga->settop(guest, -2);
   if (walker == NULL) {
-    walker = lua_newthread(guest);
-    lua_pushlightuserdata(guest, (void *)&heap_thread_key);
-    lua_pushvalue(guest, -2);
-    lua_rawset(guest, LUA_REGISTRYINDEX);
-    lua_pop(guest, 1);
+    walker = ga->newthread(guest);
+    slot_pushlightuserdata(s, guest, (void *)&heap_thread_key);
+    ga->pushvalue(guest, -2);
+    ga->rawset(guest, s->registry_index);
+    ga->settop(guest, -2);
   }
   w.walker = walker;
 
@@ -1950,11 +2626,11 @@ static int bridge_heap_snapshot(lua_State *L) {
     return luaL_error(L, "heap_snapshot: out of memory");
   }
 
-  if (!lua_checkstack(walker, 16))
+  if (!ga->checkstack(walker, 16))
     w.is_failed = 1;
   if (!w.is_failed)
     hw_walk_roots(&w, guest);
-  lua_settop(walker, 0);
+  ga->settop(walker, 0);
 
   is_pushed = !w.is_failed && hw_push_result(L, &w);
   hw_free(&w);
@@ -1963,7 +2639,464 @@ static int bridge_heap_snapshot(lua_State *L) {
   return 1;
 }
 
+/* ── Runtime slot resolution ─────────────────────────────────────────────── */
+
+static void *slot_sym(void *handle, const char *name) {
+#ifdef _WIN32
+  return (void *)(uintptr_t)GetProcAddress((HMODULE)handle, name);
+#else
+  return dlsym(handle, name);
+#endif
+}
+
+static void configure_slot(bridge_slot *s, int abi) {
+  memset(s, 0, sizeof(*s));
+  s->abi = abi;
+  switch (abi) {
+  case BRIDGE_ABI_54:
+    s->registry_index = LUA54_REGISTRYINDEX;
+    s->upvalue_base = LUA54_REGISTRYINDEX;
+    s->t_string = LUA_TSTRING;
+    s->t_table = LUA_TTABLE;
+    s->t_function = LUA_TFUNCTION;
+    s->t_userdata = LUA_TUSERDATA;
+    s->t_thread = LUA_TTHREAD;
+    s->t_cdata = -1;
+    break;
+  case BRIDGE_ABI_LUAU:
+    s->registry_index = LUA_REGISTRYINDEX; /* -10000 */
+    s->upvalue_base = LUA_GLOBALSINDEX;    /* -10002 */
+    s->t_string = 5;
+    s->t_table = 6;
+    s->t_function = 7;
+    s->t_userdata = 8;
+    s->t_thread = 9;
+    s->t_cdata = -1;
+    break;
+  default:
+    s->registry_index = LUA_REGISTRYINDEX;
+    s->upvalue_base = LUA_GLOBALSINDEX;
+    s->t_string = LUA_TSTRING;
+    s->t_table = LUA_TTABLE;
+    s->t_function = LUA_TFUNCTION;
+    s->t_userdata = LUA_TUSERDATA;
+    s->t_thread = LUA_TTHREAD;
+    s->t_cdata = abi == BRIDGE_ABI_JIT ? LUA_TCDATA : -1;
+    break;
+  }
+}
+
+#define SLOT_NEED(api, field, type, name)                                     \
+  do {                                                                        \
+    void *p_ = slot_sym(handle, name);                                        \
+    if (p_ == NULL)                                                           \
+      return name;                                                            \
+    (api)->field = (type)p_;                                                  \
+  } while (0)
+
+#define SLOT_OPT(api, field, type, name)                                      \
+  do {                                                                        \
+    (api)->field = (type)slot_sym(handle, name);                              \
+  } while (0)
+
+/* LuaJIT and PUC Lua 5.1 share the 5.1 ABI; jit adds luaJIT_setmode and
+ * lua_upvalueid. */
+static const char *resolve_51(bridge_slot *s, void *handle, int jit) {
+  bridge_guest_api *a = &s->api;
+  SLOT_NEED(a, gettop, int (*)(lua_State *), "lua_gettop");
+  SLOT_NEED(a, settop, void (*)(lua_State *, int), "lua_settop");
+  SLOT_NEED(a, pushvalue, void (*)(lua_State *, int), "lua_pushvalue");
+  SLOT_NEED(a, type, int (*)(lua_State *, int), "lua_type");
+  SLOT_NEED(a, typename_, const char *(*)(lua_State *, int), "lua_typename");
+  SLOT_NEED(a, pushnil, void (*)(lua_State *), "lua_pushnil");
+  SLOT_NEED(a, pushboolean, void (*)(lua_State *, int), "lua_pushboolean");
+  SLOT_NEED(a, pushnumber, void (*)(lua_State *, double), "lua_pushnumber");
+  SLOT_NEED(a, pushinteger, void (*)(lua_State *, int64_t), "lua_pushinteger");
+  SLOT_NEED(a, pushlstring, void (*)(lua_State *, const char *, size_t),
+            "lua_pushlstring");
+  SLOT_NEED(a, pushstring, void (*)(lua_State *, const char *),
+            "lua_pushstring");
+  SLOT_NEED(a, pushfstring, const char *(*)(lua_State *, const char *, ...),
+            "lua_pushfstring");
+  SLOT_NEED(a, pushlightuserdata, void (*)(lua_State *, void *),
+            "lua_pushlightuserdata");
+  SLOT_NEED(a, pushcclosure, void (*)(lua_State *, lua_CFunction, int),
+            "lua_pushcclosure");
+  SLOT_NEED(a, toboolean, int (*)(lua_State *, int), "lua_toboolean");
+  SLOT_NEED(a, tonumberx, double (*)(lua_State *, int, int *),
+            "lua_tonumber");
+  SLOT_NEED(a, tointegerx, int64_t (*)(lua_State *, int, int *),
+            "lua_tointeger");
+  SLOT_NEED(a, tolstring, const char *(*)(lua_State *, int, size_t *),
+            "lua_tolstring");
+  SLOT_NEED(a, touserdata, void *(*)(lua_State *, int), "lua_touserdata");
+  SLOT_NEED(a, topointer, const void *(*)(lua_State *, int), "lua_topointer");
+  SLOT_NEED(a, tothread, lua_State * (*)(lua_State *, int), "lua_tothread");
+  SLOT_NEED(a, createtable, void (*)(lua_State *, int, int),
+            "lua_createtable");
+  SLOT_NEED(a, rawgeti, int (*)(lua_State *, int, int), "lua_rawgeti");
+  SLOT_NEED(a, rawseti, void (*)(lua_State *, int, int), "lua_rawseti");
+  SLOT_NEED(a, rawget, void (*)(lua_State *, int), "lua_rawget");
+  SLOT_NEED(a, rawset, void (*)(lua_State *, int), "lua_rawset");
+  SLOT_NEED(a, setfield, void (*)(lua_State *, int, const char *),
+            "lua_setfield");
+  SLOT_NEED(a, next, int (*)(lua_State *, int), "lua_next");
+  SLOT_NEED(a, getmetatable, int (*)(lua_State *, int), "lua_getmetatable");
+  SLOT_NEED(a, setmetatable, int (*)(lua_State *, int), "lua_setmetatable");
+  SLOT_NEED(a, pcall, int (*)(lua_State *, int, int, int), "lua_pcall");
+  SLOT_NEED(a, error_, void (*)(lua_State *), "lua_error");
+  SLOT_NEED(a, ref_table, int (*)(lua_State *, int), "luaL_ref");
+  SLOT_NEED(a, unref_table, void (*)(lua_State *, int, int), "luaL_unref");
+  SLOT_NEED(a, newthread, lua_State * (*)(lua_State *), "lua_newthread");
+  SLOT_NEED(a, pushthread, int (*)(lua_State *), "lua_pushthread");
+  SLOT_NEED(a, xmove, void (*)(lua_State *, lua_State *, int), "lua_xmove");
+  SLOT_NEED(a, checkstack, int (*)(lua_State *, int), "lua_checkstack");
+  SLOT_NEED(a, getupvalue, const char *(*)(lua_State *, int, int),
+            "lua_getupvalue");
+  SLOT_NEED(a, getfenv, void (*)(lua_State *, int), "lua_getfenv");
+  SLOT_NEED(a, replace, void (*)(lua_State *, int), "lua_replace");
+  SLOT_NEED(a, luaL_newstate, lua_State * (*)(void), "luaL_newstate");
+  SLOT_NEED(a, newstate, lua_State * (*)(lua_Alloc, void *), "lua_newstate");
+  SLOT_NEED(a, openlibs, void (*)(lua_State *), "luaL_openlibs");
+  SLOT_NEED(a, getallocf, lua_Alloc(*)(lua_State *, void **),
+            "lua_getallocf");
+  SLOT_NEED(a, setallocf, void (*)(lua_State *, lua_Alloc, void *),
+            "lua_setallocf");
+  SLOT_NEED(a, close_, void (*)(lua_State *), "lua_close");
+  SLOT_NEED(a, getstack_native, int (*)(lua_State *, int, void *),
+            "lua_getstack");
+  SLOT_NEED(a, getinfo_native, int (*)(lua_State *, const char *, void *),
+            "lua_getinfo");
+  SLOT_NEED(a, getlocal_ar, const char *(*)(lua_State *, const void *, int),
+            "lua_getlocal");
+  SLOT_NEED(a, sethook,
+            void (*)(lua_State *, void (*)(lua_State *, void *), int, int),
+            "lua_sethook");
+  a->debug_read = debug_read_51;
+  a->debug_nups = debug_nups_51;
+  if (jit) {
+    SLOT_NEED(a, setmode, int (*)(lua_State *, int, int), "luaJIT_setmode");
+    SLOT_NEED(a, upvalueid, void *(*)(lua_State *, int, int),
+              "lua_upvalueid");
+  } else {
+    SLOT_OPT(a, upvalueid, void *(*)(lua_State *, int, int), "lua_upvalueid");
+  }
+  return NULL;
+}
+
+static const char *resolve_54(bridge_slot *s, void *handle) {
+  bridge_guest_api *a = &s->api;
+  SLOT_NEED(a, gettop, int (*)(lua_State *), "lua_gettop");
+  SLOT_NEED(a, settop, void (*)(lua_State *, int), "lua_settop");
+  SLOT_NEED(a, pushvalue, void (*)(lua_State *, int), "lua_pushvalue");
+  SLOT_NEED(a, type, int (*)(lua_State *, int), "lua_type");
+  SLOT_NEED(a, typename_, const char *(*)(lua_State *, int), "lua_typename");
+  SLOT_NEED(a, pushnil, void (*)(lua_State *), "lua_pushnil");
+  SLOT_NEED(a, pushboolean, void (*)(lua_State *, int), "lua_pushboolean");
+  SLOT_NEED(a, pushnumber, void (*)(lua_State *, double), "lua_pushnumber");
+  SLOT_NEED(a, pushinteger, void (*)(lua_State *, int64_t), "lua_pushinteger");
+  SLOT_NEED(a, pushlstring, void (*)(lua_State *, const char *, size_t),
+            "lua_pushlstring");
+  SLOT_NEED(a, pushstring, void (*)(lua_State *, const char *),
+            "lua_pushstring");
+  SLOT_NEED(a, pushfstring, const char *(*)(lua_State *, const char *, ...),
+            "lua_pushfstring");
+  SLOT_NEED(a, pushlightuserdata, void (*)(lua_State *, void *),
+            "lua_pushlightuserdata");
+  SLOT_NEED(a, pushcclosure, void (*)(lua_State *, lua_CFunction, int),
+            "lua_pushcclosure");
+  SLOT_NEED(a, toboolean, int (*)(lua_State *, int), "lua_toboolean");
+  SLOT_NEED(a, tonumberx, double (*)(lua_State *, int, int *),
+            "lua_tonumberx");
+  SLOT_NEED(a, tointegerx, int64_t (*)(lua_State *, int, int *),
+            "lua_tointegerx");
+  SLOT_NEED(a, tolstring, const char *(*)(lua_State *, int, size_t *),
+            "lua_tolstring");
+  SLOT_NEED(a, touserdata, void *(*)(lua_State *, int), "lua_touserdata");
+  SLOT_NEED(a, topointer, const void *(*)(lua_State *, int), "lua_topointer");
+  SLOT_NEED(a, tothread, lua_State * (*)(lua_State *, int), "lua_tothread");
+  SLOT_NEED(a, createtable, void (*)(lua_State *, int, int),
+            "lua_createtable");
+  SLOT_NEED(a, rawgeti, int (*)(lua_State *, int, int), "lua_rawgeti");
+  SLOT_NEED(a, rawseti, void (*)(lua_State *, int, int), "lua_rawseti");
+  SLOT_NEED(a, rawget, void (*)(lua_State *, int), "lua_rawget");
+  SLOT_NEED(a, rawset, void (*)(lua_State *, int), "lua_rawset");
+  SLOT_NEED(a, setfield, void (*)(lua_State *, int, const char *),
+            "lua_setfield");
+  SLOT_NEED(a, next, int (*)(lua_State *, int), "lua_next");
+  SLOT_NEED(a, getmetatable, int (*)(lua_State *, int), "lua_getmetatable");
+  SLOT_NEED(a, setmetatable, int (*)(lua_State *, int), "lua_setmetatable");
+  SLOT_NEED(a, pcallk, int (*)(lua_State *, int, int, int, intptr_t, void *),
+            "lua_pcallk");
+  SLOT_NEED(a, error_, void (*)(lua_State *), "lua_error");
+  SLOT_NEED(a, ref_table, int (*)(lua_State *, int), "luaL_ref");
+  SLOT_NEED(a, unref_table, void (*)(lua_State *, int, int), "luaL_unref");
+  SLOT_NEED(a, newthread, lua_State * (*)(lua_State *), "lua_newthread");
+  SLOT_NEED(a, pushthread, int (*)(lua_State *), "lua_pushthread");
+  SLOT_NEED(a, xmove, void (*)(lua_State *, lua_State *, int), "lua_xmove");
+  SLOT_NEED(a, checkstack, int (*)(lua_State *, int), "lua_checkstack");
+  SLOT_NEED(a, getupvalue, const char *(*)(lua_State *, int, int),
+            "lua_getupvalue");
+  SLOT_NEED(a, upvalueid, void *(*)(lua_State *, int, int), "lua_upvalueid");
+  SLOT_OPT(a, getfenv, void (*)(lua_State *, int), "lua_getfenv");
+  SLOT_OPT(a, replace, void (*)(lua_State *, int), "lua_replace");
+  SLOT_NEED(a, copy, void (*)(lua_State *, int, int), "lua_copy");
+  SLOT_NEED(a, luaL_newstate, lua_State * (*)(void), "luaL_newstate");
+  SLOT_NEED(a, newstate, lua_State * (*)(lua_Alloc, void *), "lua_newstate");
+  SLOT_NEED(a, openlibs, void (*)(lua_State *), "luaL_openlibs");
+  SLOT_NEED(a, getallocf, lua_Alloc(*)(lua_State *, void **),
+            "lua_getallocf");
+  SLOT_NEED(a, setallocf, void (*)(lua_State *, lua_Alloc, void *),
+            "lua_setallocf");
+  SLOT_NEED(a, close_, void (*)(lua_State *), "lua_close");
+  SLOT_NEED(a, getstack_native, int (*)(lua_State *, int, void *),
+            "lua_getstack");
+  SLOT_NEED(a, getinfo_native, int (*)(lua_State *, const char *, void *),
+            "lua_getinfo");
+  SLOT_NEED(a, getlocal_ar, const char *(*)(lua_State *, const void *, int),
+            "lua_getlocal");
+  SLOT_NEED(a, sethook,
+            void (*)(lua_State *, void (*)(lua_State *, void *), int, int),
+            "lua_sethook");
+  a->debug_read = debug_read_54;
+  a->debug_nups = debug_nups_54;
+  return NULL;
+}
+
+static const char *resolve_luau(bridge_slot *s, void *handle) {
+  bridge_guest_api *a = &s->api;
+  SLOT_NEED(a, gettop, int (*)(lua_State *), "lua_gettop");
+  SLOT_NEED(a, settop, void (*)(lua_State *, int), "lua_settop");
+  SLOT_NEED(a, pushvalue, void (*)(lua_State *, int), "lua_pushvalue");
+  SLOT_NEED(a, type, int (*)(lua_State *, int), "lua_type");
+  SLOT_NEED(a, typename_, const char *(*)(lua_State *, int), "lua_typename");
+  SLOT_NEED(a, pushnil, void (*)(lua_State *), "lua_pushnil");
+  SLOT_NEED(a, pushboolean, void (*)(lua_State *, int), "lua_pushboolean");
+  SLOT_NEED(a, pushnumber, void (*)(lua_State *, double), "lua_pushnumber");
+  /* Luau's lua_pushinteger/lua_tointegerx use a 32-bit lua_Integer. The
+   * canonical pointers pass/return 64 bits; every value bridge stores or
+   * reads is a small non-negative ref or slot number, so the register
+   * truncation/zero-extension is exact. */
+  SLOT_NEED(a, pushinteger, void (*)(lua_State *, int64_t),
+            "lua_pushinteger");
+  SLOT_NEED(a, pushlstring, void (*)(lua_State *, const char *, size_t),
+            "lua_pushlstring");
+  SLOT_NEED(a, pushstring, void (*)(lua_State *, const char *),
+            "lua_pushstring");
+  SLOT_NEED(a, pushfstring, const char *(*)(lua_State *, const char *, ...),
+            "lua_pushfstringL");
+  SLOT_NEED(a, pushlightuserdata_tag, void (*)(lua_State *, void *, int),
+            "lua_pushlightuserdatatagged");
+  SLOT_NEED(a, pushcclosurek,
+            void (*)(lua_State *, lua_CFunction, const char *, int, void *),
+            "lua_pushcclosurek");
+  SLOT_NEED(a, toboolean, int (*)(lua_State *, int), "lua_toboolean");
+  SLOT_NEED(a, tonumberx, double (*)(lua_State *, int, int *),
+            "lua_tonumberx");
+  SLOT_NEED(a, tointegerx, int64_t (*)(lua_State *, int, int *),
+            "lua_tointegerx");
+  SLOT_NEED(a, tolstring, const char *(*)(lua_State *, int, size_t *),
+            "lua_tolstring");
+  SLOT_NEED(a, touserdata, void *(*)(lua_State *, int), "lua_touserdata");
+  SLOT_NEED(a, topointer, const void *(*)(lua_State *, int), "lua_topointer");
+  SLOT_NEED(a, tothread, lua_State * (*)(lua_State *, int), "lua_tothread");
+  SLOT_NEED(a, createtable, void (*)(lua_State *, int, int),
+            "lua_createtable");
+  SLOT_NEED(a, rawgeti, int (*)(lua_State *, int, int), "lua_rawgeti");
+  SLOT_NEED(a, rawseti, void (*)(lua_State *, int, int), "lua_rawseti");
+  SLOT_NEED(a, rawget, void (*)(lua_State *, int), "lua_rawget");
+  SLOT_NEED(a, rawset, void (*)(lua_State *, int), "lua_rawset");
+  SLOT_NEED(a, setfield, void (*)(lua_State *, int, const char *),
+            "lua_setfield");
+  SLOT_NEED(a, next, int (*)(lua_State *, int), "lua_next");
+  SLOT_NEED(a, getmetatable, int (*)(lua_State *, int), "lua_getmetatable");
+  SLOT_NEED(a, setmetatable, int (*)(lua_State *, int), "lua_setmetatable");
+  SLOT_NEED(a, pcall, int (*)(lua_State *, int, int, int), "lua_pcall");
+  SLOT_NEED(a, error_, void (*)(lua_State *), "lua_error");
+  SLOT_NEED(a, ref_value, int (*)(lua_State *, int), "lua_ref");
+  SLOT_NEED(a, unref_value, void (*)(lua_State *, int), "lua_unref");
+  SLOT_NEED(a, newthread, lua_State * (*)(lua_State *), "lua_newthread");
+  SLOT_NEED(a, pushthread, int (*)(lua_State *), "lua_pushthread");
+  SLOT_NEED(a, xmove, void (*)(lua_State *, lua_State *, int), "lua_xmove");
+  SLOT_NEED(a, checkstack, int (*)(lua_State *, int), "lua_checkstack");
+  SLOT_NEED(a, getupvalue, const char *(*)(lua_State *, int, int),
+            "lua_getupvalue");
+  SLOT_NEED(a, getfenv, void (*)(lua_State *, int), "lua_getfenv");
+  SLOT_NEED(a, replace, void (*)(lua_State *, int), "lua_replace");
+  SLOT_OPT(a, luaL_newstate, lua_State * (*)(void), "luaL_newstate");
+  SLOT_NEED(a, newstate, lua_State * (*)(lua_Alloc, void *), "lua_newstate");
+  SLOT_NEED(a, openlibs, void (*)(lua_State *), "luaL_openlibs");
+  SLOT_OPT(a, getallocf, lua_Alloc(*)(lua_State *, void **), "lua_getallocf");
+  SLOT_NEED(a, close_, void (*)(lua_State *), "lua_close");
+  SLOT_NEED(a, stackdepth, int (*)(lua_State *), "lua_stackdepth");
+  SLOT_NEED(a, getinfo_level,
+            int (*)(lua_State *, int, const char *, void *), "lua_getinfo");
+  SLOT_NEED(a, getlocal_level, const char *(*)(lua_State *, int, int),
+            "lua_getlocal");
+  SLOT_NEED(a, callbacks, bridge_luau_callbacks * (*)(lua_State *),
+            "lua_callbacks");
+  SLOT_NEED(a, singlestep, void (*)(lua_State *, int), "lua_singlestep");
+  a->debug_read = debug_read_luau;
+  a->debug_nups = debug_nups_luau;
+  return NULL;
+}
+
+static const char *resolve_slot(bridge_slot *s, void *handle) {
+  switch (s->abi) {
+  case BRIDGE_ABI_JIT:
+    return resolve_51(s, handle, 1);
+  case BRIDGE_ABI_51:
+    return resolve_51(s, handle, 0);
+  case BRIDGE_ABI_54:
+    return resolve_54(s, handle);
+  default:
+    return resolve_luau(s, handle);
+  }
+}
+
+static int parse_abi(const char *abi) {
+  if (strcmp(abi, "jit") == 0)
+    return BRIDGE_ABI_JIT;
+  if (strcmp(abi, "5.1") == 0)
+    return BRIDGE_ABI_51;
+  if (strcmp(abi, "5.4") == 0)
+    return BRIDGE_ABI_54;
+  if (strcmp(abi, "luau") == 0)
+    return BRIDGE_ABI_LUAU;
+  return -1;
+}
+
+static void init_host_slot(void) {
+  bridge_slot *s = &g_slots[0];
+  if (s->used)
+    return;
+  configure_slot(s, BRIDGE_ABI_JIT);
+  s->handle = NULL;
+  s->api = host_api;
+  s->used = 1;
+}
+
+static int bridge_runtime(lua_State *L) {
+  const char *abi_name = lua_tostring(L, 2);
+  int abi, handle_type, i;
+  void *handle = NULL;
+
+  if (abi_name == NULL) {
+    lua_pushnil(L);
+    lua_pushstring(L, "bridge.runtime: abi string expected");
+    return 2;
+  }
+  abi = parse_abi(abi_name);
+  if (abi < 0) {
+    lua_pushnil(L);
+    lua_pushfstring(L, "bridge.runtime: unsupported abi '%s'", abi_name);
+    return 2;
+  }
+
+  handle_type = lua_type(L, 1);
+  if (handle_type == LUA_TLIGHTUSERDATA)
+    handle = lua_touserdata(L, 1);
+  else if (handle_type == LUA_TCDATA)
+    /* LuaJIT cannot mint a lightuserdata from Lua; image handles arrive as a
+     * void* cdata. */
+    handle = decode_cdata_value(L, 1);
+  else if (handle_type == LUA_TNUMBER)
+    handle = (void *)(uintptr_t)lua_tointeger(L, 1);
+  else if (handle_type != LUA_TNONE && handle_type != LUA_TNIL) {
+    lua_pushnil(L);
+    lua_pushstring(L,
+                   "bridge.runtime: handle must be a lightuserdata, cdata or "
+                   "nil");
+    return 2;
+  }
+
+  if (handle == NULL) {
+    if (abi != BRIDGE_ABI_JIT) {
+      lua_pushnil(L);
+      lua_pushstring(L, "bridge.runtime: a nil handle only names the LuaJIT "
+                        "that loaded lua-sys");
+      return 2;
+    }
+    init_host_slot();
+    lua_pushinteger(L, 0);
+    return 1;
+  }
+
+  for (i = 1; i < BRIDGE_MAX_SLOTS; i++) {
+    if (g_slots[i].used && g_slots[i].handle == handle &&
+        g_slots[i].abi == abi) {
+      lua_pushinteger(L, i);
+      return 1;
+    }
+  }
+  for (i = 1; i < BRIDGE_MAX_SLOTS; i++) {
+    if (!g_slots[i].used)
+      break;
+  }
+  if (i == BRIDGE_MAX_SLOTS) {
+    lua_pushnil(L);
+    lua_pushstring(L, "bridge.runtime: no free runtime slots (max 8)");
+    return 2;
+  }
+
+  configure_slot(&g_slots[i], abi);
+  g_slots[i].handle = handle;
+  const char *missing = resolve_slot(&g_slots[i], handle);
+  if (missing != NULL) {
+    memset(&g_slots[i], 0, sizeof(g_slots[i]));
+    lua_pushnil(L);
+    lua_pushfstring(L, "bridge.runtime: %s does not export '%s'", abi_name,
+                    missing);
+    return 2;
+  }
+  g_slots[i].used = 1;
+  lua_pushinteger(L, i);
+  return 1;
+}
+
+/* ── Exported functions ──────────────────────────────────────────────────── */
+
+static int bridge_register(lua_State *L) {
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_pushvalue(L, 1);
+  luaJIT_setmode(L, -1, LUAJIT_MODE_FUNC | LUAJIT_MODE_OFF);
+  int id = luaL_ref(L, LUA_REGISTRYINDEX);
+  lua_pushinteger(L, id);
+  return 1;
+}
+
+static int bridge_push_callback(lua_State *L) {
+  bridge_slot_args args;
+  decode_slot_args(L, &args);
+  bridge_slot *s = slot_at(L, args.slot);
+  lua_State *guest = decode_guest_ptr(L, args.first);
+  int fn_ref = (int)lua_tointeger(L, args.first + 1);
+  int slow_ref = (int)lua_tointeger(L, args.first + 2);
+  intptr_t depth_addr = (intptr_t)lua_tointeger(L, args.first + 3);
+  intptr_t chain_addr = (intptr_t)lua_tointeger(L, args.first + 4);
+
+  slot_pushinteger(s, guest, fn_ref);
+  slot_pushinteger(s, guest, slow_ref);
+  slot_pushlightuserdata(s, guest, (void *)L); /* upvalue 3: owner */
+  if (args.slot == 0) {
+    slot_pushinteger(s, guest, (int64_t)depth_addr);
+    slot_pushinteger(s, guest, (int64_t)chain_addr);
+  } else {
+    slot_push_ptr(s, guest, (void *)depth_addr);
+    slot_push_ptr(s, guest, (void *)chain_addr);
+  }
+  slot_pushcclosure(s, guest, g_dispatch[args.slot], 5);
+  return 0;
+}
+
+static int bridge_unregister(lua_State *L) {
+  int fn_ref = (int)lua_tointeger(L, 1);
+  luaL_unref(L, LUA_REGISTRYINDEX, fn_ref);
+  return 0;
+}
+
 static const luaL_Reg bridge_funcs[] = {
+    {"runtime", bridge_runtime},
     {"make_callable", bridge_make_callable},
     {"compound_tag", bridge_compound_tag},
     {"register", bridge_register},
@@ -1987,10 +3120,11 @@ static int bridge_open(lua_State *L, void *caller) {
                     "export its C API\n");
     abort();
   }
+  init_host_api();
+  init_host_slot();
   luaL_register(L, "lua-sys.bridge", bridge_funcs);
   /* Seed this state's registry with the shared metatables. Other states
-   * that share the same dlopen'd copy of this .so build them lazily (see
-   * bridge_make_callable / hook_dispatch). */
+   * that share the same dlopen'd copy of this .so build them lazily. */
   init_callable_metatable(L);
   init_hook_info_metatable(L);
   return 1;

@@ -17,7 +17,7 @@ what a host program must add before it can run code that it does not trust.
 
 ## What a fresh guest state does not isolate
 
-`lua.new()` opens every standard library, which is correct for a cooperating
+`lua:lde():new()` opens every standard library, which is correct for a cooperating
 guest and wrong for an untrusted one. These facts are measured on the current
 version:
 
